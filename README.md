@@ -1,6 +1,7 @@
 # TwinTower nanoVLM
 ## Setup
-Simply run `setup.sh`
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
+2. Simply run `setup.sh`
 
 ## Directory
 1. Training code -> `train_*.py` (vanilla / twin_tower)
