@@ -20,11 +20,9 @@ from datasets import load_dataset, concatenate_datasets, get_dataset_config_name
 from tqdm import tqdm
 import argparse
 
-# Suppress pydantic warnings about unsupported field attributes
 import warnings
 from pydantic import warnings as pydantic_warnings
 warnings.filterwarnings("ignore", category=pydantic_warnings.UnsupportedFieldAttributeWarning)
-
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
@@ -32,21 +30,13 @@ if torch.cuda.is_available():
 
 PG_CPU = None
 
-from utils_temp.config_utils import VLMConfig, TrainConfig, GlobalConfig, load_config
-
-# import sys, os
-# nanovlm_root = os.path.join(os.getcwd(), "nanoVLM")
-# if nanovlm_root not in sys.path:
-#     sys.path.insert(0, nanovlm_root)
-
+from configs.config_twin_tower import VLMConfig, TrainConfig, GlobalConfig
 from models.twin_tower import TwinTowerModel
 from data.data_utils import synchronized_dataloader_step
 from data.advanced_datasets import ConstantLengthDataset
 from data.processors import get_image_processor, get_tokenizer
-from data.coco_caption import COCODataset, COCOCollator
+from data.coco_captions import COCODataset, COCOCollator
 
-#Otherwise, the tokenizer will throw a warning
-import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -133,57 +123,9 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
     full_dataset = load_dataset(train_cfg.direct_train_dataset_path)
     train_ds = full_dataset["train"].shuffle(seed=global_cfg.seed)
     val_ds = full_dataset["validation"]
-    # dataset_names_to_load = train_cfg.train_dataset_name
-    # if "shards" in train_cfg.train_dataset_name:
-    #     print("Loading shards")
-    #     total_shards = 56
-    #     dataset_names_to_load = [train_cfg.train_dataset_path + f"/shard_{i}" for i in range(total_shards)]
-
-    # if "all" in dataset_names_to_load:
-    #     dataset_names_to_load = get_dataset_config_names(train_cfg.train_dataset_path)
-
-    # # load and combine all training datasets
-    # combined_train_data = []
-
-    # for dataset_name in dataset_names_to_load:
-    #     print(f"Loading dataset: {dataset_name}")
-    #     if "shard_" in dataset_name:
-    #         try:
-    #             train_ds = load_from_disk(dataset_name)
-    #             combined_train_data.append(train_ds)
-    #             continue
-    #         except Exception as e:
-    #             print(f"Warning: Failed to load dataset shard '{dataset_name}' from '{train_cfg.train_dataset_path}'. Error: {e}")
-    #             continue
-    #     try:
-    #         train_ds = load_dataset(train_cfg.train_dataset_path, dataset_name)['train']
-    #         train_ds[0] # Check if the dataset is loaded correctly
-    #         combined_train_data.append(train_ds)
-    #     except Exception as e:
-    #         if is_master():
-    #             print(f"Warning: Failed to load dataset config '{dataset_name}' from '{train_cfg.train_dataset_path}'. Error: {e}")
-    #         continue
-
-    # if not combined_train_data:
-    #     raise ValueError("No valid datasets were loaded. Please check your dataset path and configurations.")
-    
-    # train_ds = concatenate_datasets(combined_train_data)
-    # # apply cutoff if specified
-    # if train_cfg.data_cutoff_idx is None:
-    #     total_samples = len(train_ds)  # Use the entire dataset
-    # else:
-    #     total_samples = min(len(train_ds), train_cfg.data_cutoff_idx)
-
-    train_ds = train_ds.shuffle(seed=global_cfg.seed) # Shuffle the training dataset, so train and val get equal contributions from all concatenated datasets  
 
     if is_dist():  # We need to shard the dataset in DDP since we are using an iterable dataset instead of the distributed sampler
         train_ds = train_ds.shard(num_shards=get_world_size(), index=get_rank())
-
-    # val_size = int(len(train_ds) * train_cfg.val_ratio)
-    # print(f"Val size: {val_size}")
-
-    # val_ds = train_ds.select(range(val_size))
-    # train_ds = train_ds.select(range(val_size, len(train_ds)))
 
     train_dataset = COCODataset(train_ds, tokenizer, image_processor, vlm_cfg.mp_image_token_length)
     val_dataset = COCODataset(val_ds, tokenizer, image_processor, vlm_cfg.mp_image_token_length)
@@ -191,7 +133,6 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
     train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
                                         max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
 
-    # create collator
     collator = COCOCollator(tokenizer, vlm_cfg.lm_max_length)
 
     g = torch.Generator()
@@ -656,20 +597,14 @@ def train(train_cfg, vlm_cfg, global_cfg):
     
 
 def main(config_name: str = "config_twin_tower"):
-    """Main function loading config from YAML
-    
-    Args:
-        config_name: Name of the config file in configs/ folder (without .yaml extension)
-    """
     global PG_CPU
-    global_cfg, vlm_cfg, train_cfg = load_config(config_name)
+    global_cfg = GlobalConfig()
+    vlm_cfg = VLMConfig()
+    train_cfg = TrainConfig()
     
     if global_cfg.hf_home:
         os.environ["HF_HOME"] = global_cfg.hf_home
         print(f"Changed HF_HOME to {global_cfg.hf_home}")
-    
-    # if not global_cfg.same_dir_as_nanovlm_repo:
-    #     sys.path.insert(0, os.path.join(os.getcwd(), 'nanoVLM'))
     
     print(f"Starting training with config: {config_name}")
     print(f"VLM Config: {vlm_cfg}")
@@ -701,8 +636,9 @@ def main(config_name: str = "config_twin_tower"):
 
 def mock_main():
     global PG_CPU
-    config_name = "config_twin_tower"
-    global_cfg, vlm_cfg, train_cfg = load_config(config_name)
+    global_cfg = GlobalConfig()
+    vlm_cfg = VLMConfig()
+    train_cfg = TrainConfig()
     print("Successfully ran mock main")
 
 if __name__ == "__main__":
