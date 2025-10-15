@@ -61,6 +61,8 @@ class TrainConfig:
     lr_mp: float = 5e-05
     lr_vision_backbone: float = 0.0
     lr_language_backbone: float = 1e-05
+    freeze_right_tower: bool = False
+    lr_right_tower: float = 5e-05
 
     data_cutoff_idx: int | None = None
     generate_val_data: bool = False
@@ -99,7 +101,7 @@ class TrainConfig:
     save_model_every_n_steps: int = 1500
 
     save_local: bool = False
-    local_model_cp_path: str = "checkpoints/nanoVLM-230M-8k-twin-ft"
+    local_model_cp_path: str = "checkpoints/nanoVLM-230M-8k-twin-full-ft-sanity"
 
     save_hf: bool = True
-    hf_model_cp_path: str = "patrickamadeus/nanoVLM-230M-8k-twin-ft"
+    hf_model_cp_path: str = "patrickamadeus/nanoVLM-230M-8k-twin-full-ft-sanity"
