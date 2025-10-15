@@ -73,7 +73,7 @@ class TrainConfig:
     max_training_steps: int = 200
     max_epochs: int = 3
 
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
     max_images_per_example: int = 2
     max_images_per_knapsack: int = 8

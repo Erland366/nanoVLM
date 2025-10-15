@@ -300,9 +300,22 @@ def train(train_cfg, vlm_cfg, global_cfg):
     # initialize model
     if train_cfg.resume_from_vlm_checkpoint:
         print(f"Resuming from VLM checkpoint: {vlm_cfg.vlm_checkpoint_path}")
-        model = TwinTowerModel.from_pretrained(vlm_cfg)
+        model = TwinTowerModel.from_pretrained(
+            vlm_cfg,
+            freeze_vision_encoder=(train_cfg.lr_vision_backbone <= 0),
+            freeze_modality_projector=(train_cfg.lr_mp <= 0),
+            freeze_left_tower_decoder=(train_cfg.lr_language_backbone <= 0),
+            freeze_right_tower_decoder=(train_cfg.freeze_right_tower or train_cfg.lr_right_tower <= 0),
+        )
     else:
-        model = TwinTowerModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+        model = TwinTowerModel(
+            vlm_cfg, 
+            load_backbone=vlm_cfg.vlm_load_backbone_weights,
+            freeze_vision_encoder=(train_cfg.lr_vision_backbone <= 0),
+            freeze_modality_projector=(train_cfg.lr_mp <= 0),
+            freeze_left_tower_decoder=(train_cfg.lr_language_backbone <= 0),
+            freeze_right_tower_decoder=(train_cfg.freeze_right_tower or train_cfg.lr_right_tower <= 0),
+        )
     
     if is_master():
         total_params = sum(p.numel() for p in model.parameters())
