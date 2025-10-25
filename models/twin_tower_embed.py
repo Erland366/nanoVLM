@@ -26,9 +26,13 @@ class CacheLanguageModel(LanguageModel):
             del lm
         else:
             super().__init__(cfg)
+        self.embd_cache = []
         if freeze_decoder:
             for p in self.parameters():
                 p.requires_grad = False
+        
+    def reset_embd_cache(self):
+        self.embd_cache = []
                 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0):
         if self.lm_use_tokens:
@@ -41,8 +45,11 @@ class CacheLanguageModel(LanguageModel):
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
         
+        # store per layer embedding output
+        self.embd_cache = []
         for i, block in enumerate(self.blocks):
             x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
+            self.embd_cache.append(x)
         x = self.norm(x)
 
         if self.lm_use_tokens: 
@@ -105,6 +112,10 @@ class LeftTower(VisionLanguageModel):
     
     def get_initial_token_embd(self):
         return self.initial_token_embd
+    
+    def get_decoder_embd_cache(self):
+        return self.decoder.embd_cache
+
 
 
 
@@ -130,13 +141,20 @@ class RightTower(LanguageModel):
         if freeze_decoder:
             for p in self.parameters():
                 p.requires_grad = False
+        self.embd_cache = []
+
+    def reset_embd_cache(self):
+        self.embd_cache = []
 
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: torch.Tensor = None,
         kv_cache: list[dict] = None,
-        start_pos: int = 0
+        start_pos: int = 0,
+        left_tower_embds: list[torch.Tensor] = None,
+        left_tower_img_mask: torch.Tensor = None,
+        mask_img_on_first_layer: bool = True
     ):
         if self.lm_use_tokens or x.dim() == 2:
             x = self.token_embedding(x)
@@ -148,8 +166,27 @@ class RightTower(LanguageModel):
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
+        is_decode_phase = kv_cache[0] is not None
+        self.reset_embd_cache()
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
+            if not is_decode_phase:
+                # first layer, mask the image tokens (optionally)
+                if i == 0 and mask_img_on_first_layer:
+                    # create a masked image tokens version only for the first layer
+                    first_layer_mask = attention_mask.clone() if attention_mask is not None else torch.ones_like(left_tower_img_mask, dtype=torch.long)
+                    first_layer_mask[left_tower_img_mask] = 0
+                    x, kv_cache[i] = block(x, cos, sin, first_layer_mask, kv_cache[i])
+                else:
+                    # for all other layers, replace the image tokens with the left tower embeddings outputs per layer
+                    if i > 0:
+                        x[left_tower_img_mask] = left_tower_embds[i-1][left_tower_img_mask]
+                    
+                    # use the original attention mask for other layers
+                    x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
+            else:
+                # during decoding phase, just use the original attention mask
+                x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
+            self.embd_cache.append(x)
             
         x = self.norm(x)
 
@@ -212,75 +249,6 @@ class TwinTowerModel(nn.Module):
                 return None
             return torch.cat(images, dim=0).to(device)
         return images.to(device)
-    
-    def _split_input_by_last_image_token(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        batch_size = input_ids.size(0)
-        left_input_ids = []
-        right_input_ids = []
-        left_attention_mask = []
-        right_attention_mask = []
-        has_images = False
-        
-        for b in range(batch_size):
-            sequence = input_ids[b].tolist()
-            attn_seq = attention_mask[b].tolist() if attention_mask is not None else [1] * len(sequence)
-            
-
-            if self.tokenizer.image_token_id in sequence:
-                has_images = True
-                # last <|image|> token, pivot to split input_ids for left and right tower
-                last_image_token_idx = len(sequence) - 1 - sequence[::-1].index(self.tokenizer.image_token_id)
-                
-                left_seq = sequence[:last_image_token_idx + 1]
-                right_seq = sequence[last_image_token_idx + 1:]
-                
-                left_attn = attn_seq[:last_image_token_idx + 1]
-                right_attn = attn_seq[last_image_token_idx + 1:]
-            else:
-                left_seq = []
-                right_seq = sequence
-                
-                left_attn = []
-                right_attn = attn_seq
-            
-            left_input_ids.append(left_seq)
-            right_input_ids.append(right_seq)
-            left_attention_mask.append(left_attn)
-            right_attention_mask.append(right_attn)
-        
-        def to_tensor_or_none(seqs):
-            if not any(seqs):
-                return None
-            max_len = max(len(seq) for seq in seqs if seq)
-            padded = []
-            # batch padding
-            pad_id = getattr(self.tokenizer, 'pad_token_id', None) or self.tokenizer.eos_token_id
-            for seq in seqs:
-                if seq:
-                    padded.append(seq + [pad_id] * (max_len - len(seq)))
-                else:
-                    padded.append([pad_id] * max_len)
-            return torch.tensor(padded, dtype=input_ids.dtype, device=input_ids.device)
-        
-        def to_mask_tensor_or_none(masks):
-            if not any(masks):
-                return None
-            max_len = max(len(mask) for mask in masks if mask)
-            padded = []
-            # batch padding
-            for mask in masks:
-                if mask:
-                    padded.append(mask + [0] * (max_len - len(mask)))
-                else:
-                    padded.append([0] * max_len)
-            return torch.tensor(padded, dtype=torch.long, device=input_ids.device)
-        
-        left_input_tensor = to_tensor_or_none(left_input_ids)
-        right_input_tensor = to_tensor_or_none(right_input_ids) 
-        left_mask_tensor = to_mask_tensor_or_none(left_attention_mask) if attention_mask is not None else None
-        right_mask_tensor = to_mask_tensor_or_none(right_attention_mask) if attention_mask is not None else None
-        
-        return left_input_tensor, right_input_tensor, left_mask_tensor, right_mask_tensor, has_images
 
     def forward(
         self, 
@@ -297,127 +265,76 @@ class TwinTowerModel(nn.Module):
         if targets is not None:
             targets = targets.to(device)
 
-        # split by last <|image|> token so left tower gets until last image token
-        left_input_ids, right_input_ids, left_attention_mask, right_attention_mask, has_images = self._split_input_by_last_image_token(
-            input_ids, attention_mask
+        # forward pass left tower (capture embds and <image> mask)
+        self.left_tower.decoder.reset_embd_cache()
+        self.right_tower.reset_embd_cache()
+        left_tower_img_mask = (input_ids == self.tokenizer.image_token_id)
+        
+        # TODO: discuss with Yova, [CLS]-like should we mask or no?
+        # if hasattr(self.tokenizer, "global_image_token_id") and self.tokenizer.global_image_token_id is not None:
+        #     left_tower_img_mask = left_tower_img_mask | (input_ids == self.tokenizer.global_image_token_id)
+
+        # Don't pass targets to left tower - we only need embeddings, not loss
+        logits_left, _ = self.left_tower(input_ids, images, attention_mask=attention_mask, targets=None)
+        left_tower_embds = self.left_tower.get_decoder_embd_cache()
+        token_embd = self.left_tower.get_initial_token_embd()
+
+        # forward with the right tower
+        logits_right, _ = self.right_tower(
+            x=token_embd,
+            attention_mask=attention_mask,
+            left_tower_embds=left_tower_embds,
+            left_tower_img_mask=left_tower_img_mask,
+            mask_img_on_first_layer=mask_img_on_first_layer,
         )
         
-        left_kv_cache = None
-        left_seq_len = 0
-        
-        if has_images and left_input_ids is not None:
-            # process left tower (system + images) to generate kv_cache
-            logits_left, left_kv_cache = self.left_tower(
-                left_input_ids, 
-                images, 
-                attention_mask=left_attention_mask, 
-                targets=None
-            )
-            left_seq_len = left_input_ids.size(1)
-        
-        # process right tower (text + system) starting from left tower's kv_cache
-        if right_input_ids is not None:
-            # calculate start position for right tower
-            start_pos = left_seq_len
-            
-            # create combined attention mask for right tower
-            if left_attention_mask is not None and right_attention_mask is not None:
-                # combine left and right attention masks
-                combined_attention_mask = torch.cat([left_attention_mask, right_attention_mask], dim=1)
-            elif left_attention_mask is not None:
-                combined_attention_mask = left_attention_mask
-            elif right_attention_mask is not None:
-                combined_attention_mask = right_attention_mask  
-            else:
-                combined_attention_mask = None
-            
-            # forward pass through right tower with kv_cache continuation
-            logits_right, _ = self.right_tower(
-                x=right_input_ids,  # Pass token ids directly, not embeddings
-                attention_mask=combined_attention_mask,
-                kv_cache=left_kv_cache,  # Continue from left tower's kv_cache
-                start_pos=start_pos
-            )
-        else:
-            # no text tokens to process in right tower
-            logits_right = torch.empty((input_ids.size(0), 0, self.cfg.lm_vocab_size), 
-                                     device=device, dtype=torch.float32)
-        
-        # calculate loss if targets are provided (only on right tower outputs)
+        # calculate loss if targets are provided
         loss = None
-        if targets is not None and right_input_ids is not None:
-            # split targets the same way as input_ids
-            _, right_targets, _, _, _ = self._split_input_by_last_image_token(targets, attention_mask)
-            
-            if right_targets is not None:
-                if not self.right_tower.lm_use_tokens:
-                    logits_right = self.right_tower.head(logits_right)
-                loss = F.cross_entropy(
-                    logits_right.reshape(-1, logits_right.size(-1)), 
-                    right_targets.reshape(-1), 
-                    ignore_index=-100
-                )
+        if targets is not None:
+            logits_right = self.right_tower.head(logits_right)
+            loss = F.cross_entropy(logits_right.reshape(-1, logits_right.size(-1)), targets.reshape(-1), ignore_index=-100)
         
         return logits_right, loss
     
     @torch.inference_mode()
-    def generate(self, input_ids, images, attention_mask=None, max_new_tokens=5, top_k=50, top_p=0.9, temperature=0.5, greedy=False, result_only=False):
-        device = next(self.left_tower.vision_encoder.parameters()).device
-        input_ids = input_ids.to(device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+    def generate(self, input_ids, images, attention_mask=None, max_new_tokens=5, top_k=50, top_p=0.9, temperature=0.5, greedy=False, mask_img_on_first_layer=False):
+        # Process images
+        images_tensor = self._process_images(images, input_ids.device)
+        token_embd = self.left_tower.decoder.token_embedding(input_ids)  # [B, T_prompt_text, D_lm]
 
-        left_input_ids, right_input_ids, left_attention_mask, right_attention_mask, has_images = self._split_input_by_last_image_token(
-            input_ids, attention_mask
-        )
+        # Left tower processing for images
+        if images_tensor is not None:
+            # Process image with left tower
+            image_embd = self.left_tower.vision_encoder(images_tensor)  # [B, T_img_feat, D_model]
+            image_embd = self.left_tower.MP(image_embd)  # [B, mp_image_token_length, D_lm]
+            # Combine image and text embeddings
+            token_embd = self.left_tower._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
+
+        left_tower_img_mask = (input_ids == self.tokenizer.image_token_id)
+
+        # TODO: discuss with Yova, [CLS]-like should we mask or no?
+        # if hasattr(self.tokenizer, "global_image_token_id") and self.tokenizer.global_image_token_id is not None:
+        #     left_tower_img_mask = left_tower_img_mask | (input_ids == self.tokenizer.global_image_token_id)
         
-        left_kv_cache = None
-        left_seq_len = 0
+        # Left tower forward pass to get embeddings
+        self.left_tower.decoder.reset_embd_cache()
+        _, _ = self.left_tower.decoder(token_embd, attention_mask=attention_mask)
+        left_tower_embds = self.left_tower.decoder.embd_cache
+
+        current_total_seq_len = token_embd.size(1)
         batch_size = input_ids.size(0)
         
-        if has_images and left_input_ids is not None:
-            # Process left tower (system + images) to generate kv_cache
-            _, left_kv_cache = self.left_tower(
-                left_input_ids, 
-                images, 
-                attention_mask=left_attention_mask, 
-                targets=None
-            )
-            left_seq_len = left_input_ids.size(1)
-        
         # --- Multimodal Prefill Phase with right tower ---
-        if right_input_ids is not None:
-            # Calculate start position for right tower
-            start_pos = left_seq_len
-            
-            # Create combined attention mask for right tower
-            if left_attention_mask is not None and right_attention_mask is not None:
-                combined_attention_mask = torch.cat([left_attention_mask, right_attention_mask], dim=1)
-            elif left_attention_mask is not None:
-                combined_attention_mask = left_attention_mask
-            elif right_attention_mask is not None:
-                combined_attention_mask = right_attention_mask  
-            else:
-                combined_attention_mask = None
-            
-            # Prefill phase through right tower with kv_cache continuation
-            prefill_output, kv_cache_list = self.right_tower(
-                x=right_input_ids,
-                attention_mask=combined_attention_mask,
-                kv_cache=left_kv_cache,
-                start_pos=start_pos
-            )
-            
-            current_total_seq_len = left_seq_len + right_input_ids.size(1)
-            last_token_output_from_prefill = prefill_output[:, -1, :]
-        else:
-            # No text tokens to prefill, start from left tower's kv_cache
-            kv_cache_list = left_kv_cache
-            current_total_seq_len = left_seq_len
-            combined_attention_mask = left_attention_mask
-            
-            # Create dummy logits for the case where there's no text input
-            last_token_output_from_prefill = torch.zeros((batch_size, self.cfg.lm_hidden_dim), device=device)
+        self.right_tower.reset_embd_cache()
+        prefill_output, kv_cache_list = self.right_tower(
+            x=token_embd,                     # embeddings, not input_ids
+            attention_mask=attention_mask,
+            left_tower_embds=left_tower_embds,
+            left_tower_img_mask=left_tower_img_mask,
+            mask_img_on_first_layer=mask_img_on_first_layer
+        )
+        
+        last_token_output_from_prefill = prefill_output[:, -1, :]
         
         if not self.right_tower.lm_use_tokens:
             current_logits = self.right_tower.head(last_token_output_from_prefill)
@@ -438,20 +355,29 @@ class TwinTowerModel(nn.Module):
             
             newly_generated_ids_list.append(next_token_id)
             
+            # Embed the newly generated token
+            next_token_embed = self.right_tower.token_embedding(next_token_id)  # [B, 1, D_lm]
+            
             # The start_pos for the new token is the current total sequence length *before* adding this new token
             current_token_start_pos = current_total_seq_len
             current_total_seq_len += 1
             
             # Update attention mask
-            if combined_attention_mask is not None:
-                combined_attention_mask = torch.cat((combined_attention_mask, torch.ones((batch_size, 1), device=combined_attention_mask.device, dtype=combined_attention_mask.dtype)), dim=1)
+            if attention_mask is not None:
+                attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
             
             # With KV cache: only process the new token through right tower
+            # Decode loop
+            step_input = next_token_embed if not self.right_tower.lm_use_tokens else next_token_id
+
             decode_step_output, kv_cache_list = self.right_tower(
-                x=next_token_id,  # Pass token id directly
-                attention_mask=combined_attention_mask,
+                x=step_input,
+                attention_mask=attention_mask,
                 kv_cache=kv_cache_list,
-                start_pos=current_token_start_pos
+                start_pos=current_token_start_pos,
+                left_tower_embds=None,
+                left_tower_img_mask=None,
+                mask_img_on_first_layer=mask_img_on_first_layer
             )
 
             last_token_output = decode_step_output[:, -1, :]
@@ -463,11 +389,11 @@ class TwinTowerModel(nn.Module):
                 current_logits = last_token_output
         
         if not newly_generated_ids_list:  # Handle case where max_new_tokens might be 0
-            return input_ids  # Return original input for natural single-model behavior
+            return torch.empty((batch_size, 0), dtype=torch.long, device=input_ids.device)
         
         generated_ids = torch.cat(newly_generated_ids_list, dim=1)
         
-        # Post-process to handle EOS token on the generated part
+        # Post-process to handle EOS token
         if self.tokenizer.eos_token_id is not None and generated_ids.numel() > 0:
             seq_len = generated_ids.size(1)
             device = generated_ids.device
@@ -492,8 +418,7 @@ class TwinTowerModel(nn.Module):
             
             generated_ids[replace_mask] = self.tokenizer.eos_token_id
         
-        full_sequence = torch.cat([input_ids, generated_ids], dim=1)
-        return full_sequence if not result_only else generated_ids
+        return generated_ids
     
     @classmethod
     def _load_twin_tower_checkpoint(
