@@ -52,16 +52,16 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
     val_dataset = COCODataset(val_ds, tokenizer, image_processor, vlm_cfg.mp_image_token_length)
     collator = COCOCollator(tokenizer, vlm_cfg.lm_max_length)
 
-    train_dataset = ConstantLengthDataset(
-        train_dataset,
-        infinite=False,
-        max_sample_length=train_cfg.max_sample_length,
-        seq_length=vlm_cfg.lm_max_length,
-        num_of_sequences=train_cfg.batch_size * 4,
-        queue_size=8,
-        max_images_per_example=train_cfg.max_images_per_example,
-        max_images_per_knapsack=train_cfg.max_images_per_knapsack,
-    )
+    # train_dataset = ConstantLengthDataset(
+    #     train_dataset,
+    #     infinite=False,
+    #     max_sample_length=train_cfg.max_sample_length,
+    #     seq_length=vlm_cfg.lm_max_length,
+    #     num_of_sequences=train_cfg.batch_size * 4,
+    #     queue_size=8,
+    #     max_images_per_example=train_cfg.max_images_per_example,
+    #     max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+    # )
 
     train_loader = DataLoader(
         train_dataset,

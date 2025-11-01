@@ -1,5 +1,4 @@
 import os
-import sys
 import math
 import time
 import torch
@@ -8,15 +7,13 @@ import numpy
 import random
 import argparse
 import contextlib
-import subprocess
 import torch.optim as optim
 from statistics import mean
-from dataclasses import asdict
 from datetime import timedelta
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from datasets import load_dataset, concatenate_datasets, get_dataset_config_names, load_from_disk
+from datasets import load_dataset
 from tqdm import tqdm
 import argparse
 
@@ -35,7 +32,7 @@ from models.twin_tower import TwinTowerModel
 from data.data_utils import synchronized_dataloader_step
 from data.advanced_datasets import ConstantLengthDataset
 from data.processors import get_image_processor, get_tokenizer
-from data.coco_captions import COCODataset, COCOCollator
+from data.coco_captions_split import COCODataset, COCOCollator
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -130,8 +127,8 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
     train_dataset = COCODataset(train_ds, tokenizer, image_processor, vlm_cfg.mp_image_token_length)
     val_dataset = COCODataset(val_ds, tokenizer, image_processor, vlm_cfg.mp_image_token_length)
 
-    train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
-                                        max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
+    # train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
+    #                                     max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
 
     collator = COCOCollator(tokenizer, vlm_cfg.lm_max_length)
 

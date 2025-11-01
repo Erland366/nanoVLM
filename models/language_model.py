@@ -261,15 +261,20 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
         additive_attn_mask = None
         if attention_mask is not None:
-            # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
-            # Let's make it `[B, 1, 1, T_kv]` for SDPA.
-            mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
-            additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
-            # This additive_attn_mask shape is [B, 1, 1, T_kv]
+            # Check if mask is already in additive form [B, 1, T_curr, T_kv] (for prefill with cache)
+            if attention_mask.dim() == 4:
+                additive_attn_mask = attention_mask
+            else:
+                # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
+                # Let's make it `[B, 1, 1, T_kv]` for SDPA.
+                mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
+                additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
+                # This additive_attn_mask shape is [B, 1, 1, T_kv]
 
         if self.sdpa and x.device.type != 'mps':
-            # During decode, no additional masking needed as [1, T_kv] is naturally causal
-            is_causal = (T_curr == T_kv and T_curr > 1)
+            # During decode or prefill with explicit causal mask, no additional is_causal needed
+            # Only use is_causal for standard prefill (no cache)
+            is_causal = (T_curr == T_kv and T_curr > 1 and additive_attn_mask is None)
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k_exp, v_exp,
                 attn_mask=additive_attn_mask, 
@@ -279,13 +284,15 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         else:
             # Manual attention implementation
             attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
-            # During decode: no additional masking needed as [1, T_kv] is naturally causal
-            if T_curr == T_kv and T_curr > 1:
+            # During decode or prefill with explicit mask: no additional masking needed
+            # Only apply causal for standard prefill (no cache, no explicit mask)
+            if T_curr == T_kv and T_curr > 1 and additive_attn_mask is None:
                 causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
                 attn = attn.masked_fill(~causal_mask_val, float('-inf'))
 
-            if additive_attn_mask is not None: # Additive padding mask
-                # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
+            if additive_attn_mask is not None: # Additive mask (padding or causal+padding)
+                # additive_attn_mask can be [B,1,1,T_kv] or [B,1,T_curr,T_kv]
+                # Both broadcast correctly to [B, n_heads, T_curr, T_kv]
                 attn = attn + additive_attn_mask 
 
             attn = F.softmax(attn, dim=-1)
