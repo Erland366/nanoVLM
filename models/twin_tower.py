@@ -278,30 +278,33 @@ class TwinTowerModel(nn.Module):
         batch_size = input_ids.size(0)
         device = input_ids.device
         
+        # Find split position - image tokens are aligned across batch
+        image_token_mask = (input_ids == self.tokenizer.image_token_id)
+        positions = torch.where(image_token_mask[0])[0]
+        split_pos = positions[-1].item() + 1 if len(positions) > 0 else 0
+        
+        # Split input_ids
+        left_input_ids = input_ids[:, :split_pos]
+        right_input_ids = input_ids[:, split_pos:]
+        left_attention_mask = attention_mask[:, :split_pos] if attention_mask is not None else None
+        
         # Process images through left tower components
         images_tensor = self._process_images(images, device)
-        token_embd = self.left_tower.decoder.token_embedding(input_ids)  # [B, T_prompt_text, D_lm]
+        # Left tower uses its own token embedding
+        left_token_embd = self.left_tower.decoder.token_embedding(left_input_ids)
 
         if images_tensor is not None:
             # Process image with left tower
             image_embd = self.left_tower.vision_encoder(images_tensor)  # [B, T_img_feat, D_model]
             image_embd = self.left_tower.MP(image_embd)  # [B, mp_image_token_length, D_lm]
             # Combine image and text embeddings
-            token_embd = self.left_tower._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
-        
-        # Find split position - image tokens are aligned across batch
-        image_token_mask = (input_ids == self.tokenizer.image_token_id)
-        positions = torch.where(image_token_mask[0])[0]
-        split_pos = positions[-1].item() + 1 if len(positions) > 0 else 0
-        
-        # Split input_ids, embeddings, and attention mask
-        right_input_ids = input_ids[:, split_pos:]
-        left_token_embd, right_token_embd = token_embd[:, :split_pos, :], token_embd[:, split_pos:, :]
-        left_attention_mask = attention_mask[:, :split_pos] if attention_mask is not None else None
+            left_token_embd = self.left_tower._replace_img_tokens_with_embd(left_input_ids, left_token_embd, image_embd)
         
         # --- Prefill Phase: Process left part through left tower decoder to get image KV cache ---
         _, img_kv_cache = self.left_tower.decoder(left_token_embd, attention_mask=left_attention_mask)
         
+        # Right tower uses its own token embedding
+        right_token_embd = self.right_tower.token_embedding(right_input_ids)
         current_right_seq_len = right_token_embd.size(1)
         
         # --- Multimodal Prefill Phase with right tower ---

@@ -125,12 +125,14 @@ class COCODataset(Dataset):
         }
 
 
-def collate_fn(batch):
+def collate_fn(batch, tokenizer):
     """
-    Collate function to batch samples with proper padding.
+    Collate function to batch samples with proper image token alignment.
+    Aligns image tokens across batch so split position is consistent.
     
     Args:
         batch: List of samples from COCODataset
+        tokenizer: Tokenizer to get image_token_id and pad_token_id
     
     Returns:
         Dictionary with batched tensors
@@ -142,28 +144,75 @@ def collate_fn(batch):
     filenames = [item["filename"] for item in batch]
     image_ids = [item["image_id"] for item in batch]
     
-    # Pad input_ids to the same length
-    max_len = max(ids.size(0) for ids in input_ids_list)
-    padded_input_ids = []
-    attention_masks = []
-    
-    # Get tokenizer pad token ID from first batch item (assuming all use same tokenizer)
-    pad_token_id = 0  # Will be set by the model's tokenizer
-    
+    # Find split positions (after last image token) for each sample
+    split_positions = []
     for ids in input_ids_list:
-        pad_len = max_len - ids.size(0)
-        # Pad on the left (as per collators.py lines 9, 65, 80)
-        padded_ids = F.pad(ids, (pad_len, 0), value=pad_token_id)
-        # Create attention mask (0 for padding, 1 for real tokens)
-        attention_mask = F.pad(torch.ones_like(ids), (pad_len, 0), value=0)
+        image_token_mask = (ids == tokenizer.image_token_id)
+        positions = torch.where(image_token_mask)[0]
+        if len(positions) > 0:
+            split_positions.append(positions[-1].item() + 1)
+        else:
+            split_positions.append(0)
+    
+    # Find maximum split position to align all samples
+    max_split_pos = max(split_positions) if split_positions else 0
+    
+    # Align image tokens by left-padding before the image region
+    aligned_input_ids = []
+    aligned_attention_masks = []
+    
+    for ids, split_pos in zip(input_ids_list, split_positions):
+        pad_amount = max_split_pos - split_pos
+        if pad_amount > 0:
+            # Pad on the left to align image tokens
+            padded_ids = F.pad(ids, (pad_amount, 0), value=tokenizer.pad_token_id)
+            attention_mask = F.pad(torch.ones_like(ids), (pad_amount, 0), value=0)
+        else:
+            padded_ids = ids
+            attention_mask = torch.ones_like(ids)
         
-        padded_input_ids.append(padded_ids)
-        attention_masks.append(attention_mask)
+        aligned_input_ids.append(padded_ids)
+        aligned_attention_masks.append(attention_mask)
+    
+    # Now pad all sequences to the same total length (right padding for text region)
+    max_total_len = max(len(ids) for ids in aligned_input_ids)
+    final_input_ids = []
+    final_attention_masks = []
+    
+    for ids, attn in zip(aligned_input_ids, aligned_attention_masks):
+        pad_needed = max_total_len - len(ids)
+        if pad_needed > 0:
+            # Split into image and text parts
+            image_token_mask = (ids == tokenizer.image_token_id)
+            positions = torch.where(image_token_mask)[0]
+            split_pos = positions[-1].item() + 1 if len(positions) > 0 else 0
+            
+            # Split sequence
+            image_part = ids[:split_pos]
+            text_part = ids[split_pos:]
+            attn_image = attn[:split_pos]
+            attn_text = attn[split_pos:]
+            
+            # Left-pad the text portion (insert padding BETWEEN image and text)
+            pad_ids = torch.full((pad_needed,), tokenizer.pad_token_id, dtype=ids.dtype, device=ids.device)
+            pad_attn = torch.zeros((pad_needed,), dtype=attn.dtype, device=attn.device)
+            text_part = torch.cat([pad_ids, text_part])
+            attn_text = torch.cat([pad_attn, attn_text])
+            
+            # Rebuild: [image_part | padded_text_part]
+            final_ids = torch.cat([image_part, text_part])
+            final_attn = torch.cat([attn_image, attn_text])
+        else:
+            final_ids = ids
+            final_attn = attn
+        
+        final_input_ids.append(final_ids)
+        final_attention_masks.append(final_attn)
     
     return {
         "images": images,
-        "input_ids": torch.stack(padded_input_ids),
-        "attention_mask": torch.stack(attention_masks),
+        "input_ids": torch.stack(final_input_ids),
+        "attention_mask": torch.stack(final_attention_masks),
         "gt_captions": gt_captions,
         "filenames": filenames,
         "image_ids": image_ids
@@ -249,7 +298,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=lambda batch: collate_fn(batch, tokenizer),
         pin_memory=True if torch.cuda.is_available() else False
     )
     
