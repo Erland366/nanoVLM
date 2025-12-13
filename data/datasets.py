@@ -149,3 +149,121 @@ class VQADataset(BaseDataset):  # Visual Question Answering Dataset
         labels[-1] = -100 # Last token has no target
         
         return labels
+
+
+class VQADualDataset(Dataset):
+    def __init__(self, dataset, tokenizer, image_processor, mp_image_token_length):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.mp_image_token_length = mp_image_token_length
+        self.prefix_len = self._get_prefix_len()
+        
+    def __len__(self):
+        return len(self.dataset)
+    
+    def _get_prefix_len(self):
+        """Calculate the prefix length for assistant responses in the chat template."""
+        random_string_5_letters = "xzyvd"
+        random_string_chat_templated = self.tokenizer.apply_chat_template(
+            [{"role": "assistant", "content": random_string_5_letters}], 
+            tokenize=False, 
+            add_special_tokens=False
+        )
+        random_string_location = random_string_chat_templated.find(random_string_5_letters)
+        return len(self.tokenizer.encode(random_string_chat_templated[:random_string_location]))
+    
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        return self._process_data(item)
+    
+    def _process_data(self, item):
+        """Process a single data item: image + text to model inputs."""
+        image = item['image']
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+            
+        processed_image, splitted_image_ratio = self.image_processor(image)
+        
+        # Handle global image token case
+        if (not hasattr(self.tokenizer, "global_image_token") and 
+            splitted_image_ratio[0] * splitted_image_ratio[1] == len(processed_image) - 1):
+            processed_image = processed_image[1:]
+        
+        image_string = get_image_string(
+            self.tokenizer, 
+            [splitted_image_ratio], 
+            self.mp_image_token_length
+        )
+        
+        messages = [
+            {"role": "user", "content": image_string + "Describe the image."},
+            {"role": "assistant", "content": item['caption']}
+        ]
+        
+        # Prepare the FULL sequence
+        input_ids, loss_mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
+        
+        # Find the last image token position
+        image_token_id = self.tokenizer.encode(self.tokenizer.image_token, add_special_tokens=False)[0]
+        last_image_token_pos = -1
+        for i in range(len(input_ids) - 1, -1, -1):
+            if input_ids[i] == image_token_id:
+                last_image_token_pos = i
+                break
+        
+        # If no image token found, return None (will be filtered out)
+        if last_image_token_pos == -1:
+            return None
+        
+        # Get labels with proper shifting for causal LM
+        labels = self._get_labels(input_ids, loss_mask)
+        
+        return {
+            "images": processed_image,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "last_image_token_pos": last_image_token_pos,
+        }
+    
+    def _prepare_inputs_and_loss_mask(self, messages):
+        """
+        Prepare input_ids, loss mask, and attention mask from messages.
+        Loss mask is 1 for assistant responses, 0 elsewhere.
+        """
+        conv_ids = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_special_tokens=False,
+            return_dict=True,
+        )
+        mask = [0] * len(conv_ids["input_ids"])
+
+        # Locate each assistant turn and flip its mask to 1
+        cursor = 0
+        for msg in messages:
+            segment_ids = self.tokenizer.apply_chat_template(
+                [msg], tokenize=True, add_special_tokens=False
+            )
+            seg_len = len(segment_ids)
+
+            if msg["role"] == "assistant":
+                start = cursor + self.prefix_len
+                end = cursor + seg_len
+                mask[start:end] = [1] * (end - start)
+
+            cursor += seg_len
+        
+        return (
+            torch.tensor(conv_ids["input_ids"]), 
+            torch.tensor(mask).to(torch.bool), 
+            torch.tensor(conv_ids["attention_mask"])
+        )
+    
+    def _get_labels(self, input_ids, mask):
+        """Create labels with -100 for non-target positions, shifted for causal LM."""
+        labels = input_ids.clone().masked_fill(~mask, -100)
+        labels = labels.roll(-1)  # Shift labels for causal LM
+        labels[-1] = -100  # Last token has no target
+        return labels

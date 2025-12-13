@@ -69,12 +69,13 @@ class RotaryEmbedding(nn.Module):
         self.attention_scaling = cfg.lm_attn_scaling
 
     @torch.no_grad()
-    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, position_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute rotary positional embeddings (cosine and sine components).
 
         Args:
             position_ids (torch.Tensor): Tensor of shape (batch_size, seq_len) containing position indices.
+            attention_mask (torch.Tensor, optional): Tensor of shape (batch_size, seq_len) with 1 for valid tokens, 0 for padding.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Tuple of two tensors (cos, sin), each of shape
@@ -82,6 +83,12 @@ class RotaryEmbedding(nn.Module):
         """
 
         batch_size, seq_len = position_ids.shape
+        
+        # If attention mask is provided, adjust position_ids to not increment for padding tokens
+        if attention_mask is not None:
+            position_ids = attention_mask.cumsum(dim=1) - 1
+            position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+        
         # Dynamic scaling for longer sequences
         # Divide the angle frequency to fit more rotation into the embedding space.
         max_seq = position_ids.max() + 1
@@ -107,6 +114,11 @@ class RotaryEmbedding(nn.Module):
         # Compute cos and sin
         cos = torch.cos(emb) * self.attention_scaling
         sin = torch.sin(emb) * self.attention_scaling
+
+        if attention_mask is not None:
+            mask_expanded = attention_mask.unsqueeze(-1).expand_as(cos)
+            cos = cos * mask_expanded.float()
+            sin = sin * mask_expanded.float()
         
         return cos, sin
 
@@ -204,7 +216,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None) -> tuple[torch.Tensor, dict]:
+    def forward_ori(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
 
@@ -261,20 +273,15 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
         additive_attn_mask = None
         if attention_mask is not None:
-            # Check if mask is already in additive form [B, 1, T_curr, T_kv] (for prefill with cache)
-            if attention_mask.dim() == 4:
-                additive_attn_mask = attention_mask
-            else:
-                # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
-                # Let's make it `[B, 1, 1, T_kv]` for SDPA.
-                mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
-                additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
-                # This additive_attn_mask shape is [B, 1, 1, T_kv]
+            # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
+            # Let's make it `[B, 1, 1, T_kv]` for SDPA.
+            mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
+            additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
+            # This additive_attn_mask shape is [B, 1, 1, T_kv]
 
         if self.sdpa and x.device.type != 'mps':
-            # During decode or prefill with explicit causal mask, no additional is_causal needed
-            # Only use is_causal for standard prefill (no cache)
-            is_causal = (T_curr == T_kv and T_curr > 1 and additive_attn_mask is None)
+            # During decode, no additional masking needed as [1, T_kv] is naturally causal
+            is_causal = (T_curr == T_kv and T_curr > 1)
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k_exp, v_exp,
                 attn_mask=additive_attn_mask, 
@@ -284,17 +291,153 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         else:
             # Manual attention implementation
             attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
-            # During decode or prefill with explicit mask: no additional masking needed
-            # Only apply causal for standard prefill (no cache, no explicit mask)
-            if T_curr == T_kv and T_curr > 1 and additive_attn_mask is None:
+            # During decode: no additional masking needed as [1, T_kv] is naturally causal
+            if T_curr == T_kv and T_curr > 1:
                 causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
                 attn = attn.masked_fill(~causal_mask_val, float('-inf'))
 
-            if additive_attn_mask is not None: # Additive mask (padding or causal+padding)
-                # additive_attn_mask can be [B,1,1,T_kv] or [B,1,T_curr,T_kv]
-                # Both broadcast correctly to [B, n_heads, T_curr, T_kv]
+            if additive_attn_mask is not None: # Additive padding mask
+                # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
                 attn = attn + additive_attn_mask 
 
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            y = attn @ v_exp
+            
+        y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
+        y = self.out_proj(y)
+        y = self.resid_dropout(y)
+
+        return y, block_kv_cache
+
+
+    def forward(self, x, cos, sin, attention_mask=None, block_kv_cache=None):
+        # block_kv_cache is never empty, there will always be T_img_kv length from the image side
+
+        B, T_curr, C = x.size()
+        T_img_kv = block_kv_cache['key'].size(2)
+        is_dual_prefill = (T_curr > T_img_kv)
+
+        # let's construct full q,k,v first, we will replace the kv from image later
+        # we must do this to preserve the pos embedding assignment validity
+        q_curr = self.q_proj(x).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
+        k_curr = self.k_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+        v_curr = self.v_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+
+        q, k_rotated = apply_rotary_pos_embd(q_curr, k_curr, cos, sin)
+
+        # now since we already got the full RoPE-ed input, lets develop the logic to detect whether this is special case or no
+        if is_dual_prefill:
+            k_img = block_kv_cache['key']
+            v_img = block_kv_cache['value']
+            # then, up to [:T_img_kv], replace with k_img and v_img
+            k = torch.cat([k_img, k_rotated[:,:,T_img_kv:,:]], dim=2)  # (B, n_kv_heads, T_curr (with replacement), head_dim)
+            v = torch.cat([v_img, v_curr[:,:,T_img_kv:,:]], dim=2)  # (B, n_kv_heads, T_curr (with replacement), head_dim)
+            # then assign it back to the original `block_kv_cache`
+            block_kv_cache['key'] = k
+            block_kv_cache['value'] = v
+        else:
+            # Concatenate with cached K, V
+            # k_rotated and v_curr are for the new token(s)
+            k = block_kv_cache['key']
+            v = block_kv_cache['value']
+            k = torch.cat([k, k_rotated], dim=2)
+            v = torch.cat([v, v_curr], dim=2)
+            block_kv_cache['key'] = k
+            block_kv_cache['value'] = v
+        
+        # Repeat K, V for Grouped Query Attention
+        k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
+        v_exp = v.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
+        
+        T_kv = k_exp.size(2) # Total sequence length of keys/values
+
+        # Prepare attention mask for SDPA or manual path
+        # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
+        additive_attn_mask = None
+        if attention_mask is not None:
+            # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
+            # Let's make it `[B, 1, 1, T_kv]` for SDPA.
+            mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
+            # Convert to additive mask: 1 (attend) -> 0.0, 0 (pad) -> -inf
+            additive_attn_mask = torch.where(mask_for_keys.unsqueeze(1).unsqueeze(2).bool(), 0.0, float('-inf'))
+            # This additive_attn_mask shape is [B, 1, 1, T_kv]
+        
+        # Create modified causal mask once (shared between SDPA and manual paths)
+        # in the case of autoregressive decoding, NO NEED TO MAKE THIS, since one query token will naturally look at all others (pure self-attention)
+        # that's why the condition is if T_curr > 1, where autoregressive generation T_curr == 1 always
+        causal_mask_bool = None
+        if T_curr == T_kv and T_curr > 1:
+            # Create modified causal mask: image tokens attend bidirectionally, text tokens attend causally
+            # -img- -txt-
+            # 11111 10000
+            # 11111 11000
+            # 11111 11100
+            # 11111 11110
+            # 11111 11111
+
+
+            # 1. Image Bidirectional Masking
+            causal_mask_bool = torch.zeros(T_curr, T_curr, device=x.device, dtype=torch.bool)
+            # first T_img_kv rows can attend to first T_img_kv columns only
+            causal_mask_bool[:T_img_kv, :T_img_kv] = True
+            # all text rows can attend to the image columns (before causal)
+            causal_mask_bool[T_img_kv:, :T_img_kv] = True
+            
+
+
+            # 2. Causal Applying
+            # get the length of text and prepare the causal lower triangle matrix
+            text_len = T_curr - T_img_kv
+            text_causal = torch.tril(torch.ones(text_len, text_len, device=x.device, dtype=torch.bool))
+            # patch such triangle to the text area only
+            causal_mask_bool[T_img_kv:, T_img_kv:] = text_causal
+            # for broadcasting compatibility, add (B, n_heads) dimensions
+            causal_mask_bool = causal_mask_bool.view(1, 1, T_curr, T_curr)
+
+
+            # 3. Expectation result:
+            # assuming T_curr = 10 and T_kv  = 2, then the produced mask is ->
+            # tensor([[[[ True,  True,  True,  True,  True,  True,  True,  True,  True,  True], <- bidirectional for first img token (will be masked anyway)
+            #           [ True,  True,  True,  True,  True,  True,  True,  True,  True,  True], <- bidirectional ~ (masked anyway)
+            #           [ True,  True,  True, False, False, False, False, False, False, False], <- start of modified causal for text token #0
+            #           [ True,  True,  True,  True, False, False, False, False, False, False], <- text token #1
+            #           [ True,  True,  True,  True,  True, False, False, False, False, False], <- ...
+            #           [ True,  True,  True,  True,  True,  True, False, False, False, False],
+            #           [ True,  True,  True,  True,  True,  True,  True, False, False, False],
+            #           [ True,  True,  True,  True,  True,  True,  True,  True, False, False],
+            #           [ True,  True,  True,  True,  True,  True,  True,  True,  True, False],
+            #           [ True,  True,  True,  True,  True,  True,  True,  True,  True,  True]]]]) <- last text token
+        
+        
+        if self.sdpa and x.device.type != 'mps':
+            combined_mask = additive_attn_mask
+            if causal_mask_bool is not None:
+                # convert boolean mask to additive mask: True -> 0.0, False -> -inf
+                modified_causal_mask = torch.where(causal_mask_bool, 0.0, float('-inf'))
+                # if there is additive, add it to block <pad> / unattended token, else just use the pure causal
+                combined_mask = modified_causal_mask + additive_attn_mask if additive_attn_mask is not None else modified_causal_mask
+                # TODO: Remove after proofing
+                causal_attn = combined_mask
+            
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k_exp, v_exp,
+                attn_mask=combined_mask, # in the case of None, it will become standard bidirectional self attention mechanism
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False  # False, since we handle causal masking explicitly above
+            )
+        else:
+            # Manual attention implementation
+            attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
+
+            # Apply modified causal masking during dual prefill
+            if causal_mask_bool is not None:
+                attn = attn.masked_fill(~causal_mask_bool, float('-inf'))
+
+            if additive_attn_mask is not None: # Additive padding mask
+                # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
+                attn = attn + additive_attn_mask
+            
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
             y = attn @ v_exp
