@@ -1,20 +1,24 @@
 # DualTowerVLM
 ## Setup
 1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
-2. Simply run `setup.sh`
+2. Run `setup.sh`
 
 ## Train
-1. Run `train_dual_tower.sh` after filling in the environment variables.
+1. Run `train.sh` after filling in the environment variables.
 
 ## Directory
-1. Training code -> `train_*.py` (vanilla / dual_tower)
-2. TwinTower model -> `models/dual_tower.py`
-3. Configs -> `configs/config_*.py` (vanilla / dual_tower)
-4. Evaluation -> `generate_dual_tower.py` & `cider.py`
+0. End-to-end Implementation (Data + Model) -> `e2e_dual_tower.ipynb`
+1. Dataset & Collators -> `data/datasets.py` & `data/collators.py`
+2. DualTower model -> `models/dual_tower/dual_tower.py` & `models/dual_tower/dual_language_model.py` (RoPE & Causal Mask Modification)
+3. Configs -> `configs/config_*.py` (`vanilla` / `dual_tower`)
+4. Training Loop -> `train_*.py` (`vanilla` / `dual_tower`)
+5. Evaluation -> `evaluation/cider_utils.py`
 
 ## Changelog
-> 15/10/25 -- Revamp and tidy up `nanoVLM` repo, trimming out unused codes
+> 18/12/25 -- Add `lm_changes.patch` to make it easier to look at the diff between `dual_language_model.py` vs original `language_model.py`
+> 18/12/25 -- Add `cider_utils.py` for in-training evaluation
 > 13/12/25 -- Revamp DualTowerVLM dataset packing, training, generation code
+> 15/10/25 -- Revamp and tidy up `nanoVLM` repo, trimming out unused codes
 
 ## Citation
 This implementation is adapted from:

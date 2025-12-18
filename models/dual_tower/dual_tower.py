@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.language_model import LanguageModel
+from models.dual_tower.dual_language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.config import VLMConfig
 from models.utils import top_k_top_p_filtering
@@ -66,7 +66,7 @@ class RightTower(LanguageModel):
         x: torch.Tensor,
         attention_mask: torch.Tensor = None,
         kv_cache: list[dict] = None,
-        start_pos: int = 0,
+        start_pos = 0,
     ):
         if kv_cache is None:
             raise ValueError("kv_cache must be provided from LeftTower result to RightTower.forward(). It cannot be None.")
@@ -74,8 +74,31 @@ class RightTower(LanguageModel):
         B, T_text, _ = x.size()
         
         # Create position_ids for the current text sequence based on start_pos
-        current_position_ids = torch.arange(start_pos, start_pos + T_text, device=x.device).unsqueeze(0).expand(B, -1)
-        cos, sin = self.rotary_embd(current_position_ids, attention_mask)
+        if isinstance(start_pos, torch.Tensor):
+             if start_pos.dim() == 1:
+                 start_pos = start_pos.unsqueeze(1) # (B, 1)
+             
+             # Create offsets [0, 1, ..., T_text-1]
+             offsets = torch.arange(T_text, device=x.device).unsqueeze(0) # (1, T_text)
+             current_position_ids = start_pos + offsets # (B, T_text)
+        else:
+            current_position_ids = torch.arange(start_pos, start_pos + T_text, device=x.device).unsqueeze(0).expand(B, -1)
+        
+        # For rotary embeddings, we need the attention mask to match the current sequence length being processed
+        # During autoregressive decoding (T_text=1):
+        # We must NOT pass the sliced mask to RoPE because RoPE's skippable logic (cumsum) requires full history.
+        # Passing a slice [1] resets position to 0.
+        # Instead, we rely on the pre-calculated current_position_ids (via start_pos) and pass None.
+        
+        rope_mask = attention_mask
+        if attention_mask is not None and attention_mask.size(1) != T_text:
+             # We are in decoding phase (likely), and mask is full history but T_text is 1.
+             # We must NOT pass the full mask because RoPE expects mask shape == pos_ids shape.
+             # We must NOT pass the sliced mask because it breaks cumsum logic for skippable RoPE.
+             # So we pass None, and trust that current_position_ids is correct.
+             rope_mask = None
+
+        cos, sin = self.rotary_embd(current_position_ids, rope_mask)
         
         # Process through all transformer blocks
         # kv_cache is List[N] for N layers
@@ -133,7 +156,11 @@ class RightTower(LanguageModel):
         last_output = prompt_output[:, -1, :]
         
         # count non <pad> area, this is the valid final position ID before autoregressive increment++
-        current_token_start_pos = current_attention_mask.sum(dim=1).max().item() - 1
+        # Skippable: track actual valid tokens count per sample
+        # Note: Even though we pass single-token mask during generation loop to forward(), 
+        # this `current_token_start_pos` tensor maintains the correct cumulative position (accounting for skipped pads)
+        # which we pass as `start_pos` to correctly generate position_ids in forward().
+        current_token_start_pos = current_attention_mask.sum(dim=1) - 1 # Shape (B,)
 
         # Autoregressive generation loop up to `max_new_tokens`
         for i in range(max_new_tokens):
@@ -238,7 +265,7 @@ class DualTowerVLM(nn.Module):
         max_new_tokens: int = 50,
         top_k: int = 50,
         top_p: float = 0.9,
-        temperature: float = 0.5,
+        temperature: float = 0.7,
         greedy: bool = False,
     ):
         """
@@ -300,9 +327,8 @@ class DualTowerVLM(nn.Module):
         else:
             current_logits = last_output
         
-        # Track the current total sequence length for position tracking
-        current_token_start_pos = attention_mask.sum(dim=1).max().item() - 1
-        
+        current_token_start_pos = attention_mask.sum(dim=1) - 1 # Shape (B,)
+
         newly_generated_ids_list = []
         current_attention_mask = attention_mask.clone()
         

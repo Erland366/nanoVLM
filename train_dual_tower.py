@@ -15,9 +15,10 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from datasets import load_dataset
 from tqdm import tqdm
-
+import json
 import warnings
 from pydantic import warnings as pydantic_warnings
+import shutil
 warnings.filterwarnings("ignore", category=pydantic_warnings.UnsupportedFieldAttributeWarning)
 
 torch.manual_seed(0)
@@ -27,11 +28,12 @@ if torch.cuda.is_available():
 PG_CPU = None
 
 from configs.config_dual_tower import VLMConfig, TrainConfig, GlobalConfig
-from models.dual_tower import DualTowerVLM
+from models.dual_tower.dual_tower import DualTowerVLM
 from data.data_utils import synchronized_dataloader_step
 from data.processors import get_image_processor, get_tokenizer
 from data.datasets import VQADualDataset
 from data.collators import VQADualCollator
+from evaluation.cider_utils import COCOGenerationDataset, GenerationCollator, compute_cider_score
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -157,7 +159,30 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
     next(iter(val_loader))
     print("Warmup complete.")
 
-    return train_loader, val_loader
+    # Prepare CIDEr dataloader (only on master to save memory/time)
+    cider_loader = None
+    if is_master():
+        print("Loading COCO validation for CIDEr evaluation...")
+        cider_dataset_hf = load_dataset("patrickamadeus/coco_caption_val_unique", split="train")
+        cider_dataset = COCOGenerationDataset(
+            cider_dataset_hf,
+            tokenizer,
+            image_processor,
+            prompt="Describe the image.",
+            mp_image_token_length=vlm_cfg.mp_image_token_length,
+            total_samples=5000  # Limit for evaluation speed
+        )
+        cider_collator = GenerationCollator(tokenizer, max_length=2048)
+        cider_loader = DataLoader(
+            cider_dataset,
+            batch_size=train_cfg.batch_size,
+            shuffle=False,
+            num_workers=2,
+            collate_fn=cider_collator,
+            pin_memory=True if torch.cuda.is_available() else False
+        )
+
+    return train_loader, val_loader, cider_loader, tokenizer
 
 
 def get_lr(it, max_lr, max_steps):
@@ -173,7 +198,7 @@ def get_lr(it, max_lr, max_steps):
     return min_lr + coeff * (max_lr - min_lr)
 
 def evaluate_validation(model, val_loader, device, is_dist_flag=False, save_checkpoint=False, 
-                        vlm_cfg=None, run_name=None, global_step=None, train_cfg=None):
+                        vlm_cfg=None, run_name=None, global_step=None, train_cfg=None, compute_cider=False, cider_loader=None, tokenizer=None):
     model.eval()
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -201,7 +226,7 @@ def evaluate_validation(model, val_loader, device, is_dist_flag=False, save_chec
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             last_img_idx = batch["last_img_idx"]
-
+            
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 _, loss = model(
                     input_ids=input_ids, 
@@ -230,16 +255,37 @@ def evaluate_validation(model, val_loader, device, is_dist_flag=False, save_chec
             min_batch_loss = min(dist_gather(min_batch_loss))
             max_batch_loss = max(dist_gather(max_batch_loss))
         
+        cider_score = None
+        if compute_cider and tokenizer is not None and is_master() and cider_loader is not None:
+            if is_master():
+                print("\nComputing CIDEr score on COCO validation set...")
+            
+            log_samples_path = None
+            if run_name and global_step is not None and train_cfg is not None:
+                timestamp = run_name.split('_')[-1]
+                base_name = train_cfg.hf_model_cp_path.replace("/", "_") + "_" + timestamp
+                os.makedirs("eval_samples", exist_ok=True)
+                log_samples_path = os.path.join("eval_samples", base_name, f"samples_step_{global_step}.jsonl")
+            
+            cider_score = compute_cider_score(
+                model, cider_loader, device, tokenizer,
+                max_new_tokens=30,
+                max_samples=5000,
+                log_samples_path=log_samples_path
+            )
+            if is_master():
+                print(f"CIDEr Score: {cider_score:.4f}")
+        
         if save_checkpoint and is_master():
             checkpoint_path_step = os.path.join(vlm_cfg.vlm_checkpoint_path, run_name, f"step_{global_step}")
             save_model = model.module if is_dist_flag else model
             save_model.save_pretrained(save_directory=checkpoint_path_step)
     
-    return avg_val_loss, min_batch_loss, max_batch_loss
+    return avg_val_loss, min_batch_loss, max_batch_loss, cider_score
 
 
 def train(train_cfg, vlm_cfg, global_cfg):
-    train_loader, val_loader = get_dataloaders(train_cfg, vlm_cfg, global_cfg)
+    train_loader, val_loader, cider_loader, tokenizer = get_dataloaders(train_cfg, vlm_cfg, global_cfg)
 
     if is_dist():
         print("Rank", get_rank(), "Waiting for all workers to get dataloaders...")
@@ -265,7 +311,6 @@ def train(train_cfg, vlm_cfg, global_cfg):
             }
         )
     
-    # Initialize model
     model = DualTowerVLM(
         vlm_cfg, 
         load_backbone=vlm_cfg.vlm_load_backbone_weights,
@@ -286,7 +331,6 @@ def train(train_cfg, vlm_cfg, global_cfg):
         print()
         print(f"Training summary: {len(train_loader)} batches/epoch, batch size {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}")
 
-    # Define optimizer groups
     param_groups = []
     if train_cfg.lr_mp > 0:
         param_groups.append({'params': list(model.left_tower.MP.parameters()), 'lr': train_cfg.lr_mp})
@@ -327,9 +371,42 @@ def train(train_cfg, vlm_cfg, global_cfg):
     epoch = 0
 
     if train_cfg.use_epochs:
-        max_steps = train_cfg.max_epochs * len(train_loader)
+        # Calculate number of optimizer updates (not batches) per epoch
+        batches_per_epoch = len(train_loader)
+        updates_per_epoch = math.ceil(batches_per_epoch / train_cfg.gradient_accumulation_steps)
+        max_steps = train_cfg.max_epochs * updates_per_epoch
+        print(f"Training for {train_cfg.max_epochs} epochs = {max_steps} optimizer updates ({batches_per_epoch} batches/epoch, grad_accum={train_cfg.gradient_accumulation_steps})")
     else:
         max_steps = train_cfg.max_training_steps
+        print(f"Training for {max_steps} optimizer updates")
+
+    # Compute baseline validation loss at step 0 before training
+    if is_master():
+        print("\n" + "="*50)
+        print("Computing baseline validation loss (step 0)...")
+        print("="*50)
+    
+    baseline_val_loss, baseline_min_loss, baseline_max_loss, baseline_cider = evaluate_validation(
+        model, val_loader, device, is_dist_flag=is_dist(),
+        save_checkpoint=False, vlm_cfg=vlm_cfg, run_name=run_name,
+        global_step=0, train_cfg=train_cfg, compute_cider=True, cider_loader=cider_loader, tokenizer=tokenizer
+    )
+    
+    if is_master():
+        print(f"\nBaseline Validation Loss (step 0): {baseline_val_loss:.4f}")
+        print(f"  ├── Min batch loss: {baseline_min_loss:.4f}")
+        print(f"  └── Max batch loss: {baseline_max_loss:.4f}")
+        print("="*50 + "\n")
+        
+        if train_cfg.log_wandb:
+            log_dict = {
+                "val/val_loss": baseline_val_loss,
+                "val/min_val_loss": baseline_min_loss,
+                "val/max_val_loss": baseline_max_loss,
+            }
+            if baseline_cider is not None:
+                log_dict["val/cider_score"] = baseline_cider
+            run.log(log_dict, step=0)
 
     while global_step < max_steps:
         epoch += 1
@@ -390,12 +467,19 @@ def train(train_cfg, vlm_cfg, global_cfg):
 
             if is_update_step:
                 if train_cfg.max_grad_norm is not None:
+                    # Compute raw gradient norm BEFORE clipping
                     raw_grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in all_params if p.grad is not None]), 2)
+                    # Clip gradients (this modifies gradients in-place and returns the pre-clip norm)
+                    total_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
+                    # Compute gradient norm AFTER clipping
+                    clipped_grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in all_params if p.grad is not None]), 2)
+                    
                     if train_cfg.log_wandb and is_master():
-                        run.log({"train/raw_grad_norm": raw_grad_norm.item()}, step=global_step)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
-                    if train_cfg.log_wandb and is_master():
-                        run.log({"train/clipped_grad_norm": grad_norm}, step=global_step)
+                        run.log({
+                            "train/raw_grad_norm": raw_grad_norm.item(),
+                            "train/total_grad_norm": total_norm.item(),  # Pre-clip norm from PyTorch
+                            "train/clipped_grad_norm": clipped_grad_norm.item()  # Post-clip norm
+                        }, step=global_step)
 
                 # Update learning rates
                 param_group_idx = 0
@@ -447,33 +531,69 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 with torch.no_grad():
-                    avg_val_loss, min_val_loss, max_val_loss = evaluate_validation(
+                    avg_val_loss, min_val_loss, max_val_loss, cider_score = evaluate_validation(
                         model, val_loader, device, is_dist_flag=is_dist(), 
                         save_checkpoint=False, vlm_cfg=vlm_cfg, run_name=run_name, 
-                        global_step=global_step, train_cfg=train_cfg
+                        global_step=global_step, train_cfg=train_cfg, compute_cider=True, cider_loader=cider_loader, tokenizer=tokenizer
                     )
                     
                     if is_master():
                         print(f"Step: {global_step}, Val Loss: {avg_val_loss:.4f}, Tokens/s: {tokens_per_second:.2f}")
                         if train_cfg.log_wandb:
-                            run.log({
+                            log_dict = {
                                 "val/val_loss": avg_val_loss, 
                                 "val/min_val_loss": min_val_loss, 
                                 "val/max_val_loss": max_val_loss
-                            }, step=global_step)
+                            }
+                            if cider_score is not None:
+                                log_dict["val/cider_score"] = cider_score
+                            run.log(log_dict, step=global_step)
 
                 model.train()
 
             # Save checkpoint
             if global_step % train_cfg.save_model_every_n_steps == 0 and global_step > 0 and is_master():
                 save_model = model.module if is_dist() else model
+                checkpoint_dir = f"{train_cfg.local_model_cp_path}-{global_step}"
+                
                 if train_cfg.save_local:
-                    save_model.left_tower.save_pretrained(save_directory=f"{train_cfg.local_model_cp_path}-{global_step}")
-                    print(f"Model saved locally to {train_cfg.local_model_cp_path}-{global_step}")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    torch.save({
+                        'model_state_dict': save_model.state_dict(),
+                        'config': vlm_cfg.__dict__,
+                        'global_step': global_step,
+                    }, os.path.join(checkpoint_dir, 'dual_tower_model.pt'))
+                    with open(os.path.join(checkpoint_dir, 'config.json'), 'w') as f:
+                        json.dump(vlm_cfg.__dict__, f, indent=2)
+                    print(f"DualTowerVLM saved locally to {checkpoint_dir}")
                 
                 if train_cfg.save_hf:
-                    save_model.left_tower.push_to_hub(f"{train_cfg.hf_model_cp_path}-{global_step}")
-                    print(f"Model pushed to HuggingFace Hub: {train_cfg.hf_model_cp_path}-{global_step}")
+                    from huggingface_hub import HfApi, create_repo
+                    api = HfApi()
+                    repo_id = f"{train_cfg.hf_model_cp_path}-{global_step}"
+                    
+                    try:
+                        create_repo(repo_id, exist_ok=True)
+                    except Exception as e:
+                        print(f"Repo creation note: {e}")
+                    
+                    temp_dir = f"/tmp/dual_tower_checkpoint_{global_step}"
+                    os.makedirs(temp_dir, exist_ok=True)
+                    torch.save({
+                        'model_state_dict': save_model.state_dict(),
+                        'config': vlm_cfg.__dict__,
+                        'global_step': global_step,
+                    }, os.path.join(temp_dir, 'dual_tower_model.pt'))
+                    with open(os.path.join(temp_dir, 'config.json'), 'w') as f:
+                        json.dump(vlm_cfg.__dict__, f, indent=2)
+                    
+                    api.upload_folder(
+                        folder_path=temp_dir,
+                        repo_id=repo_id,
+                        repo_type="model"
+                    )
+                    print(f"DualTowerVLM pushed to HuggingFace Hub: {repo_id}")
+                    shutil.rmtree(temp_dir)
 
             if is_update_step:
                 if is_dist():
@@ -488,7 +608,6 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 global_step += 1
                 if global_step >= max_steps:
                     break
-            data_load_start = time.time()
 
         avg_train_loss = total_train_loss / len(train_loader)
         avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
@@ -523,9 +642,23 @@ def train(train_cfg, vlm_cfg, global_cfg):
         
         if train_cfg.save_hf and best_model_path:
             print(f"Training complete. Pushing best model from {best_model_path} to Hugging Face Hub...")
-            hf_model = DualTowerVLM.from_pretrained(vlm_cfg, best_model_path)
-            hf_model.left_tower.push_to_hub(f"{train_cfg.hf_model_cp_path}-best")
-            print(f"Best model pushed to HuggingFace Hub: {train_cfg.hf_model_cp_path}-best")
+            from huggingface_hub import HfApi, create_repo
+            api = HfApi()
+            repo_id = f"{train_cfg.hf_model_cp_path}-best"
+            
+            # Create repo if it doesn't exist
+            try:
+                create_repo(repo_id, exist_ok=True)
+            except Exception as e:
+                print(f"Repo creation note: {e}")
+            
+            # Upload the best model checkpoint folder to hub
+            api.upload_folder(
+                folder_path=best_model_path,
+                repo_id=repo_id,
+                repo_type="model"
+            )
+            print(f"DualTowerVLM best model pushed to HuggingFace Hub: {repo_id}")
 
         if train_cfg.log_wandb:
             run.summary["avg_epoch_time"] = avg_epoch_time
