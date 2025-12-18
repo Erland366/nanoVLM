@@ -15,10 +15,10 @@
 5. Evaluation -> `evaluation/cider_utils.py`
 
 ## Changelog
-> 18/12/25 -- Add `lm_changes.patch` to make it easier to look at the diff between `dual_language_model.py` vs original `language_model.py`
-> 18/12/25 -- Add `cider_utils.py` for in-training evaluation
-> 13/12/25 -- Revamp DualTowerVLM dataset packing, training, generation code
-> 15/10/25 -- Revamp and tidy up `nanoVLM` repo, trimming out unused codes
+- > 18/12/25 -- Add `lm_changes.patch` to make it easier to look at the diff between `dual_language_model.py` vs original `language_model.py`
+- > 18/12/25 -- Add `cider_utils.py` for in-training evaluation
+- > 13/12/25 -- Revamp DualTowerVLM dataset packing, training, generation code
+- > 15/10/25 -- Revamp and tidy up `nanoVLM` repo, trimming out unused codes
 
 ## Citation
 This implementation is adapted from:
