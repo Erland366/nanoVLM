@@ -62,6 +62,11 @@ def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
     return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 # ============================================================================
 # Seed and Random Utilities
@@ -236,36 +241,6 @@ def save_model_checkpoint(model, train_cfg, global_step=None, is_final=False):
         save_model.push_to_hub(hf_path)
 
 
-# ============================================================================
-# Evaluation Functions
-# ============================================================================
-
-def compute_cider(model, cider_loader, device, tokenizer, train_cfg, global_cfg, run_name=None, global_step=None):
-    # replace all / in run name with __
-    run_name = run_name.replace("/", "__")
-    log_samples_path = os.path.join(global_cfg.eval_dir, run_name, f"cider_{global_step}.jsonl")
-    return compute_cider_score(
-        model, cider_loader, device, tokenizer,
-        max_new_tokens=30, # TODO: make this a parameter
-        max_samples=train_cfg.total_samples, # TODO: make this a parameter
-        log_samples_path=log_samples_path
-    )
-
-def compute_accuracy():
-    pass
-
-def compute_bleu():
-    pass
-
-def compute_meteor():
-    pass
-
-def compute_rouge():
-    pass
-
-def compute_spice():
-    pass
-
 def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global_cfg, run_name=None, 
                         global_step=None, tokenizer=None, metric="cider"):
     model.eval()
@@ -320,22 +295,19 @@ def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global
         avg_val_loss = total_val_loss / val_batches if val_batches > 0 else 0
 
         metric_score = None
+        log_samples_path = None
+        if run_name and global_step is not None and train_cfg is not None:
+            timestamp = run_name.split('_')[-1]
+            base_name = train_cfg.hf_model_cp_path.replace("/", "_") + "_" + timestamp
+            os.makedirs(global_cfg.eval_dir, exist_ok=True)
+            log_samples_path = os.path.join(global_cfg.eval_dir, base_name, f"samples_step_{global_step}.jsonl")
+        
         if metric == "cider":
-            metric_score = compute_cider(
-                model, gen_loader, device, tokenizer, 
-                train_cfg, global_cfg, run_name, global_step
+            metric_score = compute_cider_score(
+                model, gen_loader, device, tokenizer,
+                max_new_tokens=30, # TODO: make this a parameter
+                max_samples=5000, # TODO: make this a parameter
+                log_samples_path=log_samples_path
             )
-        elif metric == "accuracy":
-            pass
-        elif metric == "bleu":
-            pass
-        elif metric == "meteor":
-            pass
-        elif metric == "rouge":
-            pass
-        elif metric == "spice":
-            pass
-        else:
-            raise ValueError(f"Invalid metric: {metric}")
 
     return avg_val_loss, min_batch_loss, max_batch_loss, metric_score

@@ -17,7 +17,7 @@ from evaluation.cider_utils import (
     VanillaCOCOGenerationDataset,
     VanillaGenerationCollator,
 )
-from train.utils import is_dist, is_master, get_world_size, get_rank
+from train_utils.utils import is_dist, is_master, get_world_size, get_rank, seed_worker
 
 
 DATASET_COLLATOR_MAP = {
@@ -28,12 +28,6 @@ DATASET_COLLATOR_MAP = {
 EVAL_DATASET_COLLATOR_MAP = {
     "coco_caption": (VanillaCOCOGenerationDataset, VanillaGenerationCollator),
 }
-
-
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
 
 
 def get_custom_dataloaders(train_cfg, vlm_cfg, global_cfg, train_split = "train", val_split = "validation", generate_val_data = False, val_ratio = 0.2):

@@ -1,5 +1,5 @@
 import wandb
-from train.utils import is_master
+from train_utils.utils import is_master
 
 
 # ============================================================================
