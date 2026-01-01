@@ -9,13 +9,12 @@ from data.processors import get_image_string
 
 
 class VanillaCOCOGenerationDataset(Dataset):
-    def __init__(self, dataset, tokenizer, image_processor, prompt, mp_image_token_length, total_samples):
+    def __init__(self, dataset, tokenizer, image_processor, mp_image_token_length, total_samples):
         print("Preparing Vanilla CIDEr dataset...")
         self.samples = []
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.mp_image_token_length = mp_image_token_length
-        self.prompt = prompt
         
         max_iter = min(total_samples, len(dataset)) if total_samples > 0 else len(dataset)
         for i in tqdm(range(max_iter), desc="Loading Vanilla CIDEr samples"):
@@ -52,7 +51,7 @@ class VanillaCOCOGenerationDataset(Dataset):
         )
         
         messages = [
-            {"role": "user", "content": image_string + self.prompt}
+            {"role": "user", "content": image_string + "Describe the image."}
         ]
         
         # Tokenize with add_generation_prompt=True to add assistant turn prefix
@@ -143,13 +142,12 @@ class VanillaGenerationCollator:
 
 
 class COCOGenerationDataset(Dataset):
-    def __init__(self, dataset, tokenizer, image_processor, prompt, mp_image_token_length, total_samples):
+    def __init__(self, dataset, tokenizer, image_processor, mp_image_token_length, total_samples):
         print("Preparing CIDEr dataset...")
         self.samples = []
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.mp_image_token_length = mp_image_token_length
-        self.prompt = prompt
         
         max_iter = min(total_samples, len(dataset)) if total_samples > 0 else len(dataset)
         for i in tqdm(range(max_iter), desc="Loading CIDEr samples"):
@@ -186,7 +184,7 @@ class COCOGenerationDataset(Dataset):
         )
         
         messages = [
-            {"role": "user", "content": image_string + self.prompt}
+            {"role": "user", "content": image_string + "Describe the image."}
         ]
         
         # Tokenize with add_generation_prompt=True to add assistant turn prefix

@@ -267,3 +267,114 @@ class VQADualDataset(Dataset):
         labels = labels.roll(-1)  # Shift labels for causal LM
         labels[-1] = -100  # Last token has no target
         return labels
+
+
+class COCOCaptionsVanillaDataset(Dataset):
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        image_processor,
+        mp_image_token_length,
+        relevance_min_rating=None,
+        image_correspondence_min_rating=None,
+        visual_dependency_min_rating=None,
+        formatting_min_rating=None,
+    ):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.mp_image_token_length = mp_image_token_length
+        self.prefix_len = self._get_prefix_len()
+
+        # these won't be used, just to maintain uniformity with the vanilla training code
+        self.relevance_min_rating = relevance_min_rating
+        self.image_correspondence_min_rating = image_correspondence_min_rating
+        self.visual_dependency_min_rating = visual_dependency_min_rating
+        self.formatting_min_rating = formatting_min_rating
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _get_prefix_len(self):
+        random_string_5_letters = "xzyvd"
+        random_string_chat_templated = self.tokenizer.apply_chat_template(
+            [{"role": "assistant", "content": random_string_5_letters}], 
+            tokenize=False, 
+            add_special_tokens=False
+        )
+        random_string_location = random_string_chat_templated.find(random_string_5_letters)
+        return len(self.tokenizer.encode(random_string_chat_templated[:random_string_location]))
+    
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        return self._process_data(item)
+    
+    def _process_data(self, item):
+        image = item['image']
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        processed_image, splitted_image_ratio = self.image_processor(image)
+
+        # handle global imag etoken case
+        if (not hasattr(self.tokenizer, "global_image_token") and 
+            splitted_image_ratio[0] * splitted_image_ratio[1] == len(processed_image) - 1):
+            processed_image = processed_image[1:]
+
+        image_string = get_image_string(
+            self.tokenizer, 
+            [splitted_image_ratio], 
+            self.mp_image_token_length
+        )
+        
+        messages = [
+            {"role": "user", "content": image_string + "Describe the image."},
+            {"role": "assistant", "content": item['caption']}
+        ]
+        
+        input_ids, loss_mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
+        labels = self._get_labels(input_ids, loss_mask)
+        
+        return {
+            "images": processed_image,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+    
+    def _prepare_inputs_and_loss_mask(self, messages):
+        conv_ids = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_special_tokens=False,
+            return_dict=True,
+        )
+        mask = [0] * len(conv_ids["input_ids"])
+
+        # locate assistant token turn and flip its mask to 1 if its more than prefix len ("assistant\n" token)
+        cursor = 0
+        for msg in messages:
+            segment_ids = self.tokenizer.apply_chat_template(
+                [msg], tokenize=True, add_special_tokens=False
+            )
+            seg_len = len(segment_ids)
+
+            if msg["role"] == "assistant":
+                start = cursor + self.prefix_len
+                end = cursor + seg_len
+                mask[start:end] = [1] * (end - start)
+
+            cursor += seg_len
+
+        return (
+            torch.tensor(conv_ids["input_ids"]), 
+            torch.tensor(mask).to(torch.bool), 
+            torch.tensor(conv_ids["attention_mask"])
+        )
+    
+    def _get_labels(self, input_ids, mask):
+        labels = input_ids.clone().masked_fill(~mask, -100)
+        labels = labels.roll(-1)
+        labels[-1] = -100
+        return labels

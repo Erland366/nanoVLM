@@ -189,3 +189,19 @@ class VQADualCollator(BaseCollator):
 
     def __call__(self, batch):
         return self.prepare_batch(batch, max_length=self.max_length)
+
+
+class COCOCaptionsVanillaCollator(BaseCollator):
+    """ Simple left padding basically same with VQACollator """
+    def __init__(self, tokenizer, max_length):
+        super().__init__(tokenizer)
+        self.max_length = max_length
+
+    def _pad_batch(self, batch, max_length):
+        batch["input_ids"] = [torch.nn.functional.pad(ids, (max_length - len(ids), 0), value=self.tokenizer.pad_token_id) for ids in batch["input_ids"]]
+        batch["labels"] = [torch.nn.functional.pad(labels, (max_length - len(labels), 0), value=-100) for labels in batch["labels"]]
+        batch["attention_mask"] = [torch.nn.functional.pad(attention_mask, (max_length - len(attention_mask), 0), value=0) for attention_mask in batch["attention_mask"]]
+
+    def __call__(self, batch):
+        batch = self.prepare_batch(batch, max_length=self.max_length)
+        return batch
