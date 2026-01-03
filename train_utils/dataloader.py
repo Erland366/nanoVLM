@@ -1,42 +1,28 @@
+# import python libs
 import torch
-import random
-import numpy as np
 from torch.utils.data import DataLoader
 from datasets import load_dataset, load_from_disk, concatenate_datasets, get_dataset_config_names
+
+# import multimodal processors, tokenizers, packing
 from data.processors import get_image_processor, get_tokenizer
-from data.datasets import (
-    VQADataset,
-    COCOCaptionsVanillaDataset,
-)
-from data.collators import (
-    VQACollator,
-    COCOCaptionsVanillaCollator,
-)
 from data.advanced_datasets import ConstantLengthDataset
-from evaluation.cider_utils import (
-    VanillaCOCOGenerationDataset,
-    VanillaGenerationCollator,
-)
+
+# import dataset, collators, and mapper
+from data.datasets import VQADataset
+from data.collators import VQACollator
+from train_utils.mapper import TRAIN_DATASET_COLLATOR_MAP, GEN_DATASET_COLLATOR_MAP
+
+# ddp helpers
 from train_utils.utils import is_dist, is_master, get_world_size, get_rank, seed_worker
-
-
-DATASET_COLLATOR_MAP = {
-    "coco_caption": (COCOCaptionsVanillaDataset, COCOCaptionsVanillaCollator),
-    "vqa": (VQADataset, VQACollator),
-}
-
-EVAL_DATASET_COLLATOR_MAP = {
-    "coco_caption": (VanillaCOCOGenerationDataset, VanillaGenerationCollator),
-}
 
 
 def get_custom_dataloaders(train_cfg, vlm_cfg, global_cfg, train_split = "train", val_split = "validation", generate_val_data = False, val_ratio = 0.2):
     print("Custom dataset loading mode...")
     print(f"Getting dataloaders from {train_cfg.train_dataset_path}")
 
-    if train_cfg.custom_dataset_id not in DATASET_COLLATOR_MAP:
-        raise ValueError(f"Custom dataset ID '{train_cfg.custom_dataset_id}' not found in DATASET_COLLATOR_MAP")
-    DatasetClass, CollatorClass = DATASET_COLLATOR_MAP[train_cfg.custom_dataset_id]
+    if train_cfg.custom_dataset_id not in TRAIN_DATASET_COLLATOR_MAP:
+        raise ValueError(f"Custom dataset ID '{train_cfg.custom_dataset_id}' not found in TRAIN_DATASET_COLLATOR_MAP")
+    DatasetClass, CollatorClass = TRAIN_DATASET_COLLATOR_MAP[train_cfg.custom_dataset_id]
 
     image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens, vlm_cfg.lm_chat_template)
@@ -263,7 +249,7 @@ def get_eval_dataloaders(train_cfg, vlm_cfg, global_cfg, eval_split = "train", t
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens, vlm_cfg.lm_chat_template)
     
     dataset_hf = load_dataset(train_cfg.custom_eval_dataset_path, split=eval_split)
-    DatasetClass, CollatorClass = EVAL_DATASET_COLLATOR_MAP[train_cfg.eval_dataset_id]
+    DatasetClass, CollatorClass = GEN_DATASET_COLLATOR_MAP[train_cfg.eval_dataset_id]
     cider_dataset = DatasetClass(dataset_hf, tokenizer, image_processor, vlm_cfg.mp_image_token_length, total_samples)
     cider_collator = CollatorClass(tokenizer, max_length=2048)
     

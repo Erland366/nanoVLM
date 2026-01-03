@@ -11,10 +11,6 @@ from tqdm import tqdm
 from evaluation.cider_utils import compute_cider_score
 
 
-# ============================================================================
-# Distributed Training Utilities
-# ============================================================================
-
 def init_dist():
     dist.init_process_group(backend='nccl', timeout=timedelta(minutes=30))
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -36,12 +32,6 @@ def get_rank():
     return dist.get_rank() if is_dist() else 0
 
 def dist_gather(obj, group=None):
-    """
-    Gather *any* picklable object from every rank without allocating
-    temporary CUDA buffers.  Returns a list [rank0_obj, rank1_obj, …].
-
-    Falls back to a single-rank list when torch.distributed is not initialised.
-    """
     if not (dist.is_available() and dist.is_initialized()):
         return [obj]
 
@@ -67,11 +57,6 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-
-# ============================================================================
-# Seed and Random Utilities
-# ============================================================================
-
 def set_seed(global_cfg):
     torch.manual_seed(global_cfg.seed)
     if torch.cuda.is_available():
@@ -79,10 +64,6 @@ def set_seed(global_cfg):
     random.seed(global_cfg.seed)
     np.random.seed(global_cfg.seed)
 
-
-# ============================================================================
-# Run Name Generation
-# ============================================================================
 
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
@@ -97,10 +78,6 @@ def get_run_name(train_cfg, vlm_cfg):
     return f"nanoVLM_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
 
 
-# ============================================================================
-# Learning Rate Scheduling
-# ============================================================================
-
 def get_lr(it, max_lr, max_steps):
     min_lr = max_lr * 0.1
     warmup_steps = max_steps * 0.03
@@ -111,11 +88,6 @@ def get_lr(it, max_lr, max_steps):
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
-
-
-# ============================================================================
-# Model Parameter Setup
-# ============================================================================
 
 def setup_param_groups(model, train_cfg):
     param_groups = []
@@ -143,12 +115,7 @@ def setup_param_groups(model, train_cfg):
     return param_groups, total_params, trainable_params
 
 
-# ============================================================================
-# Statistical Computation Functions
-# ============================================================================
-
 def compute_gradient_stats(all_params, max_grad_norm):
-    """Compute gradient statistics (raw, total, clipped norms)."""
     if max_grad_norm is None:
         return None
     
@@ -175,7 +142,6 @@ def compute_gradient_stats(all_params, max_grad_norm):
 
 
 def compute_batch_stats(loss, attention_mask, gradient_accumulation_steps, batch_start_time, batch_end_time):
-    """Compute batch-level statistics."""
     batch_loss = loss.item() * (gradient_accumulation_steps if gradient_accumulation_steps > 1 else 1)
     num_tokens = torch.sum(attention_mask).item()
     batch_duration = batch_end_time - batch_start_time
@@ -190,7 +156,6 @@ def compute_batch_stats(loss, attention_mask, gradient_accumulation_steps, batch
 
 
 def gather_batch_loss(batch_loss):
-    """Gather batch loss across all ranks."""
     if is_dist():
         return dist_mean_scalar(batch_loss)
     return batch_loss
@@ -198,10 +163,8 @@ def gather_batch_loss(batch_loss):
 
 def compute_epoch_stats(total_train_loss, total_tokens_processed, num_batches, 
                        epoch_start_time, epoch_end_time):
-    """Compute epoch-level statistics."""
     avg_loss = total_train_loss / num_batches if num_batches > 0 else 0
     
-    # Gather statistics across all ranks
     if is_dist():
         avg_loss = dist_mean_scalar(avg_loss)
         total_tokens_processed = sum(dist_gather(total_tokens_processed))
@@ -217,12 +180,7 @@ def compute_epoch_stats(total_train_loss, total_tokens_processed, num_batches,
     }
 
 
-# ============================================================================
-# Model Checkpointing Functions
-# ============================================================================
-
 def save_model_checkpoint(model, train_cfg, global_step=None, is_final=False):
-    """Save model checkpoint (local and/or HF hub)."""
     if not is_master():
         return
     
@@ -243,16 +201,19 @@ def save_model_checkpoint(model, train_cfg, global_step=None, is_final=False):
 
 def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global_cfg, run_name=None, 
                         global_step=None, tokenizer=None, metric="cider"):
+    # switch to eval mode
     model.eval()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     
+    # evaluate validation loss
     with torch.no_grad():
         total_val_loss = 0
         val_batches = 0
         min_batch_loss = float('inf')
         max_batch_loss = float('-inf')
         
+        # tqdm progress bar
         val_pbar = tqdm(
             val_loader,
             total=min(len(val_loader), train_cfg.max_val_batches),
@@ -272,7 +233,8 @@ def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            # forward pass with mixed precision
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 _, loss = model(
                     input_ids=input_ids, 
                     images=images, 
@@ -280,28 +242,34 @@ def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global
                     targets=labels
                 )
             
+            # compute avg, min, max loss
             batch_loss = loss.item()
             min_batch_loss = min(min_batch_loss, batch_loss)
             max_batch_loss = max(max_batch_loss, batch_loss)
             total_val_loss += batch_loss
-            val_batches += 1
-            
             current_val_loss = total_val_loss / val_batches
+            val_batches += 1
+            # update progress bar
             val_pbar.set_postfix({
                 'Val Loss': f'{current_val_loss:.4f}',
                 'Batch': f'{val_batches}'
             })
         
+        # compute avg loss
         avg_val_loss = total_val_loss / val_batches if val_batches > 0 else 0
 
+        # compute score + generate samples
         metric_score = None
         log_samples_path = None
+
+        # log samples path if generate
         if run_name and global_step is not None and train_cfg is not None:
             timestamp = run_name.split('_')[-1]
             base_name = train_cfg.hf_model_cp_path.replace("/", "_") + "_" + timestamp
             os.makedirs(global_cfg.eval_dir, exist_ok=True)
             log_samples_path = os.path.join(global_cfg.eval_dir, base_name, f"samples_step_{global_step}.jsonl")
         
+        # compute cider score
         if metric == "cider":
             metric_score = compute_cider_score(
                 model, gen_loader, device, tokenizer,
@@ -309,5 +277,9 @@ def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global
                 max_samples=5000, # TODO: make this a parameter
                 log_samples_path=log_samples_path
             )
+        elif metric == "bleu":
+            pass
+        else:
+            raise ValueError(f"Metric {metric} not supported")
 
     return avg_val_loss, min_batch_loss, max_batch_loss, metric_score

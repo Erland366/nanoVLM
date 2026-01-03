@@ -2,12 +2,7 @@ import wandb
 from train_utils.utils import is_master
 
 
-# ============================================================================
-# Wandb Logging Functions
-# ============================================================================
-
 def init_wandb(train_cfg, vlm_cfg, global_cfg, run_name, total_dataset_size):
-    """Initialize wandb run."""
     if not train_cfg.log_wandb or not is_master():
         return None
     
@@ -28,7 +23,6 @@ def init_wandb(train_cfg, vlm_cfg, global_cfg, run_name, total_dataset_size):
 
 def log_baseline_validation(run, train_cfg, baseline_val_loss, baseline_min_loss, 
                            baseline_max_loss, baseline_metric_score, global_step=0):
-    """Log baseline validation results to wandb."""
     if not train_cfg.log_wandb or not is_master() or run is None:
         return
     
@@ -43,7 +37,6 @@ def log_baseline_validation(run, train_cfg, baseline_val_loss, baseline_min_loss
 
 
 def log_training_step(run, train_cfg, batch_loss, gradient_stats, global_step):
-    """Log training step metrics to wandb."""
     if not train_cfg.log_wandb or not is_master() or run is None:
         return
     
@@ -59,7 +52,6 @@ def log_training_step(run, train_cfg, batch_loss, gradient_stats, global_step):
 
 def log_validation_step(run, train_cfg, avg_val_loss, min_val_loss, max_val_loss, 
                        metric_score, global_step):
-    """Log validation step metrics to wandb."""
     if not train_cfg.log_wandb or not is_master() or run is None:
         return
     
@@ -74,7 +66,6 @@ def log_validation_step(run, train_cfg, avg_val_loss, min_val_loss, max_val_loss
 
 
 def log_epoch_stats(run, train_cfg, avg_loss, epoch_duration, epoch_tokens_per_second):
-    """Log epoch statistics to wandb."""
     if not train_cfg.log_wandb or not is_master() or run is None:
         return
     
@@ -86,7 +77,6 @@ def log_epoch_stats(run, train_cfg, avg_loss, epoch_duration, epoch_tokens_per_s
 
 
 def finish_wandb(run, train_cfg, epoch_times):
-    """Finish wandb run and log summary statistics."""
     if not train_cfg.log_wandb or not is_master() or run is None:
         return
     
@@ -95,12 +85,7 @@ def finish_wandb(run, train_cfg, epoch_times):
     wandb.finish()
 
 
-# ============================================================================
-# Print Utility Functions
-# ============================================================================
-
 def print_baseline_validation(baseline_val_loss, baseline_min_loss, baseline_max_loss):
-    """Print baseline validation results."""
     if not is_master():
         return
     
@@ -114,14 +99,12 @@ def print_baseline_validation(baseline_val_loss, baseline_min_loss, baseline_max
 
 
 def print_validation_step(global_step, avg_val_loss):
-    """Print validation step results."""
     if not is_master():
         return
     print(f"\nStep {global_step} | Val Loss: {avg_val_loss:.4f}")
 
 
 def print_epoch_stats(epoch, avg_loss, epoch_duration, epoch_tokens_per_second):
-    """Print epoch statistics."""
     if not is_master():
         return
     print(f"Epoch {epoch} done | Train Loss: {avg_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
