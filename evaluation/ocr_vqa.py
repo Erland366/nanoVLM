@@ -4,30 +4,56 @@ import json
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from data.collators import VQADualCollator
-from pycocoevalcap.cider.cider import Cider
 from data.processors import get_image_string
+import re
 
 
-class VanillaCOCOGenerationDataset(Dataset):
+class OCRVQAVanillaGenerationDataset(Dataset):
     def __init__(self, dataset, tokenizer, image_processor, mp_image_token_length, total_samples):
-        print("Preparing Vanilla CIDEr dataset...")
+        print("Preparing OCR-VQA evaluation dataset...")
         self.samples = []
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.mp_image_token_length = mp_image_token_length
         
         max_iter = min(total_samples, len(dataset)) if total_samples > 0 else len(dataset)
-        for i in tqdm(range(max_iter), desc="Loading Vanilla CIDEr samples"):
-            sample = dataset[i]
-            
-            self.samples.append({
-                "image": sample["image"],
-                "gt_caption": sample.get("caption", ""),
-                "filename": sample.get("filename", str(i)),
-                "image_id": sample.get("image_id", i)
-            })
+        sample_count = 0
         
-        print(f"Loaded {len(self.samples)} samples for Vanilla CIDEr evaluation")
+        for i in tqdm(range(len(dataset)), desc="Loading OCR-VQA samples"):
+            if sample_count >= max_iter:
+                break
+                
+            sample = dataset[i]
+
+            # so here one sample has multiple instances of Q&A pairs
+            questions = sample.get('questions', [])
+            answers = sample.get('answers', [])
+            image = sample.get('image')
+            image_id = sample.get('image_id', str(i))
+            
+            if image is None or not questions or not answers:
+                continue
+            
+            for qa_idx in range(min(len(questions), len(answers))):
+                if sample_count >= max_iter:
+                    break
+                    
+                question = questions[qa_idx]
+                answer = answers[qa_idx]
+                
+                if not question or not answer:
+                    continue
+                
+                self.samples.append({
+                    "image": image,
+                    "gt_answer": answer,
+                    "question": question,
+                    "filename": sample.get("image_id", f"{image_id}_{qa_idx}"),
+                    "image_id": f"{image_id}_{qa_idx}" # custom unique id for each qa pair
+                })
+                sample_count += 1
+        
+        print(f"Loaded {len(self.samples)} Q&A pairs for OCR-VQA evaluation")
     
     def __len__(self):
         return len(self.samples)
@@ -50,8 +76,9 @@ class VanillaCOCOGenerationDataset(Dataset):
             self.mp_image_token_length
         )
         
+        question = item.get("question", "")
         messages = [
-            {"role": "user", "content": image_string + "Describe the image."}
+            {"role": "user", "content": image_string + question}
         ]
         
         # Tokenize with add_generation_prompt=True to add assistant turn prefix
@@ -59,7 +86,7 @@ class VanillaCOCOGenerationDataset(Dataset):
             messages,
             tokenize=True,
             add_special_tokens=False,
-            add_generation_prompt=True,  # Critical: adds "<|im_start|>assistant\n" prefix
+            add_generation_prompt=True, # Critical: adds "<|im_start|>assistant\n" prefix
             return_dict=True,
         )
         
@@ -67,16 +94,17 @@ class VanillaCOCOGenerationDataset(Dataset):
         attention_mask = torch.tensor(conv_ids["attention_mask"])
         
         return {
-            "images": processed_image,
+            "images": [processed_image],
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "gt_caption": item["gt_caption"],
+            "gt_answer": item["gt_answer"],
+            "question": item.get("question", ""),
             "filename": item["filename"],
             "image_id": item["image_id"],
         }
 
 
-class VanillaGenerationCollator:
+class OCRVQAVanillaGenerationCollator:
     def __init__(self, tokenizer, max_length=2048):
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -89,7 +117,8 @@ class VanillaGenerationCollator:
                 "input_ids": torch.empty(0, 0, dtype=torch.long),
                 "attention_mask": torch.empty(0, 0, dtype=torch.long),
                 "images": [],
-                "gt_captions": [],
+                "gt_answers": [],
+                "questions": [],
                 "filenames": [],
                 "image_ids": []
             }
@@ -101,19 +130,22 @@ class VanillaGenerationCollator:
                 "input_ids": torch.empty(0, 0, dtype=torch.long),
                 "attention_mask": torch.empty(0, 0, dtype=torch.long),
                 "images": [],
-                "gt_captions": [],
+                "gt_answers": [],
+                "questions": [],
                 "filenames": [],
                 "image_ids": []
             }
 
-        # Extract metadata
-        gt_captions = [x.pop("gt_caption") for x in batch]
-        filenames = [x.pop("filename") for x in batch]
-        image_ids = [x.pop("image_id") for x in batch]
-
-        # Prepare inputs with LEFT PADDING
-        input_ids = [x["input_ids"] for x in batch]
-        attention_mask = [x["attention_mask"] for x in batch]
+        gt_answers = [item["gt_answer"] for item in batch]
+        questions = [item["question"] for item in batch]
+        filenames = [item["filename"] for item in batch]
+        image_ids = [item["image_id"] for item in batch]
+        
+        batch_dict = {k: [item[k] for item in batch] for k in batch[0] if k not in ["gt_answer", "question", "filename", "image_id"]}
+        
+        input_ids = batch_dict["input_ids"]
+        attention_mask = batch_dict["attention_mask"]
+        images = batch_dict["images"]
         
         max_len = max(len(ids) for ids in input_ids)
         
@@ -134,33 +166,60 @@ class VanillaGenerationCollator:
         return {
             "input_ids": torch.stack(padded_input_ids),
             "attention_mask": torch.stack(padded_attention_mask),
-            "images": [x["images"] for x in batch],
-            "gt_captions": gt_captions,
+            "images": images,
+            "gt_answers": gt_answers,
+            "questions": questions,
             "filenames": filenames,
             "image_ids": image_ids
         }
 
 
-class COCOGenerationDataset(Dataset):
+class OCRVQADualTowerGenerationDataset(Dataset):
     def __init__(self, dataset, tokenizer, image_processor, mp_image_token_length, total_samples):
-        print("Preparing CIDEr dataset...")
+        print("Preparing OCR-VQA Dual Tower evaluation dataset...")
         self.samples = []
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.mp_image_token_length = mp_image_token_length
         
         max_iter = min(total_samples, len(dataset)) if total_samples > 0 else len(dataset)
-        for i in tqdm(range(max_iter), desc="Loading CIDEr samples"):
+        sample_count = 0
+        
+        for i in tqdm(range(len(dataset)), desc="Loading OCR-VQA Dual Tower samples"):
+            if sample_count >= max_iter:
+                break
+                
             sample = dataset[i]
             
-            self.samples.append({
-                "image": sample["image"],
-                "gt_caption": sample.get("caption", ""),
-                "filename": sample.get("filename", str(i)),
-                "image_id": sample.get("image_id", i)
-            })
+            questions = sample.get('questions', [])
+            answers = sample.get('answers', [])
+            image = sample.get('image')
+            image_id = sample.get('image_id', str(i))
+            
+            if image is None or not questions or not answers:
+                continue
+            
+            # Create one evaluation sample per Q&A pair
+            for qa_idx in range(min(len(questions), len(answers))):
+                if sample_count >= max_iter:
+                    break
+                    
+                question = questions[qa_idx]
+                answer = answers[qa_idx]
+                
+                if not question or not answer:
+                    continue
+                
+                self.samples.append({
+                    "image": image,
+                    "gt_answer": answer,
+                    "question": question,
+                    "filename": sample.get("image_id", f"{image_id}_{qa_idx}"),
+                    "image_id": f"{image_id}_{qa_idx}"  # Unique ID for each Q&A pair
+                })
+                sample_count += 1
         
-        print(f"Loaded {len(self.samples)} samples for CIDEr evaluation")
+        print(f"Loaded {len(self.samples)} Q&A pairs for OCR-VQA Dual Tower evaluation")
     
     def __len__(self):
         return len(self.samples)
@@ -183,17 +242,17 @@ class COCOGenerationDataset(Dataset):
             self.mp_image_token_length
         )
         
+        question = item.get("question", "")
         messages = [
-            {"role": "user", "content": image_string + "Describe the image."}
+            {"role": "user", "content": image_string + question}
         ]
         
         # Tokenize with add_generation_prompt=True to add assistant turn prefix
-        # This ensures the model generates content directly, not the assistant role marker
         conv_ids = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_special_tokens=False,
-            add_generation_prompt=True,  # Critical: adds "<|im_start|>assistant\n" prefix
+            add_generation_prompt=True, # Critical: adds "<|im_start|>assistant\n" prefix
             return_dict=True,
         )
         
@@ -216,13 +275,14 @@ class COCOGenerationDataset(Dataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "last_image_token_pos": last_image_token_pos,
-            "gt_caption": item["gt_caption"],
+            "gt_answer": item["gt_answer"],
+            "question": item.get("question", ""),
             "filename": item["filename"],
             "image_id": item["image_id"],
         }
 
 
-class GenerationCollator(VQADualCollator):
+class OCRVQADualTowerGenerationCollator(VQADualCollator):
     def _center_pad_batch(self, batch, split_points):
         batch["input_ids"], max_left = self._split_and_center_pad(
             batch["input_ids"], split_points, self.tokenizer.pad_token_id
@@ -310,13 +370,15 @@ class GenerationCollator(VQADualCollator):
                 "attention_mask": torch.empty(0, 0, dtype=torch.long),
                 "images": [],
                 "last_img_idx": 0,
-                "gt_captions": [],
+                "gt_answers": [],
+                "questions": [],
                 "filenames": [],
                 "image_ids": []
             }
         
         # Extract metadata before collating
-        gt_captions = [item.pop("gt_caption") for item in batch]
+        gt_answers = [item.pop("gt_answer") for item in batch]
+        questions = [item.pop("question") for item in batch]
         filenames = [item.pop("filename") for item in batch]
         image_ids = [item.pop("image_id") for item in batch]
         
@@ -324,21 +386,37 @@ class GenerationCollator(VQADualCollator):
         collated = self.prepare_batch(batch, max_length=self.max_length)
         
         # Add metadata back
-        collated["gt_captions"] = gt_captions
+        collated["gt_answers"] = gt_answers
+        collated["questions"] = questions
         collated["filenames"] = filenames
         collated["image_ids"] = image_ids
         
         return collated
 
-def compute_cider_score(model, cider_loader, device, tokenizer, max_new_tokens=30, max_samples=500, log_samples_path=None):
+
+def normalize_text_for_accuracy(text):
+    if not isinstance(text, str):
+        text = str(text)
+    # Convert to lowercase
+    text = text.lower()
+    # Remove punctuation
+    text = re.sub(r'[^\w\s]', '', text)
+    # Remove extra whitespace
+    text = " ".join(text.split())
+    # Strip leading/trailing whitespace
+    text = text.strip()
+    return text
+
+
+def compute_ocrvqa_accuracy(model, ocrvqa_loader, device, tokenizer, max_new_tokens=50, max_samples=5000, log_samples_path=None, is_dual_tower=False):
     model.eval()
-    gts = {}  # Ground truth captions
-    res = {}  # Generated captions
+    correct = 0
+    total = 0
     sample_count = 0
-    samples_to_log = [] # Store samples for jsonl logging
+    samples_to_log = []
     
     with torch.no_grad():
-        for batch in tqdm(cider_loader, desc="CIDEr Gen", leave=False):
+        for batch in tqdm(ocrvqa_loader, desc="OCR-VQA Accuracy Eval", leave=False):
             if len(batch["images"]) == 0:
                 continue
             
@@ -348,6 +426,10 @@ def compute_cider_score(model, cider_loader, device, tokenizer, max_new_tokens=3
             images = batch["images"]
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            batch_gt_answers = batch["gt_answers"]
+            batch_image_ids = batch["image_ids"]
+            batch_questions = batch.get("questions", [""] * len(batch_image_ids))
+            batch_filenames = batch.get("filenames", [""] * len(batch_image_ids))
             
             # Helper to check if model is DualTowerVLM or Vanilla VisionLanguageModel
             is_dual_tower = hasattr(model, "right_tower") or (hasattr(model, "module") and hasattr(model.module, "right_tower"))
@@ -362,41 +444,53 @@ def compute_cider_score(model, cider_loader, device, tokenizer, max_new_tokens=3
             }
 
             if is_dual_tower:
-                if "last_img_idx" in batch:
-                    generate_kwargs["last_img_idx"] = batch["last_img_idx"]
+                generate_kwargs["last_img_idx"] = batch["last_img_idx"]
             
-            # Ground Truths (list of captions)
-            batch_gt_captions = batch["gt_captions"] 
-            batch_image_ids = batch["image_ids"]
-            batch_filenames = batch.get("filenames", [""] * len(batch_image_ids))
-            
-            # Generate captions
             try:
                 generated_ids = model.generate(**generate_kwargs)
-                pred_captions = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                if generated_ids.numel() == 0 or generated_ids.shape[1] == 0:
+                    print(f"Warning: generated_ids is empty! Shape: {generated_ids.shape}")
+                    pred_answers = [""] * len(batch_image_ids)
+                else:
+                    pred_answers = tokenizer.batch_decode(
+                        generated_ids, 
+                        skip_special_tokens=True
+                    )
             except Exception as e:
                 print(f"Error during generation: {e}")
                 import traceback
                 traceback.print_exc()
-                pred_captions = [""] * len(batch_image_ids)
+                pred_answers = [""] * len(batch_image_ids)
             
             for i, image_id in enumerate(batch_image_ids):
-                # Ensure image_id is string/int consistent
-                img_id_key = str(image_id)
+                gt_answer = batch_gt_answers[i]
+                pred_answer = pred_answers[i]
                 
-                if img_id_key not in gts:
-                    gts[img_id_key] = []
-                gts[img_id_key].append(batch_gt_captions[i])
+                # Normalize both answers for comparison
+                gt_normalized = normalize_text_for_accuracy(gt_answer)
+                pred_normalized = normalize_text_for_accuracy(pred_answer)
                 
-                res[img_id_key] = [pred_captions[i]]
+                # String matching: exact match only
+                # Empty predictions should never be correct
+                is_correct = (len(pred_normalized) > 0 and 
+                             len(gt_normalized) > 0 and
+                             pred_normalized == gt_normalized)
+                
+                if is_correct:
+                    correct += 1
+                total += 1
                 
                 # Collect first 50 samples for logging
                 if len(samples_to_log) < 50:
                     samples_to_log.append({
                         "image_id": image_id,
                         "filename": batch_filenames[i] if isinstance(batch_filenames, list) else str(i),
-                        "pred_caption": pred_captions[i],
-                        "gt_caption": batch_gt_captions[i]
+                        "question": batch_questions[i] if isinstance(batch_questions, list) else "",
+                        "pred_answer": pred_answer,
+                        "gt_answer": gt_answer,
+                        "pred_normalized": pred_normalized,
+                        "gt_normalized": gt_normalized,
+                        "is_correct": is_correct
                     })
             
             sample_count += len(batch_image_ids)
@@ -408,13 +502,11 @@ def compute_cider_score(model, cider_loader, device, tokenizer, max_new_tokens=3
             for sample in samples_to_log:
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
         print(f"Saved {len(samples_to_log)} generation samples to {log_samples_path}")
-
-    # Compute CIDEr score
-    if len(gts) == 0 or len(res) == 0:
+    
+    # Compute accuracy
+    if total == 0:
         return 0.0
     
-    cider_scorer = Cider()
-    avg_cider_score, _ = cider_scorer.compute_score(gts, res)
-    
-    return avg_cider_score
+    accuracy = correct / total
+    return accuracy
 

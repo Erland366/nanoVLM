@@ -8,7 +8,9 @@ from datetime import timedelta
 from torch.nn.parallel import DistributedDataParallel
 import math
 from tqdm import tqdm
-from evaluation.cider_utils import compute_cider_score
+from evaluation.coco_captions import compute_cider_score
+from evaluation.ocr_vqa import compute_ocrvqa_accuracy
+from data.data_utils import synchronized_dataloader_step
 
 
 def init_dist():
@@ -119,9 +121,20 @@ def compute_gradient_stats(all_params, max_grad_norm):
     if max_grad_norm is None:
         return None
     
+    # Get all parameters with gradients
+    params_with_grad = [p for p in all_params if p.grad is not None]
+    
+    # If no parameters have gradients, return None or zero stats
+    if len(params_with_grad) == 0:
+        return {
+            "raw_grad_norm": 0.0,
+            "total_grad_norm": 0.0,
+            "clipped_grad_norm": 0.0,
+        }
+    
     # Compute raw gradient norm BEFORE clipping
     raw_grad_norm = torch.norm(
-        torch.stack([torch.norm(p.grad.detach(), 2) for p in all_params if p.grad is not None]), 
+        torch.stack([torch.norm(p.grad.detach(), 2) for p in params_with_grad]), 
         2
     )
     
@@ -130,7 +143,7 @@ def compute_gradient_stats(all_params, max_grad_norm):
     
     # Compute gradient norm AFTER clipping
     clipped_grad_norm = torch.norm(
-        torch.stack([torch.norm(p.grad.detach(), 2) for p in all_params if p.grad is not None]), 
+        torch.stack([torch.norm(p.grad.detach(), 2) for p in params_with_grad]), 
         2
     )
     
@@ -247,9 +260,10 @@ def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global
             min_batch_loss = min(min_batch_loss, batch_loss)
             max_batch_loss = max(max_batch_loss, batch_loss)
             total_val_loss += batch_loss
-            current_val_loss = total_val_loss / val_batches
             val_batches += 1
+
             # update progress bar
+            current_val_loss = total_val_loss / val_batches
             val_pbar.set_postfix({
                 'Val Loss': f'{current_val_loss:.4f}',
                 'Batch': f'{val_batches}'
@@ -264,22 +278,133 @@ def evaluate_validation(model, val_loader, gen_loader, device, train_cfg, global
 
         # log samples path if generate
         if run_name and global_step is not None and train_cfg is not None:
-            timestamp = run_name.split('_')[-1]
-            base_name = train_cfg.hf_model_cp_path.replace("/", "_") + "_" + timestamp
+            # Use run_name directly, sanitize for file paths
+            base_name = run_name.replace("/", "_")
             os.makedirs(global_cfg.eval_dir, exist_ok=True)
             log_samples_path = os.path.join(global_cfg.eval_dir, base_name, f"samples_step_{global_step}.jsonl")
         
-        # compute cider score
+        # compute metric score
         if metric == "cider":
             metric_score = compute_cider_score(
                 model, gen_loader, device, tokenizer,
                 max_new_tokens=30, # TODO: make this a parameter
                 max_samples=5000, # TODO: make this a parameter
-                log_samples_path=log_samples_path
+                log_samples_path=log_samples_path,
+                is_dual_tower=False
+            )
+        elif metric == "accuracy":
+            metric_score = compute_ocrvqa_accuracy(
+                model, gen_loader, device, tokenizer,
+                max_new_tokens=50, # TODO: make this a parameter
+                max_samples=5000, # TODO: make this a parameter
+                log_samples_path=log_samples_path,
+                is_dual_tower=False
             )
         elif metric == "bleu":
             pass
         else:
             raise ValueError(f"Metric {metric} not supported")
+
+    return avg_val_loss, min_batch_loss, max_batch_loss, metric_score
+
+
+def evaluate_validation_dual_tower(model, val_loader, gen_loader, device, train_cfg, global_cfg, run_name=None, 
+                                   global_step=None, tokenizer=None, metric="cider"):
+    model.eval()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    
+    # evaluate validation loss
+    with torch.no_grad():
+        total_val_loss = 0
+        val_batches = 0
+        min_batch_loss = float('inf')
+        max_batch_loss = float('-inf')
+        
+        # tqdm progress bar
+        val_pbar = tqdm(
+            synchronized_dataloader_step(val_loader, is_dist()),
+            total=min(len(val_loader), train_cfg.max_val_batches),
+            desc="Validation",
+            leave=False
+        )
+        
+        for batch in val_pbar:
+            if val_batches >= train_cfg.max_val_batches:
+                break
+                
+            if len(batch["images"]) == 0:
+                continue
+                
+            images = batch["images"]
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            last_img_idx = batch["last_img_idx"]
+            
+            # forward pass with mixed precision
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == 'cuda' else torch.float16):
+                _, loss = model(
+                    input_ids=input_ids, 
+                    images=images, 
+                    attention_mask=attention_mask, 
+                    targets=labels,
+                    last_img_idx=last_img_idx
+                )
+            
+            # compute avg, min, max loss
+            batch_loss = loss.item()
+            min_batch_loss = min(min_batch_loss, batch_loss)
+            max_batch_loss = max(max_batch_loss, batch_loss)
+            total_val_loss += batch_loss
+            val_batches += 1
+
+            # update progress bar
+            current_val_loss = total_val_loss / val_batches
+            val_pbar.set_postfix({
+                'Val Loss': f'{current_val_loss:.4f}',
+                'Batch': f'{val_batches}'
+            })
+        
+        # compute avg loss
+        avg_val_loss = total_val_loss / val_batches if val_batches > 0 else 0
+        avg_val_loss = dist_mean_scalar(avg_val_loss) if is_dist() else avg_val_loss
+        
+        if is_dist():
+            min_batch_loss = min(dist_gather(min_batch_loss))
+            max_batch_loss = max(dist_gather(max_batch_loss))
+
+        # compute score + generate samples
+        metric_score = None
+        log_samples_path = None
+
+        # log samples path if generate
+        if run_name and global_step is not None and train_cfg is not None:
+            base_name = run_name.replace("/", "_")
+            os.makedirs(global_cfg.eval_dir, exist_ok=True)
+            log_samples_path = os.path.join(global_cfg.eval_dir, base_name, f"samples_step_{global_step}.jsonl")
+        
+        # compute metric score (only on master for dual tower)
+        if is_master() and gen_loader is not None and tokenizer is not None:
+            if metric == "cider":
+                metric_score = compute_cider_score(
+                    model, gen_loader, device, tokenizer,
+                    max_new_tokens=30,
+                    max_samples=5000,
+                    log_samples_path=log_samples_path,
+                    is_dual_tower=True
+                )
+            elif metric == "accuracy":
+                metric_score = compute_ocrvqa_accuracy(
+                    model, gen_loader, device, tokenizer,
+                    max_new_tokens=50,
+                    max_samples=5000,
+                    log_samples_path=log_samples_path,
+                    is_dual_tower=True
+                )
+            elif metric == "bleu":
+                pass
+            else:
+                raise ValueError(f"Metric {metric} not supported")
 
     return avg_val_loss, min_batch_loss, max_batch_loss, metric_score

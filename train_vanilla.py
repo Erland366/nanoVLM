@@ -1,6 +1,5 @@
 # import python libs
 import os
-import sys
 import math
 import time
 import torch
@@ -24,7 +23,7 @@ from configs.config_vanilla import VLMConfig, TrainConfig, GlobalConfig
 
 # logging utils
 from train_utils.logging import (
-    init_wandb, log_baseline_validation, log_training_step,
+    init_wandb, log_code_to_wandb, log_baseline_validation, log_training_step,
     log_validation_step, log_epoch_stats, finish_wandb,
     print_baseline_validation, print_validation_step, print_epoch_stats
 )
@@ -55,6 +54,12 @@ def train(train_cfg, vlm_cfg, global_cfg):
     run_name = get_run_name(train_cfg, vlm_cfg)
     total_dataset_size = len(train_loader.dataset)
     run = init_wandb(train_cfg, vlm_cfg, global_cfg, run_name, total_dataset_size)
+    
+    # log code and config to wandb artifacts before training starts
+    if is_master():
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_vanilla.py")
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "config_vanilla.py")
+        log_code_to_wandb(run, train_cfg, script_path, config_path)
 
     # load / initialize model
     if train_cfg.resume_from_vlm_checkpoint:
@@ -99,7 +104,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
     # compute baseline validation loss & metric score
     baseline_val_loss, baseline_min_loss, baseline_max_loss, baseline_metric_score = evaluate_validation(
         model, val_loader, gen_loader, device, train_cfg, global_cfg,
-        run_name=run_name, global_step=0, tokenizer=tokenizer, metric=train_cfg.metric
+        run_name=run_name, global_step=0, tokenizer=tokenizer, metric=train_cfg.eval_metric
     )
     
     # print and log baseline validation results
@@ -233,8 +238,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
                     # evaluate validation loss & metric score
                     avg_val_loss, min_val_loss, max_val_loss, metric_score = evaluate_validation(
                         model, val_loader, gen_loader, device, train_cfg, global_cfg,
-                        run_name=run_name, global_step=global_step, tokenizer=tokenizer,
-                        compute_metric=True, metric=train_cfg.metric
+                        run_name=run_name, global_step=global_step, tokenizer=tokenizer, metric=train_cfg.eval_metric
                     )
                     
                     # print and log validation stats and results

@@ -1,4 +1,5 @@
 import wandb
+import os
 from train_utils.utils import is_master
 
 
@@ -32,7 +33,7 @@ def log_baseline_validation(run, train_cfg, baseline_val_loss, baseline_min_loss
         "val/max_val_loss": baseline_max_loss,
     }
     if baseline_metric_score is not None:
-        log_dict[f"val/{train_cfg.metric}_score"] = baseline_metric_score
+        log_dict[f"val/{train_cfg.eval_metric}_score"] = baseline_metric_score
     run.log(log_dict, step=global_step)
 
 
@@ -61,7 +62,7 @@ def log_validation_step(run, train_cfg, avg_val_loss, min_val_loss, max_val_loss
         "val/max_val_loss": max_val_loss,
     }
     if metric_score is not None:
-        log_dict[f"val/{train_cfg.metric}_score"] = metric_score
+        log_dict[f"val/{train_cfg.eval_metric}_score"] = metric_score
     run.log(log_dict, step=global_step)
 
 
@@ -74,6 +75,27 @@ def log_epoch_stats(run, train_cfg, avg_loss, epoch_duration, epoch_tokens_per_s
         "epoch_duration": epoch_duration,
         "epoch_tokens_per_second": epoch_tokens_per_second
     })
+
+
+def log_code_to_wandb(run, train_cfg, script_path, config_path):
+    if not train_cfg.log_wandb or not train_cfg.save_code_cfg or not is_master() or run is None:
+        return
+    
+    try:
+        artifact = wandb.Artifact("training_code", type="code")
+        
+        if os.path.exists(script_path):
+            artifact.add_file(script_path, name=os.path.basename(script_path))
+            print(f"Added training script to wandb artifact: {script_path}")
+        
+        if os.path.exists(config_path):
+            artifact.add_file(config_path, name=os.path.basename(config_path))
+            print(f"Added config file to wandb artifact: {config_path}")
+        
+        run.log_artifact(artifact)
+        print("Code and config files logged to wandb artifacts")
+    except Exception as e:
+        print(f"Warning: Failed to log code to wandb: {e}")
 
 
 def finish_wandb(run, train_cfg, epoch_times):

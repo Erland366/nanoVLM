@@ -16,7 +16,7 @@ from train_utils.mapper import TRAIN_DATASET_COLLATOR_MAP, GEN_DATASET_COLLATOR_
 from train_utils.utils import is_dist, is_master, get_world_size, get_rank, seed_worker
 
 
-def get_custom_dataloaders(train_cfg, vlm_cfg, global_cfg, train_split = "train", val_split = "validation", generate_val_data = False, val_ratio = 0.2):
+def get_custom_dataloaders(train_cfg, vlm_cfg, global_cfg, train_split = "train", val_split = "validation", generate_val_data = False, val_ratio = 0.2, is_dual_tower = False):
     print("Custom dataset loading mode...")
     print(f"Getting dataloaders from {train_cfg.train_dataset_path}")
 
@@ -244,12 +244,12 @@ def get_cauldron_dataloaders(train_cfg, vlm_cfg, global_cfg):
     return train_loader, val_loader
 
 
-def get_eval_dataloaders(train_cfg, vlm_cfg, global_cfg, eval_split = "train", total_samples = 5000):
+def get_eval_dataloaders(train_cfg, vlm_cfg, global_cfg, val_split_name = "train", total_samples = 5000):
     image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens, vlm_cfg.lm_chat_template)
     
-    dataset_hf = load_dataset(train_cfg.custom_eval_dataset_path, split=eval_split)
-    DatasetClass, CollatorClass = GEN_DATASET_COLLATOR_MAP[train_cfg.eval_dataset_id]
+    dataset_hf = load_dataset(train_cfg.custom_eval_dataset_path, split=val_split_name)
+    DatasetClass, CollatorClass = GEN_DATASET_COLLATOR_MAP[train_cfg.custom_eval_dataset_id]
     cider_dataset = DatasetClass(dataset_hf, tokenizer, image_processor, vlm_cfg.mp_image_token_length, total_samples)
     cider_collator = CollatorClass(tokenizer, max_length=2048)
     
@@ -258,7 +258,7 @@ def get_eval_dataloaders(train_cfg, vlm_cfg, global_cfg, eval_split = "train", t
     
     eval_loader = DataLoader(
         cider_dataset,
-        batch_size=train_cfg.batch_size,
+        batch_size=train_cfg.eval_batch_size,
         shuffle=False,
         num_workers=1,
         collate_fn=cider_collator,
@@ -274,7 +274,7 @@ def get_eval_dataloaders(train_cfg, vlm_cfg, global_cfg, eval_split = "train", t
     return eval_loader
 
 
-def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
+def get_dataloaders(train_cfg, vlm_cfg, global_cfg, is_dual_tower=False):
     train_loader, val_loader = None, None
     gen_loader = None
     
@@ -282,9 +282,16 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens, vlm_cfg.lm_chat_template)
     
     if train_cfg.use_custom_dataset:
-        train_loader, val_loader = get_custom_dataloaders(train_cfg, vlm_cfg, global_cfg, train_split = train_cfg.train_split, val_split = train_cfg.val_split, generate_val_data = train_cfg.generate_val_data, val_ratio = train_cfg.val_ratio)
+        train_loader, val_loader = get_custom_dataloaders(
+            train_cfg, vlm_cfg, global_cfg, 
+            train_split=train_cfg.train_split_name, 
+            val_split=train_cfg.val_split_name, 
+            generate_val_data=train_cfg.generate_val_data, 
+            val_ratio=train_cfg.val_ratio,
+            is_dual_tower=is_dual_tower
+        )
     else:
         train_loader, val_loader = get_cauldron_dataloaders(train_cfg, vlm_cfg, global_cfg)
-    gen_loader = get_eval_dataloaders(train_cfg, vlm_cfg, global_cfg, eval_split = train_cfg.eval_split, total_samples = train_cfg.total_samples)
+    gen_loader = get_eval_dataloaders(train_cfg, vlm_cfg, global_cfg, val_split_name=train_cfg.custom_eval_dataset_split_name, total_samples=train_cfg.max_gen_samples)
     return train_loader, val_loader, gen_loader, tokenizer
 

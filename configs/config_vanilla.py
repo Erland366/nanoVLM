@@ -4,7 +4,10 @@ from dataclasses import dataclass, field
 class GlobalConfig:
     seed: int = 42
     hf_home: str = '/workspace/huggingface/' # if none use default ~/.cache/huggingface
-    same_dir_as_nanovlm_repo: bool = False # if true, sys.path.append(os.path.join(os.getcwd(), 'nanoVLM'))
+    log_dir: str = "logs"
+    model_dir: str = "checkpoints"
+    eval_dir: str = "evals"
+    prefix_run_name: str = None
 
 
 @dataclass
@@ -59,51 +62,87 @@ class VLMConfig:
     vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
     hf_repo_name: str = 'nanoVLM'
 
-
 @dataclass
 class TrainConfig:
+    # model related
+    # 1. learning rate
+    # 2. model compiling
+    # 3. checkpoint resuming
     lr_mp: float = 1e-5
-    lr_vision_backbone: float = 0
+    lr_vision_backbone: float = 0.0
     lr_language_backbone: float = 5e-6
-
-    data_cutoff_idx: int = None # limit number of data to be used in train run
-    generate_val_data: bool = False # if true, generate val data from train data
-    val_ratio: float = 0.2
-    batch_size: int = 64
-
-    use_epochs: bool = True
-    max_training_steps: int = 200
-    max_epochs: int = 3
-
-    gradient_accumulation_steps: int = 4
-    max_grad_norm: float = 1.0
-    max_images_per_example: int = 2
-    max_images_per_knapsack: int = 8
-    max_sample_length: int = 256
-
     compile: bool = True
     resume_from_vlm_checkpoint: bool = True
 
-    direct_train_dataset_path: str = "jxie/coco_captions" # COCO captions dataset (will be preprocessed)
-    split_name: str = "train"  # Use 'train' for training, 'validation' for validation
-    
+
+
+    # data related
+    # 0. batch size + grad. accum (effective batch size)
+    batch_size: int = 64
+    gradient_accumulation_steps: int = 4
+    # 1. using the_cauldron preset / custom data source
     train_dataset_path: str = 'HuggingFaceM4/the_cauldron'
-    train_dataset_name: tuple[str, ...] = ("tqa", )
+    train_dataset_name: tuple[str, ...] = ("ocrvqa", )  # e.g., ("ocrvqa", ) or ("tqa", "ocrvqa")
+    # 1.1. dataset subset for the the_cauldron needed, including the relevance min_rating, etc.
+    relevance_min_rating: int = 1
+    image_correspondence_min_rating: int = 1
+    visual_dependency_min_rating: int = 1
+    formatting_min_rating: int = 1
+    # 1.2 custom data source
+    use_custom_dataset: bool = True
+    train_dataset_path: str = 'howard-hou/OCR-VQA'
+    custom_dataset_id: str = "ocr_vqa"
+    train_split_name: str = "train"
+    val_split_name: str = "validation"
+    # 2. automatic validation set generation or direct from the path subset
+    generate_val_data: bool = False # if true, generate val data from train data
+    val_ratio: float = 0.2
+    # 3. data packing related including samples length + others
+    use_packing: bool = True
+    max_images_per_example: int = 1
+    max_images_per_knapsack: int = 1
+    max_sample_length: int = 256
+    stream_dataset: bool = False  # Whether to stream the dataset (for large datasets)
+    data_cutoff_idx: int = None # limit number of data to be used in train run
+    
+    
 
+    # training loop related
+    # 1. using epochs / training steps
+    # 2. max_training steps + max epochs defined
+    # 3. max_grad_norm
+    use_epochs: bool = True
+    max_epochs: int = 5
+    max_training_steps: int = 500
+    max_grad_norm: float = 1.0
+
+
+    # evaluation related
+    # 1. evaluation dataloader preset
+    # 2. evaluation metric preset
+    # 3. evaluation steps
+    # 4. evaluation
+    custom_eval_dataset_id: str = "ocr_vqa"
+    custom_eval_dataset_path: str = "howard-hou/OCR-VQA"
+    custom_eval_dataset_split_name: str = "validation"
+    eval_metric: str = "accuracy"
+    eval_every_n_steps: int = 500 # evaluate every x steps
+    eval_batch_size: int = 128 # batch size for evaluation
+    max_val_batches: int = 100 # hard limit on number of batches to evaluate on
+
+
+    # logging & model saving related
+    # 1. wandb logging
     log_wandb: bool = True
-    wandb_project: str = 'nanoVLM-twin-tower'
-    prefix_run_name: str = "vanilla-230M-8k"
-
-    eval_every_n_steps: int = 500
-    eval_batch_size: int = 128
-    max_val_batches: int = 1000
-    max_cider_batches: int = 1000
-    eval_metric: str = "cider"
-    generate_first_n_samples: int = 10
+    wandb_project: str = 'dual-tower-ocrvqa'
+    prefix_run_name: str = "vanilla-230m"
+    save_code_cfg: bool = True
+    # 2. save model & generate every x steps
     save_model_every_n_steps: int = 1500
-    
+    generate_every_n_steps: int = 1500
+    max_gen_samples: int = 50
+    # 4. model saving
     save_local: bool = False
-    local_model_cp_path: str = "checkpoints/nanoVLM-230M-8k-vanilla-cococap-full--v2-bs256"
-    
-    save_hf: bool = True
-    hf_model_cp_path: str = "patrickamadeus/nanoVLM-230M-8k-vanilla-cococap-full-v2-bs256"
+    local_model_cp_path: str = "checkpoints/vanilla-230m"
+    save_hf: bool = False
+    hf_model_cp_path: str = "patrickamadeus/vanilla-230m"
