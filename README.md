@@ -12,9 +12,10 @@
 2. DualTower model -> `models/dual_tower/dual_tower.py` & `models/dual_tower/dual_language_model.py` (RoPE & Causal Mask Modification)
 3. Configs -> `configs/config_*.py` (`vanilla` / `dual_tower`)
 4. Training Loop -> `train_*.py` (`vanilla` / `dual_tower`)
-5. Evaluation -> `evaluation/cider_utils.py`
+5. Evaluation -> `evaluation/*.py` (so far, `ocr_vqa` / `coco_captions`)
 
 ## Changelog
+- > 8/1/26 -- Fix decoding for dual tower evaluation (cider + accuracy)
 - > 18/12/25 -- Add `lm_changes.patch` to make it easier to look at the diff between `dual_language_model.py` vs original `language_model.py`
 - > 18/12/25 -- Add `cider_utils.py` for in-training evaluation
 - > 13/12/25 -- Revamp DualTowerVLM dataset packing, training, generation code
