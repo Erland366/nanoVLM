@@ -16,9 +16,7 @@ logs/
 *.csv
 .vscode
 
-.python-version
-pyproject.toml
-uv.lock
+resources
 
 .DS_Store
 

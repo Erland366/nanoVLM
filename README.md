@@ -54,10 +54,8 @@ cd nanoVLM
 
 If you want to use `uv`:
 ```bash
-uv init --bare --python 3.12
-uv sync --python 3.12
+uv sync
 source .venv/bin/activate
-uv add torch numpy torchvision pillow datasets huggingface-hub transformers wandb
 # Optional: for lmms-eval integration you have to install it from source, see section 'Evaluation with lmms-eval'
 ```
 
