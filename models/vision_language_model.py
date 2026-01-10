@@ -10,6 +10,7 @@ from models.vision_transformer import ViT
 from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
 from models.config import VLMConfig
+from models.momh_attention import compute_content_starts
 
 from data.processors import get_tokenizer
 
@@ -68,7 +69,12 @@ class VisionLanguageModel(nn.Module):
             image_embd = self.MP(image_embd)  # [num_images, mp_image_token_length, D_lm]
             token_embd = self._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
 
-        logits, _ = self.decoder(token_embd, attention_mask=attention_mask)
+        # Calculate content_starts for MoMH attention (where padding ends)
+        content_starts = None
+        if attention_mask is not None and getattr(self.cfg, 'momh_enabled', False):
+            content_starts = compute_content_starts(attention_mask)
+
+        logits, _ = self.decoder(token_embd, attention_mask=attention_mask, content_starts=content_starts)
 
         loss = None
         if targets is not None:
@@ -93,13 +99,19 @@ class VisionLanguageModel(nn.Module):
 
         current_total_seq_len = token_embd.size(1)
         batch_size = input_ids.size(0) # Or token_embd.size(0)
-        
+
+        # Calculate content_starts for MoMH attention during prefill
+        content_starts = None
+        if attention_mask is not None and getattr(self.cfg, 'momh_enabled', False):
+            content_starts = compute_content_starts(attention_mask)
+
         # --- Multimodal Prefill Phase ---
         prefill_output, kv_cache_list = self.decoder(
             token_embd,
             attention_mask=attention_mask, # Use the provided attention mask
             kv_cache=None,
-            start_pos=0
+            start_pos=0,
+            content_starts=content_starts  # MoMH during prefill
         )
         
         last_token_output_from_prefill = prefill_output[:, -1, :] 
@@ -135,11 +147,13 @@ class VisionLanguageModel(nn.Module):
                 attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
 
             # With KV cache: only process the new token
+            # Note: content_starts=None during decode (no MoMH, use standard causal attention)
             decode_step_output, kv_cache_list = self.decoder(
                 next_token_embed,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache_list,
-                start_pos=current_token_start_pos
+                start_pos=current_token_start_pos,
+                content_starts=None  # No MoMH during decode phase
             )
       
             last_token_output = decode_step_output[:, -1, :] 

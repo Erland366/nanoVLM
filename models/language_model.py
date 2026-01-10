@@ -3,6 +3,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.momh_attention import (
+    flex_attention_compiled,
+    create_momh_block_mask,
+)
+
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
 class RMSNorm(nn.Module):
     """
@@ -170,20 +175,34 @@ class LanguageModelGroupedQueryAttention(nn.Module):
     GQA reduces computation by using fewer key-value heads than query heads,
     grouping multiple query heads to share the same key-value heads.
 
+    Optionally supports Mixture of Modality Heads (MoMH) for vision-language models,
+    where different heads specialize in different modality attention patterns.
+
     Args:
         cfg: Configuration object containing:
             - lm_n_heads (int): Number of query heads.
             - lm_n_kv_heads (int): Number of key-value heads.
             - lm_hidden_dim (int): Hidden embedding dimension.
             - lm_dropout (float): Dropout rate.
+            - momh_enabled (bool): Enable Mixture of Modality Heads.
+            - momh_head_pct_vision (float): Percentage of heads for V->V.
+            - momh_head_pct_text (float): Percentage of heads for T->T.
+            - mp_image_token_length (int): Number of vision tokens (S_V).
     """
     def __init__(self, cfg):
         super().__init__()
 
+        self.cfg = cfg
         self.n_heads = cfg.lm_n_heads
         self.n_kv_heads = cfg.lm_n_kv_heads
         self.embd_dim = cfg.lm_hidden_dim
         self.dropout = cfg.lm_dropout
+
+        # MoMH configuration
+        self.momh_enabled = getattr(cfg, 'momh_enabled', False)
+        self.momh_pct_vision = getattr(cfg, 'momh_head_pct_vision', 0.4)
+        self.momh_pct_text = getattr(cfg, 'momh_head_pct_text', 0.4)
+        self.S_V = getattr(cfg, 'mp_image_token_length', 64)
 
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         assert self.embd_dim % self.n_heads == 0, "embd_dim must be divisible by num_heads"
@@ -204,7 +223,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None) -> tuple[torch.Tensor, dict]:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None, content_starts=None) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
 
@@ -218,6 +237,8 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             attention_mask (Tensor, optional): Attention mask tensor of shape (B, total_kv_length),
                                                with 1 for tokens to attend to and 0 for padding.
             block_kv_cache (dict, optional): Cache dict with 'key' and 'value' tensors for autoregressive decoding.
+            content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
+                                               for MoMH attention (where padding ends).
 
         Returns:
             tuple[Tensor, dict]:
@@ -257,40 +278,63 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         
         T_kv = k_exp.size(2) # Total sequence length of keys/values
 
-        # Prepare attention mask for SDPA or manual path
-        # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
-        additive_attn_mask = None
-        if attention_mask is not None:
-            # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
-            # Let's make it `[B, 1, 1, T_kv]` for SDPA.
-            mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
-            additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
-            # This additive_attn_mask shape is [B, 1, 1, T_kv]
+        # MoMH path: Use flex_attention with modality-specific masks during prefill
+        use_momh = (self.momh_enabled and is_prefill and content_starts is not None
+                    and x.device.type == 'cuda')
 
-        if self.sdpa and x.device.type != 'mps':
-            # During decode, no additional masking needed as [1, T_kv] is naturally causal
-            is_causal = (T_curr == T_kv and T_curr > 1)
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k_exp, v_exp,
-                attn_mask=additive_attn_mask, 
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=is_causal
+        if use_momh:
+            # Create MoMH block mask with per-batch content_start offsets
+            block_mask = create_momh_block_mask(
+                n_q_heads=self.n_heads,
+                seq_len=T_kv,
+                S_V=self.S_V,
+                content_starts=content_starts,
+                pct_v=self.momh_pct_vision,
+                pct_t=self.momh_pct_text,
+                device=str(x.device)
             )
+            # Ensure consistent dtypes (rotary embeddings may change q/k dtype)
+            target_dtype = q.dtype
+            k_exp = k_exp.to(target_dtype)
+            v_exp = v_exp.to(target_dtype)
+            # Use compiled flex_attention for efficient sparse attention
+            y = flex_attention_compiled(q, k_exp, v_exp, block_mask=block_mask)
         else:
-            # Manual attention implementation
-            attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
-            # During decode: no additional masking needed as [1, T_kv] is naturally causal
-            if T_curr == T_kv and T_curr > 1:
-                causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
-                attn = attn.masked_fill(~causal_mask_val, float('-inf'))
+            # Standard attention path (decode phase, MoMH disabled, or non-CUDA)
+            # Prepare attention mask for SDPA or manual path
+            # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
+            additive_attn_mask = None
+            if attention_mask is not None:
+                # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
+                # Let's make it `[B, 1, 1, T_kv]` for SDPA.
+                mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
+                additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
+                # This additive_attn_mask shape is [B, 1, 1, T_kv]
 
-            if additive_attn_mask is not None: # Additive padding mask
-                # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
-                attn = attn + additive_attn_mask 
+            if self.sdpa and x.device.type != 'mps':
+                # During decode, no additional masking needed as [1, T_kv] is naturally causal
+                is_causal = (T_curr == T_kv and T_curr > 1)
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k_exp, v_exp,
+                    attn_mask=additive_attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=is_causal
+                )
+            else:
+                # Manual attention implementation
+                attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
+                # During decode: no additional masking needed as [1, T_kv] is naturally causal
+                if T_curr == T_kv and T_curr > 1:
+                    causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
+                    attn = attn.masked_fill(~causal_mask_val, float('-inf'))
 
-            attn = F.softmax(attn, dim=-1)
-            attn = self.attn_dropout(attn)
-            y = attn @ v_exp
+                if additive_attn_mask is not None: # Additive padding mask
+                    # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
+                    attn = attn + additive_attn_mask
+
+                attn = F.softmax(attn, dim=-1)
+                attn = self.attn_dropout(attn)
+                y = attn @ v_exp
             
         y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
         y = self.out_proj(y)
@@ -356,7 +400,7 @@ class LanguageModelBlock(nn.Module):
         self.norm1 = RMSNorm(cfg) # Input Norm
         self.norm2 = RMSNorm(cfg) # Post Attention Norm
     
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None):
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None, content_starts: torch.Tensor=None):
         """
         Forward pass of the Transformer block.
 
@@ -369,6 +413,8 @@ class LanguageModelBlock(nn.Module):
                 with 1 indicating tokens to attend to and 0 for padding tokens.
             block_kv_cache (dict, optional): Key-value cache dict for cached keys and values
                 during decoding. If None, no cache is used.
+            content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
+                for MoMH attention (where padding ends).
 
         Returns:
             Tuple[Tensor, dict]: Output tensor after the block (same shape as input),
@@ -376,7 +422,7 @@ class LanguageModelBlock(nn.Module):
         """
         res = x
         x = self.norm1(x)
-        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache)
+        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache, content_starts)
         x = res + x
 
         res = x
@@ -416,7 +462,7 @@ class LanguageModel(nn.Module):
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0):
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0, content_starts: torch.Tensor=None):
         """
         Performs a forward pass through the language model.
 
@@ -433,6 +479,8 @@ class LanguageModel(nn.Module):
             start_pos (int, optional): The starting position index for the current input
                 sequence. Used to compute rotary positional embeddings correctly,
                 especially for cached sequences during generation. Default is 0.
+            content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
+                for MoMH attention (where padding ends). Only used during prefill.
 
         Returns:
             Tuple:
@@ -459,7 +507,7 @@ class LanguageModel(nn.Module):
 
         # T_curr is the length of the current input sequence
         B, T_curr, _ = x.size()
-        
+
         # Create position_ids for the current sequence based on start_pos
         current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).expand(B, -1)
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
@@ -469,7 +517,7 @@ class LanguageModel(nn.Module):
             kv_cache = [None] * len(self.blocks)
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
+            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i], content_starts)
 
         x = self.norm(x)
 

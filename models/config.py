@@ -37,6 +37,12 @@ class VLMConfig:
     mp_pixel_shuffle_factor: int = 4
     mp_image_token_length: int = 64
 
+    # Mixture of Modality Heads (MoMH) config
+    momh_enabled: bool = True
+    momh_head_pct_vision: float = 0.4  # 40% of heads for V->V only
+    momh_head_pct_text: float = 0.4    # 40% of heads for T->T only
+    # Remaining 20% (1 - vision - text) for VT->VT cross-modal
+
     max_img_size: int = 2048
     resize_to_max_side_len: bool = True
 
@@ -60,7 +66,7 @@ class TrainConfig:
     lr_vision_backbone: float = 5e-5 #0.0005 #
     lr_language_backbone: float = 5e-5 #0
     val_size: int = 50000
-    batch_size: int = 2
+    batch_size: int = 1  # Reduced for MoMH (disabled packing uses more memory)
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
     eval_in_epochs: bool = True

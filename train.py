@@ -25,7 +25,7 @@ if torch.cuda.is_available():
 
 PG_CPU = None
 
-from data.datasets import VQADataset
+from data.datasets import VQADataset, VQAIterableDataset
 from data.collators import VQACollator
 from data.data_utils import synchronized_dataloader_step
 from data.advanced_datasets import ConstantLengthDataset
@@ -175,7 +175,10 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_ds = train_ds.select(range(val_size))
         train_ds = train_ds.select(range(val_size, len(train_ds)))
 
-    train_dataset = VQADataset(
+    # Use VQAIterableDataset for streaming datasets, VQADataset for map-style
+    DatasetClass = VQAIterableDataset if train_cfg.stream_dataset else VQADataset
+
+    train_dataset = DatasetClass(
         train_ds,
         tokenizer,
         image_processor,
@@ -185,7 +188,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_cfg.visual_dependency_min_rating,
         train_cfg.formatting_min_rating,
     )
-    val_dataset = VQADataset(
+    val_dataset = DatasetClass(
         val_ds,
         tokenizer,
         image_processor,
@@ -196,11 +199,12 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_cfg.formatting_min_rating,
     )
 
-    train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
-                                        max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
+    # MoMH: Disable packing to keep image tokens contiguous at sequence start
+    # train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
+    #                                     max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
 
-    val_dataset = ConstantLengthDataset(val_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
-                                        max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
+    # val_dataset = ConstantLengthDataset(val_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
+    #                                     max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
 
     # Create collators
     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
@@ -209,30 +213,55 @@ def get_dataloaders(train_cfg, vlm_cfg):
     g.manual_seed(0)
 
     # Create dataloaders
+    # For streaming/iterable datasets, don't use shuffle or generator (no sampler needed)
+    is_iterable = train_cfg.stream_dataset
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=train_cfg.batch_size,    # =per device BS in DDP
-        collate_fn=vqa_collator,
-        num_workers=3,
-        pin_memory=True,
-        persistent_workers=False,
-        drop_last=True,
-        worker_init_fn=seed_worker,
-        generator=g,
-    )
+    if is_iterable:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_cfg.batch_size,    # =per device BS in DDP
+            collate_fn=vqa_collator,
+            num_workers=3,
+            pin_memory=True,
+            persistent_workers=False,
+            drop_last=True,
+            worker_init_fn=seed_worker,
+        )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=train_cfg.batch_size,
-        collate_fn=vqa_collator,
-        num_workers=1,
-        pin_memory=True,
-        persistent_workers=False,
-        drop_last=True,
-        worker_init_fn=seed_worker,
-        generator=g,
-    )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_cfg.batch_size,
+            collate_fn=vqa_collator,
+            num_workers=1,
+            pin_memory=True,
+            persistent_workers=False,
+            drop_last=True,
+            worker_init_fn=seed_worker,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_cfg.batch_size,    # =per device BS in DDP
+            collate_fn=vqa_collator,
+            num_workers=3,
+            pin_memory=True,
+            persistent_workers=False,
+            drop_last=True,
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_cfg.batch_size,
+            collate_fn=vqa_collator,
+            num_workers=1,
+            pin_memory=True,
+            persistent_workers=False,
+            drop_last=True,
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
 
     # Warmup dataloaders to kickstart worker processes
     print("Warming up dataloaders...")   
