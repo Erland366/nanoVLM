@@ -49,7 +49,7 @@ class VLMConfig:
       "r6c1": "<row_6_col_1>", "r6c2": "<row_6_col_2>", "r6c3": "<row_6_col_3>", "r6c4": "<row_6_col_4>", "r6c5": "<row_6_col_5>", "r6c6": "<row_6_col_6>", "r6c7": "<row_6_col_7>", "r6c8": "<row_6_col_8>",
       "r7c1": "<row_7_col_1>", "r7c2": "<row_7_col_2>", "r7c3": "<row_7_col_3>", "r7c4": "<row_7_col_4>", "r7c5": "<row_7_col_5>", "r7c6": "<row_7_col_6>", "r7c7": "<row_7_col_7>", "r7c8": "<row_7_col_8>",
       "r8c1": "<row_8_col_1>", "r8c2": "<row_8_col_2>", "r8c3": "<row_8_col_3>", "r8c4": "<row_8_col_4>", "r8c5": "<row_8_col_5>", "r8c6": "<row_8_col_6>", "r8c7": "<row_8_col_7>", "r8c8": "<row_8_col_8>"})
-    vlm_load_backbone_weights: bool = True
+    vlm_load_backbone_weights: bool = False  # Train from scratch for fair comparison with MoMH
     vlm_checkpoint_path: str = 'checkpoints'
     hf_repo_name: str = 'nanoVLM'
 
@@ -60,13 +60,13 @@ class TrainConfig:
     lr_vision_backbone: float = 5e-5 #0.0005 #
     lr_language_backbone: float = 5e-5 #0
     val_size: int = 50000
-    batch_size: int = 2
+    batch_size: int = 1
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
     eval_in_epochs: bool = True
     eval_interval: int = 500
     stats_log_interval: int = 100
-    max_training_steps: int = 40000
+    max_training_steps: int = 12000
     max_images_per_example: int = 4
     max_images_per_knapsack: int = 18
     max_sample_length: int = 4096
@@ -75,11 +75,12 @@ class TrainConfig:
     train_dataset_path: str = 'HuggingFaceM4/FineVision_concat_shuffled_2'
     train_dataset_name: tuple[str, ...] = ("default", ) #('allava_laion', 'allava_vflan', 'cambrian(filtered)_processed', 'LLaVA_Instruct_150K', 'mmevol', 'sharegpt4o', 'sharegpt4v(coco)', 'sharegpt4v(knowledge)', 'sharegpt4v(llava)', 'sharegpt4v(sam)') # 'vision_flan(filtered)', 'lvis_instruct4v',
     stream_dataset: bool = True
+    use_packing: bool = False  # Use ConstantLengthDataset for packing multiple samples
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1
     visual_dependency_min_rating: int = 1
     formatting_min_rating: int = 1
-    wandb_entity: str = "HuggingFace" # Indicate the entity to log to in wandb
+    wandb_entity: str = "erlandpg" # Indicate the entity to log to in wandb
     log_wandb: bool = True
     use_lmms_eval: bool = True # Use lmms-eval for evaluation
     lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
