@@ -39,9 +39,9 @@ class VLMConfig:
 
     # Mixture of Modality Heads (MoMH) config
     momh_enabled: bool = True
-    momh_head_pct_vision: float = 0.4  # 40% of heads for V->V only
-    momh_head_pct_text: float = 0.4    # 40% of heads for T->T only
-    # Remaining 20% (1 - vision - text) for VT->VT cross-modal
+    momh_head_pct_vision: float = 0.2  # 20% of heads for V->V only
+    momh_head_pct_text: float = 0.3    # 30% of heads for T->T only
+    # Remaining 50% (1 - vision - text) for VT->VT cross-modal
 
     max_img_size: int = 2048
     resize_to_max_side_len: bool = True
@@ -62,9 +62,9 @@ class VLMConfig:
 
 @dataclass
 class TrainConfig:
-    lr_mp: float = 0.00512
-    lr_vision_backbone: float = 5e-5 #0.0005 #
-    lr_language_backbone: float = 5e-5 #0
+    lr_mp: float = 1e-3  # Pretraining from scratch
+    lr_vision_backbone: float = 1e-4  # Pretraining from scratch
+    lr_language_backbone: float = 1e-4  # Pretraining from scratch
     val_size: int = 50000
     batch_size: int = 1  # Reduced for MoMH (disabled packing uses more memory)
     gradient_accumulation_steps: int = 8
