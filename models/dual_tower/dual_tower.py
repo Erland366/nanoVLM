@@ -1,10 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+import os
+import tempfile
+from dataclasses import asdict
+from safetensors.torch import load_model as load_safetensors, save_model
 from models.dual_tower.dual_language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.config import VLMConfig
 from models.utils import top_k_top_p_filtering
+from huggingface_hub import create_repo, hf_hub_download, upload_folder
+
 
 
 class LeftTower(VisionLanguageModel):
@@ -400,3 +407,97 @@ class DualTowerVLM(nn.Module):
             generated_ids[replace_mask] = self.tokenizer.eos_token_id
         
         return generated_ids
+    
+    def save_pretrained(self, save_directory: str) -> None:
+        os.makedirs(save_directory, exist_ok=True)
+
+        with open(os.path.join(save_directory, "config.json"), "w") as f:
+            f.write(json.dumps(asdict(self.cfg), indent=4))
+
+        save_model(self, os.path.join(save_directory, "model.safetensors"))
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        source: str,
+        *,
+        config_path: str | None = None,
+        device: torch.device | str | None = None,
+        load_backbone: bool = False,
+        **model_kwargs,
+    ):
+        """Load a DualTowerVLM from a local checkpoint directory/weights file or HF repo."""
+        if device is None:
+            device = torch.device("cpu")
+
+        if os.path.isdir(source):
+            resolved_config_path = config_path or os.path.join(source, "config.json")
+            weights_path = os.path.join(source, "model.safetensors")
+        elif os.path.isfile(source):
+            weights_path = source
+            resolved_config_path = config_path or os.path.join(os.path.dirname(source), "config.json")
+        else:
+            resolved_config_path = hf_hub_download(repo_id=source, filename="config.json")
+            weights_path = hf_hub_download(repo_id=source, filename="model.safetensors")
+
+        if not os.path.exists(resolved_config_path):
+            raise FileNotFoundError("config.json not found; pass config_path for local weights.")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError("model.safetensors not found for the provided source.")
+
+        with open(resolved_config_path, "r") as f:
+            cfg_dict = json.load(f)
+        cfg = VLMConfig(**cfg_dict)
+
+        model = cls(cfg, load_backbone=load_backbone, **model_kwargs)
+
+        load_safetensors(model, weights_path)
+        model = model.to(device)
+        return model
+
+    def push_to_hub(self, repo_id: str, private: bool = False) -> None:
+        repo_url = create_repo(repo_id=repo_id, private=private, exist_ok=True)
+        repo_id = repo_url.repo_id
+        print("Created repo: ", repo_url)
+
+        with tempfile.TemporaryDirectory() as save_path:
+            self.save_pretrained(save_path)
+
+            with open(os.path.join(save_path, "README.md"), "w") as f:
+                f.write(DUAL_TOWER_MODEL_CARD_TEMPLATE.format(repo_id=repo_id))
+
+            return upload_folder(
+                repo_id=repo_id,
+                repo_type="model",
+                folder_path=save_path,
+                commit_message="Upload DualTowerVLM using push_to_hub",
+            )
+
+
+DUAL_TOWER_MODEL_CARD_TEMPLATE = """---
+# For reference on model card metadata, see the spec: https://github.com/huggingface/hub-docs/blob/main/modelcard.md?plain=1
+# Doc / guide: https://huggingface.co/docs/hub/model-cards
+library_name: dualtowervlm
+license: mit
+pipeline_tag: image-text-to-text
+tags:
+  - vision-language
+  - multimodal
+  - dual-tower
+  - research
+---
+
+**DualTowerVLM** is a dual-tower Vision-Language Model (VLM) architecture that processes images and text through separate towers before combining their representations.
+
+For more information, check out the repository.
+
+**Usage:**
+
+```python
+from models.dual_tower.dual_tower import DualTowerVLM
+from models.config import VLMConfig
+
+cfg = VLMConfig()
+model = DualTowerVLM.from_pretrained("{repo_id}")
+```
+"""
