@@ -5,7 +5,9 @@ import torch.nn.functional as F
 
 from models.momh_attention import (
     flex_attention_compiled,
+    flex_attention_compiled_dynamic,
     create_momh_block_mask,
+    generate_momh_score_mod_with_offset,
 )
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
@@ -223,7 +225,37 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None, content_starts=None) -> tuple[torch.Tensor, dict]:
+        # MoMH decode support: captured tensor buffers and score_mod
+        # These are created lazily on first decode to ensure correct device placement
+        self._momh_decode_score_mod = None
+        self._momh_content_starts_buffer = None
+        self._momh_position_offset_buffer = None
+
+    def _get_momh_decode_score_mod(self, device: torch.device):
+        """
+        Lazily create the MoMH score_mod for decode phase.
+
+        Uses captured tensors so that value changes don't trigger recompilation.
+        The score_mod is created once and reused for all subsequent decode calls.
+        """
+        if self._momh_decode_score_mod is None:
+            # Create buffer tensors on the correct device
+            # These will be updated with actual values before each forward call
+            self._momh_content_starts_buffer = torch.zeros(1, dtype=torch.int64, device=device)
+            self._momh_position_offset_buffer = torch.tensor(0, dtype=torch.int64, device=device)
+
+            # Create score_mod with captured tensors
+            self._momh_decode_score_mod = generate_momh_score_mod_with_offset(
+                n_q_heads=self.n_heads,
+                S_V=self.S_V,
+                content_starts=self._momh_content_starts_buffer,
+                position_offset=self._momh_position_offset_buffer,
+                pct_v=self.momh_pct_vision,
+                pct_t=self.momh_pct_text
+            )
+        return self._momh_decode_score_mod
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None, content_starts=None, position_offset: int = 0) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
 
@@ -239,6 +271,9 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             block_kv_cache (dict, optional): Cache dict with 'key' and 'value' tensors for autoregressive decoding.
             content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
                                                for MoMH attention (where padding ends).
+            position_offset (int, optional): Position offset for decode phase. During decode,
+                                            q_idx=0 in the tensor but actual position is position_offset.
+                                            Default 0 (no offset, used during prefill).
 
         Returns:
             tuple[Tensor, dict]:
@@ -278,11 +313,15 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         
         T_kv = k_exp.size(2) # Total sequence length of keys/values
 
-        # MoMH path: Use flex_attention with modality-specific masks during prefill
-        use_momh = (self.momh_enabled and is_prefill and content_starts is not None
-                    and x.device.type == 'cuda')
+        # MoMH path: Use flex_attention with modality-specific masks
+        # Prefill: Use BlockMask for efficient sparse attention
+        # Decode: Use score_mod with position offset for correct masking
+        use_momh_prefill = (self.momh_enabled and is_prefill and content_starts is not None
+                           and x.device.type == 'cuda')
+        use_momh_decode = (self.momh_enabled and not is_prefill and content_starts is not None
+                          and x.device.type == 'cuda')
 
-        if use_momh:
+        if use_momh_prefill:
             # Create MoMH block mask with per-batch content_start offsets
             block_mask = create_momh_block_mask(
                 n_q_heads=self.n_heads,
@@ -299,8 +338,42 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             v_exp = v_exp.to(target_dtype)
             # Use compiled flex_attention for efficient sparse attention
             y = flex_attention_compiled(q, k_exp, v_exp, block_mask=block_mask)
+
+        elif use_momh_decode:
+            # MoMH decode path: Use score_mod with position offset
+            # Get or create the score_mod (uses captured tensors to avoid recompilation)
+            score_mod = self._get_momh_decode_score_mod(x.device)
+
+            # Update captured tensor values (value changes don't trigger recompilation)
+            # Resize content_starts buffer if batch size changed
+            if self._momh_content_starts_buffer.shape[0] != content_starts.shape[0]:
+                self._momh_content_starts_buffer = content_starts.clone()
+                # Recreate score_mod with new buffer
+                self._momh_decode_score_mod = generate_momh_score_mod_with_offset(
+                    n_q_heads=self.n_heads,
+                    S_V=self.S_V,
+                    content_starts=self._momh_content_starts_buffer,
+                    position_offset=self._momh_position_offset_buffer,
+                    pct_v=self.momh_pct_vision,
+                    pct_t=self.momh_pct_text
+                )
+                score_mod = self._momh_decode_score_mod
+            else:
+                self._momh_content_starts_buffer.copy_(content_starts)
+
+            self._momh_position_offset_buffer.fill_(position_offset)
+
+            # Ensure consistent dtypes
+            target_dtype = q.dtype
+            k_exp = k_exp.to(target_dtype)
+            v_exp = v_exp.to(target_dtype)
+
+            # Use flex_attention with score_mod for MoMH masking
+            # Use dynamic=True version for decode: KV length grows each step
+            y = flex_attention_compiled_dynamic(q, k_exp, v_exp, score_mod=score_mod)
+
         else:
-            # Standard attention path (decode phase, MoMH disabled, or non-CUDA)
+            # Standard attention path (MoMH disabled or non-CUDA)
             # Prepare attention mask for SDPA or manual path
             # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
             additive_attn_mask = None
@@ -336,6 +409,8 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                 attn = self.attn_dropout(attn)
                 y = attn @ v_exp
             
+        # Ensure output dtype matches input (flex_attention may return float32)
+        y = y.to(x.dtype)
         y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
         y = self.out_proj(y)
         y = self.resid_dropout(y)
@@ -400,7 +475,7 @@ class LanguageModelBlock(nn.Module):
         self.norm1 = RMSNorm(cfg) # Input Norm
         self.norm2 = RMSNorm(cfg) # Post Attention Norm
     
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None, content_starts: torch.Tensor=None):
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None, content_starts: torch.Tensor=None, position_offset: int=0):
         """
         Forward pass of the Transformer block.
 
@@ -415,6 +490,7 @@ class LanguageModelBlock(nn.Module):
                 during decoding. If None, no cache is used.
             content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
                 for MoMH attention (where padding ends).
+            position_offset (int, optional): Position offset for decode phase. Default 0.
 
         Returns:
             Tuple[Tensor, dict]: Output tensor after the block (same shape as input),
@@ -422,7 +498,7 @@ class LanguageModelBlock(nn.Module):
         """
         res = x
         x = self.norm1(x)
-        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache, content_starts)
+        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache, content_starts, position_offset)
         x = res + x
 
         res = x
@@ -462,7 +538,7 @@ class LanguageModel(nn.Module):
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0, content_starts: torch.Tensor=None):
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0, content_starts: torch.Tensor=None, position_offset: int=None):
         """
         Performs a forward pass through the language model.
 
@@ -480,7 +556,10 @@ class LanguageModel(nn.Module):
                 sequence. Used to compute rotary positional embeddings correctly,
                 especially for cached sequences during generation. Default is 0.
             content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
-                for MoMH attention (where padding ends). Only used during prefill.
+                for MoMH attention (where padding ends). Used for both prefill and decode.
+            position_offset (int, optional): Position offset for MoMH decode phase.
+                During decode, q_idx=0 but actual position is position_offset.
+                If None, defaults to start_pos.
 
         Returns:
             Tuple:
@@ -516,8 +595,12 @@ class LanguageModel(nn.Module):
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
+        # position_offset for MoMH decode: default to start_pos if not specified
+        if position_offset is None:
+            position_offset = start_pos
+
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i], content_starts)
+            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i], content_starts, position_offset)
 
         x = self.norm(x)
 

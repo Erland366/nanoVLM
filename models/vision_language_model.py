@@ -147,13 +147,15 @@ class VisionLanguageModel(nn.Module):
                 attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
 
             # With KV cache: only process the new token
-            # Note: content_starts=None during decode (no MoMH, use standard causal attention)
+            # Pass content_starts for MoMH attention during decode
+            # position_offset tells the attention layer where this token actually is in the sequence
             decode_step_output, kv_cache_list = self.decoder(
                 next_token_embed,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache_list,
                 start_pos=current_token_start_pos,
-                content_starts=None  # No MoMH during decode phase
+                content_starts=content_starts,  # MoMH during decode phase
+                position_offset=current_token_start_pos  # Actual position of the query token
             )
       
             last_token_output = decode_step_output[:, -1, :] 
