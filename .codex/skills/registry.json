@@ -2,7 +2,7 @@
   "domain": "research",
   "version": "1.0.0",
   "created": "2026-01-13",
-  "updated": "2026-01-13",
+  "updated": "2026-01-14",
   "skills": {
     "domain-advisor": {
       "type": "core",
@@ -11,6 +11,10 @@
     "domain-retrospective": {
       "type": "core",
       "description": "Document findings as reusable skills"
+    },
+    "mmstar-first-letter-scoring": {
+      "type": "result",
+      "description": "MMStar exact-match uses the first output character; gibberish can score"
     }
   },
   "paths": {
