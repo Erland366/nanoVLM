@@ -6,13 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.9.0",
-    "numpy>=2.0.0",
+    "numpy==1.26.4",
     "torchvision>=0.22.1",
     "pillow>=11.0.0",
-    "datasets>=3.0.0",
     "huggingface-hub>=0.26.0",
     "transformers>=4.46.0",
     "wandb>=0.18.0",
+    "datasets>=2.19.0,<3",
+    "lmms-eval>=0.5.0",
 ]
 
 [tool.uv.sources]
