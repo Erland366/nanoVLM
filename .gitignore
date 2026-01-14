@@ -7,3 +7,4 @@ train.sh
 logs/
 eval_results/
 *.png
+*.sh
