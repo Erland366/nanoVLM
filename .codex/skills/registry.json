@@ -1,0 +1,30 @@
+{
+  "domain": "research",
+  "version": "1.0.0",
+  "created": "2025-01-13",
+  "updated": "2025-01-15",
+  "skills": {
+    "domain-advisor": {
+      "type": "core",
+      "description": "Plan experiments using past knowledge"
+    },
+    "domain-retrospective": {
+      "type": "core",
+      "description": "Document findings as reusable skills"
+    },
+    "flex-attention-inference": {
+      "type": "project",
+      "description": "Patterns for flex_attention prefill vs decode"
+    },
+    "torch-compile-debug": {
+      "type": "project",
+      "description": "Debug torch.compile recompilations and graph breaks"
+    }
+  },
+  "paths": {
+    "reports": "training_reports/",
+    "experiment_log": "references/experiment-log.md",
+    "troubleshooting": "references/troubleshooting.md",
+    "templates": "templates/"
+  }
+}
