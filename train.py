@@ -388,6 +388,8 @@ def train(train_cfg, vlm_cfg):
         'fw_bw_time': [],
         'post_process_time': [],
         'images_per_sample': [],
+        'effective_tokens': [],  # Tokens without padding
+        'total_tokens': [],      # Total tokens including padding
     }
     
     while global_step < train_cfg.max_training_steps:
@@ -462,7 +464,8 @@ def train(train_cfg, vlm_cfg):
                 batch_loss = batch_loss * train_cfg.gradient_accumulation_steps
             total_train_loss += batch_loss
 
-            num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens
+            num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens (effective tokens)
+            total_batch_tokens = attention_mask.numel()   # Total tokens including padding
             total_tokens_processed += num_tokens
             post_process_time = time.time() - post_process_start
 
@@ -478,6 +481,8 @@ def train(train_cfg, vlm_cfg):
             accumulated_stats['fw_bw_time'].append(fw_bw_time)
             accumulated_stats['post_process_time'].append(post_process_time)
             accumulated_stats['images_per_sample'].extend(images_per_sample)
+            accumulated_stats['effective_tokens'].append(num_tokens)
+            accumulated_stats['total_tokens'].append(total_batch_tokens)
             
             if train_cfg.eval_in_epochs and global_step % train_cfg.eval_interval == 0 and is_update_step:
                 print("Starting evaluation")
@@ -542,7 +547,7 @@ def train(train_cfg, vlm_cfg):
                         stats[f'avg_{key}'] = mean(all_values_flat)
                     else:
                         stats[f'avg_{key}'] = mean(accumulated_stats[key])
-                
+
                 for key in ['data_load_time', 'fw_bw_time', 'post_process_time', 'images_per_sample']:
                     if is_dist():
                         all_values = dist_gather(accumulated_stats[key])
@@ -557,11 +562,31 @@ def train(train_cfg, vlm_cfg):
                     stats['min_images_per_sample'] = min(all_images_flat)
                 else:
                     stats['min_images_per_sample'] = min(accumulated_stats['images_per_sample'])
-                
+
+                # Compute token efficiency (sync all-reduce if enabled, otherwise local only)
+                local_effective = sum(accumulated_stats['effective_tokens'])
+                local_total = sum(accumulated_stats['total_tokens'])
+
+                if train_cfg.sync_token_efficiency and is_dist():
+                    token_tensor = torch.tensor([local_effective, local_total],
+                                                device=torch.cuda.current_device(),
+                                                dtype=torch.float64)
+                    dist.all_reduce(token_tensor, op=dist.ReduceOp.SUM)
+                    global_effective = token_tensor[0].item()
+                    global_total = token_tensor[1].item()
+                else:
+                    global_effective = local_effective
+                    global_total = local_total
+
+                token_efficiency = global_effective / global_total if global_total > 0 else 1.0
+
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
                     run.log({
                         **{f"training_stats/{key}": value for key, value in stats.items()},
+                        "training_stats/effective_tokens": global_effective,
+                        "training_stats/total_tokens": global_total,
+                        "training_stats/token_efficiency": token_efficiency,
                     }, step=global_step)
 
                     # Check for and log new lmms-eval results

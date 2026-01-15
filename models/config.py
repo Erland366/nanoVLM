@@ -66,6 +66,7 @@ class TrainConfig:
     eval_in_epochs: bool = True
     eval_interval: int = 500
     stats_log_interval: int = 100
+    sync_token_efficiency: bool = False  # Enable cross-GPU sync for token efficiency stats
     max_training_steps: int = 12000
     max_images_per_example: int = 4
     max_images_per_knapsack: int = 18
