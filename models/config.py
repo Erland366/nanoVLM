@@ -87,3 +87,7 @@ class TrainConfig:
     lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
+    # Async HuggingFace checkpoint upload
+    upload_checkpoints_to_hf: bool = False
+    hf_upload_repo_id: str = None  # Required if upload_checkpoints_to_hf is True
+    hf_upload_max_queue: int = 3  # Max pending uploads before dropping oldest

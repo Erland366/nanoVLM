@@ -33,6 +33,7 @@ from data.processors import get_image_processor, get_tokenizer
 
 import models.config as config
 from models.vision_language_model import VisionLanguageModel
+from utils.hf_uploader import AsyncHFUploader
 
 #Otherwise, the tokenizer will throw a warning
 import os
@@ -366,6 +367,16 @@ def train(train_cfg, vlm_cfg):
     
     print(f"Using device: {device}")
     model.to(device)
+
+    # Initialize async HuggingFace checkpoint uploader
+    hf_uploader = None
+    if train_cfg.upload_checkpoints_to_hf and is_master():
+        hf_uploader = AsyncHFUploader(
+            repo_id=train_cfg.hf_upload_repo_id,  # If None, will auto-generate
+            repo_name_base=vlm_cfg.hf_repo_name,  # Used if repo_id is None
+            max_pending=train_cfg.hf_upload_max_queue,
+        )
+        print(f"Async HF uploader initialized for repo: {hf_uploader.repo_id}")
     
     if train_cfg.compile:
         model = torch.compile(model)
@@ -518,6 +529,10 @@ def train(train_cfg, vlm_cfg):
                         save_model = model.module if is_dist() else model # unwrap the model for saving if DDP
                         save_model.save_pretrained(save_directory=checkpoint_path_step)
 
+                        # Queue for async HuggingFace upload
+                        if hf_uploader:
+                            hf_uploader.submit_upload(checkpoint_path_step, global_step)
+
                         if train_cfg.use_lmms_eval and global_step % (train_cfg.eval_interval*2) == 0:
                             # Submit evaluation job
                             cmd = f"sbatch eval.slurm {checkpoint_path_step} {global_step} {run_name} {train_cfg.lmms_eval_limit} {train_cfg.lmms_eval_tasks} {train_cfg.lmms_eval_batch_size}"
@@ -588,6 +603,11 @@ def train(train_cfg, vlm_cfg):
                         "training_stats/total_tokens": global_total,
                         "training_stats/token_efficiency": token_efficiency,
                     }, step=global_step)
+
+                    # Log HF upload status
+                    if hf_uploader:
+                        upload_status = hf_uploader.get_status()
+                        run.log({f"hf_upload/{k}": v for k, v in upload_status.items()}, step=global_step)
 
                     # Check for and log new lmms-eval results
                     eval_results_dir = os.path.join('eval_results', run_name)
@@ -676,6 +696,13 @@ def train(train_cfg, vlm_cfg):
         print(f"Average time per epoch: {avg_epoch_time:.2f}s")
         print(f"Average time per sample: {avg_time_per_sample:.4f}s")
 
+        # Wait for pending HF checkpoint uploads to complete
+        if hf_uploader:
+            print("Waiting for pending HF uploads to complete...")
+            hf_uploader.shutdown(wait=True)
+            status = hf_uploader.get_status()
+            print(f"HF upload complete. Completed: {status['completed']}, Failed: {status['failed']}")
+
         # Push the best model to the hub (Please set your user name in the config!)
         if vlm_cfg.hf_repo_name is not None and best_model_path:
             print(f"Training complete. Pushing best model from {best_model_path} to Hugging Face Hub...")
@@ -703,6 +730,9 @@ def main():
     parser.add_argument('--image_correspondence_min_rating', type=int, help='Minimum image correspondence rating of images per sample')
     parser.add_argument('--visual_dependency_min_rating', type=int, help='Minimum visual dependency rating of images per sample')
     parser.add_argument('--formatting_min_rating', type=int, help='Minimum formatting rating of images per sample')
+    parser.add_argument('--max_training_steps', type=int, help='Maximum training steps')
+    parser.add_argument('--upload_checkpoints_to_hf', action='store_true', help='Upload checkpoints to HuggingFace Hub asynchronously')
+    parser.add_argument('--hf_upload_repo_id', type=str, help='HuggingFace repo ID for checkpoint uploads (auto-generated if not provided)')
 
     args = parser.parse_args()
 
@@ -731,6 +761,12 @@ def main():
         train_cfg.visual_dependency_min_rating = args.visual_dependency_min_rating
     if args.formatting_min_rating is not None:
         train_cfg.formatting_min_rating = args.formatting_min_rating
+    if args.max_training_steps is not None:
+        train_cfg.max_training_steps = args.max_training_steps
+    if args.upload_checkpoints_to_hf:
+        train_cfg.upload_checkpoints_to_hf = True
+    if args.hf_upload_repo_id is not None:
+        train_cfg.hf_upload_repo_id = args.hf_upload_repo_id
 
     if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
         train_cfg.resume_from_vlm_checkpoint = True
