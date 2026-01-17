@@ -12,9 +12,11 @@ dependencies = [
     "huggingface-hub>=0.26.0",
     "transformers>=4.46.0",
     "wandb>=0.18.0",
-    "datasets>=2.19.0,<3",
     "lmms-eval>=0.5.0",
 ]
+
+[tool.uv]
+override-dependencies = ["datasets==4.2.0"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }
