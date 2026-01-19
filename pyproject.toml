@@ -14,7 +14,11 @@ dependencies = [
     "wandb>=0.18.0",
     "datasets>=2.19.0,<3",
     "lmms-eval>=0.5.0",
+    "einops>=0.8.1",
 ]
+
+[tool.uv]
+override-dependencies = ["datasets==4.2.0"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }
