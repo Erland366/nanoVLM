@@ -100,11 +100,15 @@ class BaseDataset(Dataset):
                 mask[start:end] = [1] * (end - start)  # attend to these tokens
 
             cursor += seg_len
-
+        
         return torch.tensor(conv_ids["input_ids"]), torch.tensor(mask).to(torch.bool), torch.tensor(conv_ids["attention_mask"])
 
 
-class VQADataset(BaseDataset):  # Visual Question Answering Dataset (map-style)
+class VQADataset(BaseDataset):  # Visual Question Answering Dataset
+    def iter_for_worker(self):  # with iterable datasets, each worker gets different shards
+        for data in self.dataset:
+            yield self._process_data(data)
+
     def __getitem__(self, idx):
         item = self.dataset[idx]
         return self._process_data(item)

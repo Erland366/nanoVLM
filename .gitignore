@@ -26,5 +26,9 @@ results/
 eval_results*/
 *.arrow
 /shards/*
-*.png
 plots*/
+.ipynb_checkpoints/
+setup.sh
+train.sh
+*.png
+*.sh

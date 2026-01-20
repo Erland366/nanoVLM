@@ -76,6 +76,8 @@ class TrainConfig:
     max_training_steps: int = 12000
     max_images_per_example: int = 4
     max_images_per_knapsack: int = 18
+
+    pack_sequences: bool = False
     max_sample_length: int = 4096
     compile: bool = False
     resume_from_vlm_checkpoint: bool = False # Indicate if the training should be resumed from a checkpoint of the whole VLM or you want to start from scratch
@@ -89,7 +91,7 @@ class TrainConfig:
     formatting_min_rating: int = 1
     wandb_entity: str = "erlandpg" # Indicate the entity to log to in wandb
     log_wandb: bool = True
-    use_lmms_eval: bool = True # Use lmms-eval for evaluation
+    use_lmms_eval: bool = False # Use lmms-eval for evaluation
     lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
