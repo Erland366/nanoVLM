@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from data.data_utils import synchronized_dataloader_step
 
-from configs.config_vanilla import VLMConfig, TrainConfig, GlobalConfig
+from configs.config import VLMConfig, TrainConfig, GlobalConfig
 from models.vision_language_model import VisionLanguageModel
 from train_utils import (
     create_cpu_group, destroy_dist, dist_gather, dist_mean_scalar,

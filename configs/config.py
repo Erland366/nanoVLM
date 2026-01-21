@@ -39,8 +39,8 @@ class VLMConfig:
     lm_max_length: int = 4096
     lm_use_tokens: bool = False # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
     lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
-    lm_model_type: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
-    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
+    lm_model_type: str = 'HuggingFaceTB/SmolLM2-360M-Instruct'
+    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-360M-Instruct'
     lm_chat_template: str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
     mp_pixel_shuffle_factor: int = 4
@@ -59,6 +59,12 @@ class VLMConfig:
       "r7c1": "<row_7_col_1>", "r7c2": "<row_7_col_2>", "r7c3": "<row_7_col_3>", "r7c4": "<row_7_col_4>", "r7c5": "<row_7_col_5>", "r7c6": "<row_7_col_6>", "r7c7": "<row_7_col_7>", "r7c8": "<row_7_col_8>",
       "r8c1": "<row_8_col_1>", "r8c2": "<row_8_col_2>", "r8c3": "<row_8_col_3>", "r8c4": "<row_8_col_4>", "r8c5": "<row_8_col_5>", "r8c6": "<row_8_col_6>", "r8c7": "<row_8_col_7>", "r8c8": "<row_8_col_8>"})
     vlm_load_backbone_weights: bool = True
+
+    momh_enabled: bool = True
+    momh_head_pct_vision: float = 0.3  # 40% of heads for V->V only
+    momh_head_pct_text: float = 0.2    # 40% of heads for T->T only
+    # Remaining 20% (1 - vision - text) for VT->VT cross-modal
+
     vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
     hf_repo_name: str = 'nanoVLM'
 
@@ -70,13 +76,13 @@ class TrainConfig:
     lr_mp: float = 0.00512                            # Learning rate for multimodal projection layers
     lr_vision_backbone: float = 0                 # Learning rate for vision backbone
     lr_language_backbone: float = 5e-5              # Learning rate for language backbone
-    compile: bool = True                            # Use torch.compile for model/training
+    compile: bool = False                            # Use torch.compile for model/training
     resume_from_vlm_checkpoint: bool = False       # Resume full VLM training from checkpoint
 
     # =========================
     # Data Related
     # =========================
-    batch_size: int = 4                           # Per-device batch size
+    batch_size: int = 1                           # Per-device batch size
     gradient_accumulation_steps: int = 32            # Gradient accumulation steps (to simulate larger effective batch)
     train_dataset_path: str = 'HuggingFaceM4/the_cauldron'
     train_dataset_name: tuple[str, ...] = (
@@ -125,6 +131,8 @@ class TrainConfig:
     pack_sequences: bool = False
     max_sample_length: int = 4096
 
+    # Sync Token Efficiency
+
     # =========================
     # Training Loop Related
     # =========================
@@ -144,9 +152,9 @@ class TrainConfig:
     # Logging & Model Saving
     # =========================
     log_wandb: bool = True                          # Enable/disable logging to WandB
-    wandb_entity: str = ""                          # Indicate the entity to log to in wandb
-    wandb_project: str = 'dualtower-cauldron'
-    prefix_run_name: str = "vanilla"
+    wandb_entity: str = "erlandpg"                          # Indicate the entity to log to in wandb
+    wandb_project: str = 'nanoVLM'
+    prefix_run_name: str = "momh"
     save_code_cfg: bool = True                # Save configuration/code snapshot with checkpoint
     save_model_every_n_steps: int = 500            # How often to save model snapshot
     stats_log_interval: int = 100                   # Log loss/metrics stats every N steps
