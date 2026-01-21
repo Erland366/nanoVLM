@@ -46,7 +46,7 @@ class VLMConfig:
     mp_pixel_shuffle_factor: int = 4
     mp_image_token_length: int = 64
 
-    max_img_size: int = 512
+    max_img_size: int = 2048
     resize_to_max_side_len: bool = False
 
     vlm_extra_tokens: dict[str, str] = field(default_factory=lambda: {"image_token": "<|image|>", "global_image_token": "<|global_image|>",
@@ -67,27 +67,51 @@ class TrainConfig:
     # =========================
     # Model/Optimizer Related
     # =========================
-    lr_mp: float = 1e-5                             # Learning rate for multimodal projection layers
-    lr_vision_backbone: float = 0.0                 # Learning rate for vision backbone
-    lr_language_backbone: float = 5e-6              # Learning rate for language backbone
+    lr_mp: float = 0.00512                            # Learning rate for multimodal projection layers
+    lr_vision_backbone: float = 0                 # Learning rate for vision backbone
+    lr_language_backbone: float = 5e-5              # Learning rate for language backbone
     compile: bool = True                            # Use torch.compile for model/training
-    resume_from_vlm_checkpoint: bool = True         # Resume full VLM training from checkpoint
+    resume_from_vlm_checkpoint: bool = False       # Resume full VLM training from checkpoint
 
     # =========================
     # Data Related
     # =========================
-    batch_size: int = 256                           # Per-device batch size
-    gradient_accumulation_steps: int = 4            # Gradient accumulation steps (to simulate larger effective batch)
-    train_dataset_path: str = 'HuggingFaceM4/FineVision_concat_shuffled_2'   # HF dataset repo/id for training
-    train_dataset_name: tuple[str, ...] = ("default", )                      # Subsets or data splits to use
+    batch_size: int = 4                           # Per-device batch size
+    gradient_accumulation_steps: int = 32            # Gradient accumulation steps (to simulate larger effective batch)
+    train_dataset_path: str = 'HuggingFaceM4/the_cauldron'
+    train_dataset_name: tuple[str, ...] = (
 
-    stream_dataset: bool = False                    # Stream dataset from remote source/storage
-    interleave_datasets: bool = False               # Enable/disable dataset interleaving for training (if relevant)
-    interleave_probabilities: tuple[float, ...] | None = None  # Interleaving: probabilities per dataset
-    interleave_stopping_strategy: str = "all_exhausted"        # Interleaving: stop after all exhausted, or on first exhaustion
-    streaming_shuffle_buffer: int = 10000           # Stream buffer for shuffling (higher = more randomness, more memory)
-    stratified_val_split: bool = False              # Stratify/split validation set in a balanced way
-    data_cutoff_idx: int | None = None              # If not None, cut off dataset at this index for debugging/prototyping
+        # # Use All
+        # "all"
+
+        # # Subset 1 (Basic QA + Text Understanding): 
+        "textcaps", "textvqa", "screen2words", "vistext",
+         "iam", "cocoqa", "visual7w", "iconqa",
+
+        # # Subset 2: (Spatial Grounding + Reasoning QA)
+        # "tallyqa", "raven", "spot_the_diff", "vsr", 
+        # "geomverse", "ai2d", "diagram_image_to_text", 
+        # "infographic_vqa", "st_vqa", "okvqa", "intergps",
+
+        # # Subset 3: (OCR + Doc / Screen Understanding)
+        # "plotqa", "dvqa", "figureqa", "chart2text", "chartqa", 
+        # "robut_wikisql", "robut_wtq", "tabmwp", "docvqa", 
+        # "multihiertt", "tat_qa", "hitab", "tqa", "mapqa",
+
+        # # Subset 4: (Domain Specific, Science, Math)
+        # "ocrvqa", "clevr_math", "datikz", "aokvqa", "finqa", 
+        # "scienceqa", "robut_sqa", "websight", "visualmrc", 
+        # "vqarad", "hateful_memes"
+
+    )                 
+
+    stream_dataset: bool = True  # Whether to stream the dataset (for large datasets)
+    interleave_datasets: bool = True
+    interleave_probabilities: tuple[float, ...] | None = None
+    interleave_stopping_strategy: str = "all_exhausted"
+    streaming_shuffle_buffer: int = 10_000
+    stratified_val_split: bool = True
+    data_cutoff_idx: int | None = None # limit number of data to be used in train run            # If not None, cut off dataset at this index for debugging/prototyping
 
     # Subset quality filtering
     relevance_min_rating: int = 1                   # Subset: minimum relevance rating for filtering
@@ -104,34 +128,34 @@ class TrainConfig:
     # =========================
     # Training Loop Related
     # =========================
-    max_training_steps: int = 500                   # Total optimizer steps for training
+    max_training_steps: int = 20_000                   # Total optimizer steps for training
     max_grad_norm: float = 1.0                      # Gradient clipping
 
     # =========================
     # Evaluation Related
     # =========================
     # Validation/evaluation split sizing (global or per-rank depending on strategy)
-    val_size: int = 50000
+    val_size: int = 50_000
     max_val_batches: int = 128                      # Hard limit on batches during evaluation
     eval_in_epochs: bool = True                     # Evaluate in epochs or by global steps
-    eval_interval: int = 500                        # Number of steps/epochs between evaluations
+    eval_interval: int = 250                        # Number of steps/epochs between evaluations
 
     # =========================
     # Logging & Model Saving
     # =========================
     log_wandb: bool = True                          # Enable/disable logging to WandB
     wandb_entity: str = ""                          # Indicate the entity to log to in wandb
-    wandb_project: str = 'nanovlm-cauldron'         # Project name for WandB
-    prefix_run_name: str = "vanilla-230m"           # Prefix for experiment/run
-    save_code_cfg: bool = True                      # Save configuration/code snapshot with checkpoint
-    save_model_every_n_steps: int = 1500            # How often to save model snapshot
+    wandb_project: str = 'dualtower-cauldron'
+    prefix_run_name: str = "vanilla"
+    save_code_cfg: bool = True                # Save configuration/code snapshot with checkpoint
+    save_model_every_n_steps: int = 500            # How often to save model snapshot
     stats_log_interval: int = 100                   # Log loss/metrics stats every N steps
 
     # Model saving configuration
     save_local: bool = False                        # Save model locally for backup/debugging
-    local_model_cp_path: str = "checkpoints/vanilla-230m"  # Checkpoint save path (local)
-    save_hf: bool = False                           # Save model to HuggingFace Hub (push_to_hub)
-    hf_model_cp_path: str = "patrickamadeus/vanilla-230m"  # HuggingFace Hub repo name/path
+    local_model_cp_path: str = "checkpoints/vanilla-c1"  # Checkpoint save path (local)
+    save_hf: bool = True                           # Save model to HuggingFace Hub (push_to_hub)
+    hf_model_cp_path: str = "patrickamadeus/vanilla-c1"  # HuggingFace Hub repo name/path
 
     # =========================
     # Extended Evaluation
