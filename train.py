@@ -287,12 +287,13 @@ def train(train_cfg, vlm_cfg, global_cfg):
 
                 checkpoint_path_step = ""
                 if is_master():
-                    # Save a checkpoint for this evaluation step
-                    checkpoint_path_step = os.path.join(vlm_cfg.vlm_checkpoint_path, run_name, f"step_{global_step}")
-                    save_model = model.module if is_dist() else model # unwrap the model for saving if DDP
-                    save_model.save_pretrained(save_directory=checkpoint_path_step)
+                    # Save a checkpoint for this evaluation step only when explicitly needed.
+                    if train_cfg.save_local or train_cfg.use_lmms_eval:
+                        checkpoint_path_step = os.path.join(vlm_cfg.vlm_checkpoint_path, run_name, f"step_{global_step}")
+                        save_model = model.module if is_dist() else model # unwrap the model for saving if DDP
+                        save_model.save_pretrained(save_directory=checkpoint_path_step)
 
-                    if train_cfg.use_lmms_eval and global_step % (train_cfg.eval_interval*2) == 0:
+                    if train_cfg.use_lmms_eval and checkpoint_path_step and global_step % (train_cfg.eval_interval*2) == 0:
                         # Submit evaluation job
                         cmd = f"sbatch eval.slurm {checkpoint_path_step} {global_step} {run_name} {train_cfg.lmms_eval_limit} {train_cfg.lmms_eval_tasks} {train_cfg.lmms_eval_batch_size}"
                         print(f"Submitting evaluation job: {cmd}")

@@ -10,4 +10,4 @@
 ## If decide not to use the available pyproject.toml
 # uv add torch numpy torchvision pillow datasets huggingface-hub transformers wandb hf_transfer einops
 ## OR
-pip install datasets einops hf_transfer huggingface_hub ipykernel ipywidgets jupyter numpy pillow pycocoevalcap torch torchvision transformers wandb
+pip install datasets einops hf_transfer huggingface_hub ipykernel ipywidgets jupyter numpy pillow pycocoevalcap torch torchvision transformers wandb lmms_eval
