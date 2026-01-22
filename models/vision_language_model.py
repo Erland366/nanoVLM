@@ -32,6 +32,8 @@ class VisionLanguageModel(nn.Module):
         self.MP = ModalityProjector(cfg)
         self.load_backbone = load_backbone
         self.tokenizer = get_tokenizer(cfg.lm_tokenizer, cfg.vlm_extra_tokens, cfg.lm_chat_template)
+        # Cache token ID to avoid tokenizer access during forward (causes graph break with torch.compile)
+        self._image_token_id = self.tokenizer.image_token_id
 
     def _replace_img_tokens_with_embd(self, input_ids, token_embd, image_embd):
         """
@@ -43,7 +45,7 @@ class VisionLanguageModel(nn.Module):
         updated_token_embd = token_embd.clone()
 
         # Build a mask of all image-token positions: shape [B, T_seq]
-        mask = (input_ids == self.tokenizer.image_token_id)
+        mask = (input_ids == self._image_token_id)
         updated_token_embd[mask] = image_embd.view(-1, image_embd.size(-1)).to(updated_token_embd.dtype) # torch flattens before assigning
 
         return updated_token_embd
