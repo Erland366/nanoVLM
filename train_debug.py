@@ -8,13 +8,15 @@ NO network calls, NO disk I/O - starts in ~2 seconds.
 
     python train_debug.py
 
-    Runs ALL diagnostics:
+    Runs the core diagnostics (compiled mode uses regional compilation by default):
     1. Graph break check (fullgraph=True, catches breaks)
     2. Eager vs Compiled comparison (speed + VRAM)
     3. Vary batch test (catches batch dim recompilation)
     4. Vary sequence test (catches seq dim recompilation)
-    5. Compile latency comparison (regional vs core)
-    6. Guard overhead check (skip_guard_eval_unsafe optimization)
+    5. Guard overhead check (skip_guard_eval_unsafe optimization)
+
+    Optional (opt-in):
+    - Compile latency comparison (regional vs full core): --compile-bench
 
 === QUICK MODE ===
 
@@ -52,8 +54,11 @@ NO network calls, NO disk I/O - starts in ~2 seconds.
     --quick             Skip dynamic shape tests
     --skip-baseline     Skip eager comparison
     --skip-graph-check  Skip fullgraph graph break detection
-    --skip-compile-bench Skip compile latency comparison
     --skip-guard-bench  Skip guard overhead benchmark
+
+=== OPT-IN FLAGS ===
+
+    --compile-bench     Run compile latency comparison (regional vs core)
 """
 
 import argparse
@@ -97,6 +102,20 @@ def _maybe_mark_dynamic(tensor, dim):
         torch._dynamo.maybe_mark_dynamic(tensor, dim)
     else:
         torch._dynamo.mark_dynamic(tensor, dim)
+
+
+def _avoid_token_id_collisions(input_ids: torch.Tensor, forbidden_token_id: int, vocab_size: int) -> None:
+    """
+    Ensure synthetic `input_ids` do not accidentally contain reserved tokens (e.g., `image_token_id`)
+    outside intended spans.
+    """
+    if vocab_size <= 1:
+        return
+    forbidden_token_id = int(forbidden_token_id)
+    safe_token_id = (forbidden_token_id + 1) % vocab_size
+    if safe_token_id == forbidden_token_id:
+        safe_token_id = 0
+    input_ids[input_ids == forbidden_token_id] = safe_token_id
 
 
 def _set_torch_logs(diagnose_mode):
@@ -215,6 +234,7 @@ def _check_graph_breaks(vlm_cfg, device, batch_size):
 
         # Build batch
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -281,6 +301,7 @@ def _run_baseline_comparison(vlm_cfg, device, batch_size, steps):
 
         # Build batch
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -382,6 +403,7 @@ def _test_vary_batch(vlm_cfg, device, steps=8):
         batch_size = batch_sizes[step]
 
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -458,6 +480,7 @@ def _test_vary_sequence(vlm_cfg, device, steps=6):
     try:
         for step, seq_len in enumerate(seq_lengths):
             input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, seq_len), device=device)
+            _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
             # Don't add image tokens if seq too short
             if seq_len > vlm_cfg.mp_image_token_length + 2:
                 for b in range(batch_size):
@@ -524,6 +547,7 @@ def _benchmark_compile_latency(vlm_cfg, device, batch_size):
 
             # Build batch
             input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+            _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
             for b in range(batch_size):
                 input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
             labels = input_ids.clone()
@@ -661,6 +685,7 @@ def _benchmark_guard_overhead(vlm_cfg, device, batch_size, steps=50):
         optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -765,6 +790,7 @@ def _benchmark_guard_overhead(vlm_cfg, device, batch_size, steps=50):
 
         optimizer = optim.AdamW(model.parameters(), lr=1e-4)
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -808,6 +834,7 @@ def _benchmark_guard_overhead(vlm_cfg, device, batch_size, steps=50):
 
         optimizer = optim.AdamW(model.parameters(), lr=1e-4)
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -887,7 +914,10 @@ def _quick_guard_benchmark(vlm_cfg, device, batch_size, steps=30):
 
     # Create dummy data
     input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+    _avoid_token_id_collisions(input_ids, vlm._image_token_id, vlm_cfg.lm_vocab_size)
+    input_ids[:, 1:1 + vlm_cfg.mp_image_token_length] = vlm._image_token_id
     labels = input_ids.clone()
+    labels[input_ids == vlm._image_token_id] = -100
     attention_mask = torch.ones_like(input_ids)
     images = [[torch.randn(1, 3, vlm_cfg.vit_img_size, vlm_cfg.vit_img_size, device=device)]
               for _ in range(batch_size)]
@@ -988,6 +1018,7 @@ def _ablate_backends(vlm_cfg, device, batch_size):
             model = torch.compile(model, backend=backend)
 
             input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+            _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
             for b in range(batch_size):
                 input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
             attention_mask = torch.ones(batch_size, vlm_cfg.lm_max_length, device=device)
@@ -1087,6 +1118,7 @@ def _ablate_config(vlm_cfg, device, batch_size, config_spec, steps=10):
         optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -1157,6 +1189,7 @@ def _run_with_profiler(vlm_cfg, device, batch_size, steps, output_path):
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
     input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+    _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
     for b in range(batch_size):
         input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
     labels = input_ids.clone()
@@ -1221,7 +1254,7 @@ def _run_with_trace(vlm_cfg, device, batch_size, steps, trace_dir):
 
     print(f"\n   TORCH_TRACE must be set BEFORE running the script.")
     print(f"\n   Run this command instead:")
-    print(f"\n      TORCH_TRACE={trace_dir} python train_debug.py --skip-graph-check --skip-compile-bench --quick --steps {steps}")
+    print(f"\n      TORCH_TRACE={trace_dir} python train_debug.py --skip-graph-check --quick --steps {steps}")
     print(f"\n   Then analyze with:")
     print(f"      pip install tlparse")
     print(f"      tlparse {trace_dir}")
@@ -1248,6 +1281,7 @@ def _run_with_trace(vlm_cfg, device, batch_size, steps, trace_dir):
         optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
         input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        _avoid_token_id_collisions(input_ids, model._image_token_id, vlm_cfg.lm_vocab_size)
         for b in range(batch_size):
             input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
         labels = input_ids.clone()
@@ -1289,10 +1323,10 @@ def main():
                        help="Skip eager vs compiled comparison")
     parser.add_argument("--skip-graph-check", action="store_true",
                        help="Skip fullgraph graph break detection")
-    parser.add_argument("--skip-compile-bench", action="store_true",
-                       help="Skip compile latency comparison")
     parser.add_argument("--skip-guard-bench", action="store_true",
                        help="Skip guard overhead benchmark")
+    parser.add_argument("--compile-bench", action="store_true",
+                       help="Run compile latency comparison (regional vs core)")
 
     # Specific diagnostic modes (run ONLY that diagnostic)
     parser.add_argument("--diagnose", type=str,
@@ -1381,8 +1415,8 @@ def main():
         _test_vary_batch(vlm_cfg, device, steps=8)
         _test_vary_sequence(vlm_cfg, device, steps=6)
 
-    # 4. Compile latency comparison
-    if not args.skip_compile_bench:
+    # 4. Compile latency comparison (opt-in)
+    if args.compile_bench:
         _benchmark_compile_latency(vlm_cfg, device, args.batch_size)
 
     # 5. Guard overhead check
@@ -1398,6 +1432,7 @@ def main():
     print("  --diagnose breaks       # See graph break locations")
     print("  --trace                 # Generate tlparse trace (deep analysis)")
     print("  --profile               # Generate chrome trace (kernel perf)")
+    print("  --compile-bench          # Compare regional vs full-core compile latency")
     print("  --ablate-config <name>  # Test specific inductor config")
     print("  --ablate-config 'a;b'   # Test multiple configs")
     print("  --benchmark-guards      # Full guard benchmark (4 methods)")

@@ -91,19 +91,30 @@ class VisionLanguageModel(nn.Module):
             if hasattr(torch._dynamo, "mark_unbacked"):
                 torch._dynamo.mark_unbacked(input_ids, 0)
             _maybe_mark_dynamic(input_ids, 0)
+            _maybe_mark_dynamic(input_ids, 1)
             if attention_mask is not None:
                 if hasattr(torch._dynamo, "mark_unbacked"):
                     torch._dynamo.mark_unbacked(attention_mask, 0)
                 _maybe_mark_dynamic(attention_mask, 0)
+                _maybe_mark_dynamic(attention_mask, 1)
             if targets is not None:
                 if hasattr(torch._dynamo, "mark_unbacked"):
                     torch._dynamo.mark_unbacked(targets, 0)
                 _maybe_mark_dynamic(targets, 0)
+                _maybe_mark_dynamic(targets, 1)
             if images_tensor is not None:
                 _maybe_mark_dynamic(images_tensor, 0)
         return self._forward_core(input_ids, images_tensor, attention_mask, targets)
 
     def compile_regional(self, backend="inductor", mode=None, fullgraph=False, compile_dynamic=False):
+        if compile_dynamic:
+            try:
+                import torch._dynamo as dynamo
+                dynamo.config.dynamic_shapes = True
+                if hasattr(dynamo.config, "assume_static_by_default"):
+                    dynamo.config.assume_static_by_default = True
+            except Exception:
+                pass
         def _compile(module):
             kwargs = {"backend": backend}
             if mode is not None:

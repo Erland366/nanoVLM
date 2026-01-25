@@ -11,6 +11,10 @@
     "domain-retrospective": {
       "type": "core",
       "description": "Document findings as reusable skills"
+    },
+    "torch-compile-policy": {
+      "type": "project",
+      "description": "nanoVLM torch.compile default strategy"
     }
   },
   "paths": {

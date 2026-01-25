@@ -465,8 +465,10 @@ class LanguageModel(nn.Module):
         """
         if getattr(self, "_compile_dynamic", False):
             _maybe_mark_dynamic(x, 0)
+            _maybe_mark_dynamic(x, 1)
             if attention_mask is not None:
                 _maybe_mark_dynamic(attention_mask, 0)
+                _maybe_mark_dynamic(attention_mask, 1)
         if self.lm_use_tokens:
             x = self.token_embedding(x)
 
@@ -476,6 +478,11 @@ class LanguageModel(nn.Module):
         # Create position_ids for the current sequence based on start_pos
         current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).repeat(B, 1)
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
+        if getattr(self, "_compile_dynamic", False):
+            _maybe_mark_dynamic(cos, 0)
+            _maybe_mark_dynamic(cos, 1)
+            _maybe_mark_dynamic(sin, 0)
+            _maybe_mark_dynamic(sin, 1)
 
         # Initialize new KV cache if none provided
         if kv_cache is None:
@@ -484,8 +491,10 @@ class LanguageModel(nn.Module):
         for i, block in enumerate(self.blocks):
             if getattr(self, "_compile_dynamic", False):
                 _maybe_mark_dynamic(x, 0)
+                _maybe_mark_dynamic(x, 1)
                 if attention_mask is not None:
                     _maybe_mark_dynamic(attention_mask, 0)
+                    _maybe_mark_dynamic(attention_mask, 1)
             x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
 
         x = self.norm(x)

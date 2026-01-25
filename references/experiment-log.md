@@ -284,4 +284,38 @@ with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
 
 ---
 
+## 2026-01-25 — Observation: mark_dynamic must be re-applied at compiled boundaries
+
+**Type**: Observation
+**General description**: Eliminated batch/seq recompiles (without `dynamic=True`) by re-marking batch+sequence dims on tensors right before calling compiled blocks, and marking RoPE `cos/sin`.
+
+### What changed
+- Marked both `dim=0` (batch) and `dim=1` (sequence) for `x` and `attention_mask` at every LM block boundary.
+- Marked RoPE `cos/sin` batch+sequence dims so rotary-derived tensors don’t re-specialize compiled blocks.
+- Kept hidden/head dims static; no use of `torch.compile(dynamic=True)`.
+
+### Artifacts
+- Code: `models/language_model.py`, `models/vision_language_model.py`
+- Global skill: `/home/coder/dotfiles/skills/torch-compile-dynamic-metadata-propagation/SKILL.md`
+
+---
+
+## 2026-01-25 — Bugfix: `--large-scale` gather assert from synthetic image token collisions
+
+**Type**: Retrospective
+**General description**: Fixed `train_debug.py --large-scale` crashing with `vectorized_gather_kernel index out of bounds` by sanitizing synthetic `input_ids` to avoid accidental `image_token_id` collisions.
+
+### Root cause
+- Synthetic `input_ids = torch.randint(...)` occasionally produced `image_token_id` outside the intended `[1 : 1 + mp_image_token_length]` span.
+- This increases the number of image placeholders beyond the number of image embeddings (`num_images * mp_image_token_length`), triggering a CUDA gather out-of-bounds assert.
+- Large-scale mode (batch size >= 8) made this much more likely.
+
+### Fix
+- Added `_avoid_token_id_collisions(...)` and applied it after every `torch.randint(...)` that feeds a batch with image placeholders.
+
+### Artifacts
+- `train_debug.py`
+
+---
+
 <!-- New entries go above this line -->
