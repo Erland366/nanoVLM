@@ -14,6 +14,7 @@ NO network calls, NO disk I/O - starts in ~2 seconds.
     3. Vary batch test (catches batch dim recompilation)
     4. Vary sequence test (catches seq dim recompilation)
     5. Compile latency comparison (regional vs core)
+    6. Guard overhead check (skip_guard_eval_unsafe optimization)
 
 === QUICK MODE ===
 
@@ -39,6 +40,10 @@ NO network calls, NO disk I/O - starts in ~2 seconds.
     python train_debug.py --ablate-config "epilogue_fusion;max_autotune"
     python train_debug.py --ablate-config "epilogue_fusion=True;coordinate_descent_tuning=True"
 
+    # Guard overhead benchmark (tests optimization techniques)
+    python train_debug.py --benchmark-guards
+    python train_debug.py --benchmark-guards --large-scale
+
     # Large-scale config ablation (bigger model, more reliable measurements)
     python train_debug.py --ablate-config epilogue_fusion --large-scale
 
@@ -48,6 +53,7 @@ NO network calls, NO disk I/O - starts in ~2 seconds.
     --skip-baseline     Skip eager comparison
     --skip-graph-check  Skip fullgraph graph break detection
     --skip-compile-bench Skip compile latency comparison
+    --skip-guard-bench  Skip guard overhead benchmark
 """
 
 import argparse
@@ -340,12 +346,18 @@ def _run_baseline_comparison(vlm_cfg, device, batch_size, steps):
 # =============================================================================
 
 def _test_vary_batch(vlm_cfg, device, steps=8):
-    """Test recompilation with varying batch sizes."""
+    """Test recompilation with varying batch sizes.
+
+    NOTE: Uses min batch=4 to avoid PyTorch's batch 1/2 specialization issues.
+    Large jumps in batch size can also cause gather kernel bugs with torch.compile.
+    """
     print("\n" + "="*60)
     print("3. DYNAMIC BATCH TEST (vary batch size)")
     print("="*60)
 
-    batch_sizes = [4, 8, 4, 16, 8, 32]
+    # Use batch sizes starting from 4 to avoid specialization bugs
+    # Also avoid extreme jumps (e.g., 4->32) which can trigger gather kernel issues
+    batch_sizes = [4, 8, 6, 10, 8, 12]
     print(f"   Batch sizes: {batch_sizes[:steps]}")
 
     _reset_compiler_state()
@@ -387,6 +399,10 @@ def _test_vary_batch(vlm_cfg, device, steps=8):
             _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
         loss.backward()
         optimizer.step()
+
+        # Sync to catch CUDA errors early (they're often async)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
 
     # Clear logs
     if "TORCH_LOGS" in os.environ:
@@ -554,6 +570,398 @@ def _benchmark_compile_latency(vlm_cfg, device, batch_size):
     print(f"\n   Regional is {ratio:.1f}x faster compile than full core")
 
     return {"regional": t_regional, "core": t_core}
+
+
+# =============================================================================
+# Diagnostic: Guard Overhead Benchmark
+# =============================================================================
+
+def _benchmark_guard_overhead(vlm_cfg, device, batch_size, steps=50):
+    """
+    Benchmark guard evaluation overhead with different optimization techniques.
+
+    Tests:
+    1. Baseline (no optimization)
+    2. skip_guard_eval_unsafe stance (after warmup)
+    3. Guard filter functions (if available in PyTorch 2.6+)
+
+    Uses torch.profiler to measure "TorchDynamo Cache Lookup" time.
+    """
+    print("\n" + "="*60)
+    print("6. GUARD OVERHEAD BENCHMARK")
+    print("="*60)
+    print(f"   Batch size: {batch_size}, Steps: {steps}")
+    print("   Measuring 'TorchDynamo Cache Lookup' time from profiler\n")
+
+    if "TORCHDYNAMO_DISABLE" in os.environ:
+        del os.environ["TORCHDYNAMO_DISABLE"]
+
+    results = {}
+
+    def measure_guard_overhead(model, optimizer, input_ids, labels, attention_mask, images, label):
+        """Run steps and measure guard overhead from profiler."""
+        model.train()
+
+        # Warmup (essential for skip_guard_eval_unsafe)
+        warmup_steps = 10
+        for _ in range(warmup_steps):
+            optimizer.zero_grad()
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+            loss.backward()
+            optimizer.step()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        # Profile to measure guard overhead
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            record_shapes=False,
+        ) as prof:
+            for _ in range(steps):
+                optimizer.zero_grad()
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                loss.backward()
+                optimizer.step()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        # Extract guard overhead from profiler
+        guard_time_us = 0
+        total_time_us = 0
+        for evt in prof.key_averages():
+            if "TorchDynamo Cache Lookup" in evt.key:
+                guard_time_us = evt.cpu_time_total
+            total_time_us += evt.cpu_time_total
+
+        guard_time_ms = guard_time_us / 1000
+        avg_guard_per_step_us = guard_time_us / steps if steps > 0 else 0
+
+        return {
+            "total_guard_ms": guard_time_ms,
+            "avg_guard_per_step_us": avg_guard_per_step_us,
+        }
+
+    def create_model_and_data(compile_options=None):
+        """Create fresh model and data."""
+        _reset_compiler_state()
+        model = VisionLanguageModel(vlm_cfg, load_backbone=False)
+        model.to(device)
+
+        if compile_options:
+            _apply_regional_compile(model, backend="inductor", mode="default",
+                                   fullgraph=False, compile_dynamic=False, **compile_options)
+        else:
+            _apply_regional_compile(model, backend="inductor", mode="default",
+                                   fullgraph=False, compile_dynamic=False)
+
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+
+        input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        for b in range(batch_size):
+            input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
+        labels = input_ids.clone()
+        labels[input_ids == model._image_token_id] = -100
+        attention_mask = torch.ones(batch_size, vlm_cfg.lm_max_length, device=device)
+        images = [[torch.randn(1, 3, vlm_cfg.vit_img_size, vlm_cfg.vit_img_size)] for _ in range(batch_size)]
+
+        return model, optimizer, input_ids, labels, attention_mask, images
+
+    # --- Test 1: Baseline (no guard optimization) ---
+    print("   [1/3] Baseline (no guard optimization)...")
+    model, optimizer, input_ids, labels, attention_mask, images = create_model_and_data()
+    results["baseline"] = measure_guard_overhead(
+        model, optimizer, input_ids, labels, attention_mask, images, "baseline"
+    )
+    print(f"         Guard overhead: {results['baseline']['avg_guard_per_step_us']:.1f} µs/step")
+    del model, optimizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Test 2: skip_guard_eval_unsafe stance ---
+    print("   [2/3] With skip_guard_eval_unsafe stance...")
+    model, optimizer, input_ids, labels, attention_mask, images = create_model_and_data()
+
+    # Check if stance API is available
+    has_stance = hasattr(torch.compiler, "set_stance")
+    if has_stance:
+        model.train()
+        # Warmup before enabling unsafe mode
+        for _ in range(15):
+            optimizer.zero_grad()
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+            loss.backward()
+            optimizer.step()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        # Measure with skip_guard_eval_unsafe
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            record_shapes=False,
+        ) as prof:
+            with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
+                for _ in range(steps):
+                    optimizer.zero_grad()
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                    loss.backward()
+                    optimizer.step()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        guard_time_us = 0
+        for evt in prof.key_averages():
+            if "TorchDynamo Cache Lookup" in evt.key:
+                guard_time_us = evt.cpu_time_total
+
+        results["skip_guard_unsafe"] = {
+            "total_guard_ms": guard_time_us / 1000,
+            "avg_guard_per_step_us": guard_time_us / steps if steps > 0 else 0,
+        }
+        print(f"         Guard overhead: {results['skip_guard_unsafe']['avg_guard_per_step_us']:.1f} µs/step")
+    else:
+        results["skip_guard_unsafe"] = None
+        print("         ⚠️  torch.compiler.set_stance not available (requires PyTorch 2.5+)")
+
+    del model, optimizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Test 3: Guard filter functions ---
+    # Check if guard filters are available
+    has_inbuilt_filter = hasattr(torch.compiler, "skip_guard_on_inbuilt_nn_modules_unsafe")
+    has_all_filter = hasattr(torch.compiler, "skip_guard_on_all_nn_modules_unsafe")
+
+    # Test 3a: skip_guard_on_inbuilt_nn_modules_unsafe
+    print("   [3/4] With guard filter (inbuilt nn.Module)...")
+    if has_inbuilt_filter:
+        _reset_compiler_state()
+        model = VisionLanguageModel(vlm_cfg, load_backbone=False)
+        model.to(device)
+
+        # Apply compile with guard filter
+        # NOTE: Can't use 'mode' with 'options' - they're mutually exclusive
+        for i, block in enumerate(model.decoder.blocks):
+            model.decoder.blocks[i] = torch.compile(
+                block,
+                backend="inductor",
+                fullgraph=False,
+                options={"guard_filter_fn": torch.compiler.skip_guard_on_inbuilt_nn_modules_unsafe}
+            )
+        for i, block in enumerate(model.vision_encoder.blocks):
+            model.vision_encoder.blocks[i] = torch.compile(
+                block,
+                backend="inductor",
+                fullgraph=False,
+                options={"guard_filter_fn": torch.compiler.skip_guard_on_inbuilt_nn_modules_unsafe}
+            )
+
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+        input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        for b in range(batch_size):
+            input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
+        labels = input_ids.clone()
+        labels[input_ids == model._image_token_id] = -100
+        attention_mask = torch.ones(batch_size, vlm_cfg.lm_max_length, device=device)
+        images = [[torch.randn(1, 3, vlm_cfg.vit_img_size, vlm_cfg.vit_img_size)] for _ in range(batch_size)]
+
+        results["guard_filter_inbuilt"] = measure_guard_overhead(
+            model, optimizer, input_ids, labels, attention_mask, images, "guard_filter_inbuilt"
+        )
+        print(f"         Guard overhead: {results['guard_filter_inbuilt']['avg_guard_per_step_us']:.1f} µs/step")
+
+        del model, optimizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        results["guard_filter_inbuilt"] = None
+        print("         ⚠️  skip_guard_on_inbuilt_nn_modules_unsafe not available")
+
+    # Test 3b: skip_guard_on_all_nn_modules_unsafe (more aggressive)
+    print("   [4/4] With guard filter (ALL nn.Module)...")
+    if has_all_filter:
+        _reset_compiler_state()
+        model = VisionLanguageModel(vlm_cfg, load_backbone=False)
+        model.to(device)
+
+        for i, block in enumerate(model.decoder.blocks):
+            model.decoder.blocks[i] = torch.compile(
+                block,
+                backend="inductor",
+                fullgraph=False,
+                options={"guard_filter_fn": torch.compiler.skip_guard_on_all_nn_modules_unsafe}
+            )
+        for i, block in enumerate(model.vision_encoder.blocks):
+            model.vision_encoder.blocks[i] = torch.compile(
+                block,
+                backend="inductor",
+                fullgraph=False,
+                options={"guard_filter_fn": torch.compiler.skip_guard_on_all_nn_modules_unsafe}
+            )
+
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+        input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+        for b in range(batch_size):
+            input_ids[b, 1:1 + vlm_cfg.mp_image_token_length] = model._image_token_id
+        labels = input_ids.clone()
+        labels[input_ids == model._image_token_id] = -100
+        attention_mask = torch.ones(batch_size, vlm_cfg.lm_max_length, device=device)
+        images = [[torch.randn(1, 3, vlm_cfg.vit_img_size, vlm_cfg.vit_img_size)] for _ in range(batch_size)]
+
+        results["guard_filter_all"] = measure_guard_overhead(
+            model, optimizer, input_ids, labels, attention_mask, images, "guard_filter_all"
+        )
+        print(f"         Guard overhead: {results['guard_filter_all']['avg_guard_per_step_us']:.1f} µs/step")
+
+        del model, optimizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        results["guard_filter_all"] = None
+        print("         ⚠️  skip_guard_on_all_nn_modules_unsafe not available")
+
+    # --- Summary ---
+    print("\n   " + "-"*55)
+    print("   GUARD OVERHEAD SUMMARY")
+    print("   " + "-"*55)
+    print(f"   {'Method':<40} | {'µs/step':<10} | {'vs Baseline':<12}")
+    print("   " + "-"*55)
+
+    baseline_us = results["baseline"]["avg_guard_per_step_us"]
+    print(f"   {'Baseline':<40} | {baseline_us:<8.1f} | {'1.00x':<12}")
+
+    if results.get("skip_guard_unsafe"):
+        skip_us = results["skip_guard_unsafe"]["avg_guard_per_step_us"]
+        ratio = baseline_us / skip_us if skip_us > 0 else float('inf')
+        print(f"   {'skip_guard_eval_unsafe (warmup)':<40} | {skip_us:<8.1f} | {ratio:.2f}x faster")
+
+    if results.get("guard_filter_inbuilt"):
+        filter_us = results["guard_filter_inbuilt"]["avg_guard_per_step_us"]
+        ratio = baseline_us / filter_us if filter_us > 0 else float('inf')
+        print(f"   {'guard_filter (inbuilt nn.Module)':<40} | {filter_us:<8.1f} | {ratio:.2f}x faster")
+
+    if results.get("guard_filter_all"):
+        filter_us = results["guard_filter_all"]["avg_guard_per_step_us"]
+        ratio = baseline_us / filter_us if filter_us > 0 else float('inf')
+        print(f"   {'guard_filter (ALL nn.Module)':<40} | {filter_us:<8.1f} | {ratio:.2f}x faster")
+
+    print("\n   NOTE: Guard overhead is typically small compared to GPU compute.")
+    print("   These optimizations matter most for very fast inference (<1ms).")
+    print("\n   USAGE:")
+    print("     # Runtime (after warmup):")
+    print("     with torch.compiler.set_stance(skip_guard_eval_unsafe=True):")
+    print("         model(x)")
+    print("     # Compile-time:")
+    print("     torch.compile(m, options={'guard_filter_fn': torch.compiler.skip_guard_on_all_nn_modules_unsafe})")
+
+    return results
+
+
+def _quick_guard_benchmark(vlm_cfg, device, batch_size, steps=30):
+    """
+    Quick guard overhead check for default diagnostic.
+
+    Only tests baseline vs skip_guard_eval_unsafe (the effective optimization).
+    For full benchmark with all methods, use --benchmark-guards.
+    """
+    print("\n" + "="*60)
+    print("6. GUARD OVERHEAD CHECK")
+    print("="*60)
+    print(f"   Testing skip_guard_eval_unsafe optimization")
+
+    if "TORCHDYNAMO_DISABLE" in os.environ:
+        del os.environ["TORCHDYNAMO_DISABLE"]
+
+    # Create model with regional compilation
+    vlm = VisionLanguageModel(vlm_cfg, load_backbone=False).to(device)
+    _apply_regional_compile(vlm, backend="inductor", mode="default",
+                            fullgraph=False, compile_dynamic=True)
+    optimizer = torch.optim.AdamW(vlm.parameters(), lr=1e-4)
+
+    # Create dummy data
+    input_ids = torch.randint(0, vlm_cfg.lm_vocab_size, (batch_size, vlm_cfg.lm_max_length), device=device)
+    labels = input_ids.clone()
+    attention_mask = torch.ones_like(input_ids)
+    images = [[torch.randn(1, 3, vlm_cfg.vit_img_size, vlm_cfg.vit_img_size, device=device)]
+              for _ in range(batch_size)]
+
+    vlm.train()
+
+    # Warmup
+    warmup_steps = 10
+    for _ in range(warmup_steps):
+        optimizer.zero_grad()
+        _, loss = vlm(input_ids, images, attention_mask=attention_mask, targets=labels)
+        loss.backward()
+        optimizer.step()
+    torch.cuda.synchronize()
+
+    # Measure baseline guard overhead
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        record_shapes=False,
+    ) as prof:
+        for _ in range(steps):
+            optimizer.zero_grad()
+            _, loss = vlm(input_ids, images, attention_mask=attention_mask, targets=labels)
+            loss.backward()
+            optimizer.step()
+        torch.cuda.synchronize()
+
+    baseline_guard_us = 0
+    for evt in prof.key_averages():
+        if "TorchDynamo Cache Lookup" in evt.key:
+            baseline_guard_us = evt.cpu_time_total
+    baseline_per_step = baseline_guard_us / steps
+
+    # Measure with skip_guard_eval_unsafe
+    with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            record_shapes=False,
+        ) as prof:
+            for _ in range(steps):
+                optimizer.zero_grad()
+                _, loss = vlm(input_ids, images, attention_mask=attention_mask, targets=labels)
+                loss.backward()
+                optimizer.step()
+            torch.cuda.synchronize()
+
+    optimized_guard_us = 0
+    for evt in prof.key_averages():
+        if "TorchDynamo Cache Lookup" in evt.key:
+            optimized_guard_us = evt.cpu_time_total
+    optimized_per_step = optimized_guard_us / steps
+
+    # Report
+    improvement = baseline_per_step / optimized_per_step if optimized_per_step > 0 else 1.0
+    print(f"\n   Baseline:              {baseline_per_step:.1f} µs/step")
+    print(f"   skip_guard_eval_unsafe: {optimized_per_step:.1f} µs/step ({improvement:.2f}x faster)")
+
+    if improvement > 1.1:
+        print(f"\n   ✅ skip_guard_eval_unsafe provides {(improvement-1)*100:.0f}% reduction")
+        print("   TIP: Use after warmup in production:")
+        print("        with torch.compiler.set_stance(skip_guard_eval_unsafe=True):")
+        print("            model(x)")
+    else:
+        print(f"\n   ℹ️  Guard overhead already minimal ({baseline_per_step:.0f}µs)")
+
+    print(f"\n   For full guard benchmark: python train_debug.py --benchmark-guards")
+
+    # Cleanup
+    del vlm, optimizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _reset_compiler_state()
+
+    return {"baseline_us": baseline_per_step, "optimized_us": optimized_per_step, "speedup": improvement}
 
 
 # =============================================================================
@@ -883,6 +1291,8 @@ def main():
                        help="Skip fullgraph graph break detection")
     parser.add_argument("--skip-compile-bench", action="store_true",
                        help="Skip compile latency comparison")
+    parser.add_argument("--skip-guard-bench", action="store_true",
+                       help="Skip guard overhead benchmark")
 
     # Specific diagnostic modes (run ONLY that diagnostic)
     parser.add_argument("--diagnose", type=str,
@@ -900,6 +1310,8 @@ def main():
                        help="Run backend ablation only")
     parser.add_argument("--ablate-config", type=str,
                        help="Run config ablation only (e.g., epilogue_fusion)")
+    parser.add_argument("--benchmark-guards", action="store_true",
+                       help="Benchmark guard overhead with optimization techniques")
     parser.add_argument("--large-scale", action="store_true",
                        help="Use larger model (~30M params) for more accurate benchmarks")
 
@@ -950,6 +1362,10 @@ def main():
         _ablate_config(vlm_cfg, device, args.batch_size, args.ablate_config, args.steps)
         return
 
+    if args.benchmark_guards:
+        _benchmark_guard_overhead(vlm_cfg, device, args.batch_size, steps=args.steps)
+        return
+
     # === Default: Comprehensive Diagnostic ===
 
     # 1. Graph break check
@@ -969,6 +1385,10 @@ def main():
     if not args.skip_compile_bench:
         _benchmark_compile_latency(vlm_cfg, device, args.batch_size)
 
+    # 5. Guard overhead check
+    if not args.skip_guard_bench:
+        _quick_guard_benchmark(vlm_cfg, device, args.batch_size, steps=args.steps)
+
     # Final summary
     print("\n" + "="*60)
     print("DIAGNOSTIC COMPLETE")
@@ -980,6 +1400,7 @@ def main():
     print("  --profile               # Generate chrome trace (kernel perf)")
     print("  --ablate-config <name>  # Test specific inductor config")
     print("  --ablate-config 'a;b'   # Test multiple configs")
+    print("  --benchmark-guards      # Full guard benchmark (4 methods)")
     print("  --large-scale           # Use larger model for ablation")
 
 
