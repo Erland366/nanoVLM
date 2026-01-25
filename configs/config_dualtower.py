@@ -70,6 +70,8 @@ class TrainConfig:
     freeze_right_tower: bool = True         # Whether or not to freeze the "right" tower (e.g. language tower)
     lr_right_tower: float = 0.0             # If not frozen, learning rate for right tower
     compile: bool = False                   # Use torch.compile for model/training
+    compile_backend: str = "inductor"       # torch.compile backend
+    compile_dynamic: bool = True            # Enable mark_dynamic for batch dims (avoid dynamic=True)
     resume_from_vlm_checkpoint: bool = True # Resume full VLM training from checkpoint
 
     # =========================

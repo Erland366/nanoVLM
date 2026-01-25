@@ -71,6 +71,8 @@ class TrainConfig:
     lr_vision_backbone: float = 0                 # Learning rate for vision backbone
     lr_language_backbone: float = 5e-5              # Learning rate for language backbone
     compile: bool = True                            # Use torch.compile for model/training
+    compile_backend: str = "inductor"               # torch.compile backend
+    compile_dynamic: bool = True                    # Enable mark_dynamic for batch dims (avoid dynamic=True)
     resume_from_vlm_checkpoint: bool = False       # Resume full VLM training from checkpoint
 
     # =========================
@@ -164,4 +166,3 @@ class TrainConfig:
     lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa'
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
-

@@ -8,3 +8,4 @@ logs/
 eval_results/
 *.png
 *.sh
+./compile_trace

@@ -93,6 +93,8 @@ class TrainConfig:
     lr_vision_backbone: float = 1e-4
     lr_language_backbone: float = 1e-4
     compile: bool = True  # Test torch.compile
+    compile_backend: str = "inductor"  # torch.compile backend
+    compile_dynamic: bool = True  # Enable mark_dynamic for batch dims (avoid dynamic=True)
     resume_from_vlm_checkpoint: bool = False
 
     # Data - minimal for debug

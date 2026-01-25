@@ -3,6 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def _maybe_mark_dynamic(tensor, dim):
+    if hasattr(torch._dynamo, "maybe_mark_dynamic"):
+        torch._dynamo.maybe_mark_dynamic(tensor, dim)
+    else:
+        torch._dynamo.mark_dynamic(tensor, dim)
+
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
 class RMSNorm(nn.Module):
     """
@@ -85,12 +91,15 @@ class RotaryEmbedding(nn.Module):
         # Dynamic scaling for longer sequences
         # Divide the angle frequency to fit more rotation into the embedding space.
         max_seq = position_ids.max() + 1
-        if max_seq > self.original_max_seq_len:
-            scale = max_seq / self.original_max_seq_len
-            inv_freq = self.inv_freq / scale
-        else:
-            inv_freq = self.inv_freq
-            
+        scale = max_seq / self.original_max_seq_len
+        scaled_inv_freq = self.inv_freq / scale
+
+        inv_freq = torch.where(
+            max_seq > self.original_max_seq_len,
+            scaled_inv_freq,
+            self.inv_freq
+        )
+
         # Compute theta = position * frequency
         # Flatten position_ids for batch processing
         flat_position_ids = position_ids.reshape(-1).float()
@@ -268,8 +277,8 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             # This additive_attn_mask shape is [B, 1, 1, T_kv]
 
         if self.sdpa and x.device.type != 'mps':
-            # During decode, no additional masking needed as [1, T_kv] is naturally causal
-            is_causal = (T_curr == T_kv and T_curr > 1)
+            # Use a Python bool to avoid SymBool graph breaks in torch.compile.
+            is_causal = is_prefill
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k_exp, v_exp,
                 attn_mask=additive_attn_mask, 
@@ -454,6 +463,10 @@ class LanguageModel(nn.Module):
             - The method returns the logits or embeddings along with the updated
             cache for efficient decoding.
         """
+        if getattr(self, "_compile_dynamic", False):
+            _maybe_mark_dynamic(x, 0)
+            if attention_mask is not None:
+                _maybe_mark_dynamic(attention_mask, 0)
         if self.lm_use_tokens:
             x = self.token_embedding(x)
 
@@ -461,7 +474,7 @@ class LanguageModel(nn.Module):
         B, T_curr, _ = x.size()
         
         # Create position_ids for the current sequence based on start_pos
-        current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).expand(B, -1)
+        current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).repeat(B, 1)
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
 
         # Initialize new KV cache if none provided
@@ -469,6 +482,10 @@ class LanguageModel(nn.Module):
             kv_cache = [None] * len(self.blocks)
 
         for i, block in enumerate(self.blocks):
+            if getattr(self, "_compile_dynamic", False):
+                _maybe_mark_dynamic(x, 0)
+                if attention_mask is not None:
+                    _maybe_mark_dynamic(attention_mask, 0)
             x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
 
         x = self.norm(x)

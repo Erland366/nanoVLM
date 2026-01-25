@@ -132,7 +132,14 @@ def train(train_cfg, vlm_cfg, global_cfg):
     model.to(device)
     
     if train_cfg.compile:
-        model = torch.compile(model)
+        print("[DEBUG] Compiling repeated blocks with torch.compile (regional)...")
+        compile_start = time.time()
+        model._compile_dynamic = bool(train_cfg.compile_dynamic)
+        model.compile_regional(
+            backend=train_cfg.compile_backend,
+            compile_dynamic=model._compile_dynamic,
+        )
+        print(f"[DEBUG] torch.compile setup took {time.time() - compile_start:.2f}s")
     if is_dist():
         print("Wrapping model for DDP")
         model = wrap_model(model)

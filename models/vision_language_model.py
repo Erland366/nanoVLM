@@ -18,6 +18,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_model, save_model
 
+def _maybe_mark_dynamic(tensor, dim):
+    if hasattr(torch._dynamo, "maybe_mark_dynamic"):
+        torch._dynamo.maybe_mark_dynamic(tensor, dim)
+    else:
+        torch._dynamo.mark_dynamic(tensor, dim)
+
 class VisionLanguageModel(nn.Module):
     def __init__(self, cfg: VLMConfig, load_backbone=True):
         super().__init__()
@@ -34,6 +40,7 @@ class VisionLanguageModel(nn.Module):
         self.tokenizer = get_tokenizer(cfg.lm_tokenizer, cfg.vlm_extra_tokens, cfg.lm_chat_template)
         # Cache token ID to avoid tokenizer access during forward (causes graph break with torch.compile)
         self._image_token_id = self.tokenizer.image_token_id
+        self._compile_dynamic = False
 
     def _replace_img_tokens_with_embd(self, input_ids, token_embd, image_embd):
         """
@@ -41,16 +48,27 @@ class VisionLanguageModel(nn.Module):
         from `image_embd`. Supports an arbitrary number of image-token placeholders per sample.
         The first example in the batch might have 2 images and the second none.
         """
-        # Clone the original embeddings to avoid in-place issues
-        updated_token_embd = token_embd.clone()
-
         # Build a mask of all image-token positions: shape [B, T_seq]
         mask = (input_ids == self._image_token_id)
-        updated_token_embd[mask] = image_embd.view(-1, image_embd.size(-1)).to(updated_token_embd.dtype) # torch flattens before assigning
+        mask_flat = mask.view(-1)
 
-        return updated_token_embd
+        token_flat = token_embd.view(-1, token_embd.size(-1))
+        image_flat = image_embd.view(-1, image_embd.size(-1))
 
+        # Map each masked position to its sequential image embedding index without nonzero().
+        idx = torch.cumsum(mask_flat.to(torch.int64), dim=0) - 1
+        idx = idx.clamp(min=0)
+        replacement = image_flat[idx].to(token_flat.dtype)
+
+        updated_flat = torch.where(mask_flat.unsqueeze(-1), replacement, token_flat)
+        return updated_flat.view_as(token_embd)
+
+    @torch.compiler.disable
     def _process_images(self, images, device):
+        """
+        Process images list into a tensor. Disabled from torch.compile to avoid
+        recompilation on batch size changes (Python list length is specialized).
+        """
         if isinstance(images, list):
             if images and isinstance(images[0], list):
                 images = [img for sublist in images for img in sublist]
@@ -62,7 +80,51 @@ class VisionLanguageModel(nn.Module):
         return images # Already a tensor
 
     def forward(self, input_ids, images, attention_mask=None, targets=None):
+        """
+        Main forward pass. Pre-processes images (Python list) then delegates to _forward_core.
+        When using torch.compile, compile only _forward_core for clean tensor-only compilation.
+        """
+        self.decoder._compile_dynamic = self._compile_dynamic
+        self.vision_encoder._compile_dynamic = self._compile_dynamic
         images_tensor = self._process_images(images, input_ids.device)
+        if self._compile_dynamic:
+            if hasattr(torch._dynamo, "mark_unbacked"):
+                torch._dynamo.mark_unbacked(input_ids, 0)
+            _maybe_mark_dynamic(input_ids, 0)
+            if attention_mask is not None:
+                if hasattr(torch._dynamo, "mark_unbacked"):
+                    torch._dynamo.mark_unbacked(attention_mask, 0)
+                _maybe_mark_dynamic(attention_mask, 0)
+            if targets is not None:
+                if hasattr(torch._dynamo, "mark_unbacked"):
+                    torch._dynamo.mark_unbacked(targets, 0)
+                _maybe_mark_dynamic(targets, 0)
+            if images_tensor is not None:
+                _maybe_mark_dynamic(images_tensor, 0)
+        return self._forward_core(input_ids, images_tensor, attention_mask, targets)
+
+    def compile_regional(self, backend="inductor", mode=None, fullgraph=False, compile_dynamic=False):
+        def _compile(module):
+            kwargs = {"backend": backend}
+            if mode is not None:
+                kwargs["mode"] = mode
+            if fullgraph:
+                kwargs["fullgraph"] = fullgraph
+            return torch.compile(module, **kwargs)
+
+        for block in self.decoder.blocks:
+            block._compile_dynamic = compile_dynamic
+        for block in self.vision_encoder.blocks:
+            block._compile_dynamic = compile_dynamic
+
+        self.decoder.blocks = nn.ModuleList([_compile(block) for block in self.decoder.blocks])
+        self.vision_encoder.blocks = nn.ModuleList([_compile(block) for block in self.vision_encoder.blocks])
+
+    def _forward_core(self, input_ids, images_tensor, attention_mask=None, targets=None):
+        """
+        Core forward with tensor-only inputs. This is the compile-friendly path.
+        images_tensor: pre-processed tensor [N, C, H, W] or None
+        """
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
 
         if images_tensor is not None:

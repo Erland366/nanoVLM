@@ -3,6 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def _maybe_mark_dynamic(tensor, dim):
+    if hasattr(torch._dynamo, "maybe_mark_dynamic"):
+        torch._dynamo.maybe_mark_dynamic(tensor, dim)
+    else:
+        torch._dynamo.mark_dynamic(tensor, dim)
+
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/modeling_siglip.py#L245
 class ViTPatchEmbeddings(nn.Module):
     def __init__(self, cfg):
@@ -157,6 +163,8 @@ class ViT(nn.Module):
         x = self.patch_embedding(x) 
         x = self.dropout(x)
         for block in self.blocks:
+            if getattr(self, "_compile_dynamic", False):
+                _maybe_mark_dynamic(x, 0)
             x = block(x)
 
         if self.cls_flag:
