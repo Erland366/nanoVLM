@@ -22,7 +22,6 @@ flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
 # Increase dynamo cache for multiple mask configurations
 torch._dynamo.config.cache_size_limit = 1000
 
-
 def generate_momh_mask_mod_from_modality(
     n_q_heads: int,
     *,
@@ -142,6 +141,19 @@ def create_momh_block_mask_from_modality(
         pct_v=pct_v,
         pct_t=pct_t,
     )
+
+    if torch.compiler.is_compiling():
+        # Avoid nested compilation / extra Dynamo frames inside an already-compiled model.
+        return create_block_mask(
+            mask_mod,
+            B=is_vision.shape[0],
+            H=n_q_heads,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+
+    # Eager mode: use PyTorch's recommended compilation path for create_block_mask.
     return create_block_mask(
         mask_mod,
         B=is_vision.shape[0],

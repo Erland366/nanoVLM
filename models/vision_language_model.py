@@ -34,6 +34,10 @@ class VisionLanguageModel(nn.Module):
         self.tokenizer = tokenizer or get_tokenizer(
             cfg.lm_tokenizer, cfg.vlm_extra_tokens, cfg.lm_chat_template
         )
+        # Avoid calling HuggingFace tokenizer methods inside torch.compile graphs.
+        self.image_token_id = int(self.tokenizer.image_token_id)
+        self.pad_token_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
+        self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
 
     def _replace_img_tokens_with_embd(self, input_ids, token_embd, image_embd):
         """
@@ -41,14 +45,34 @@ class VisionLanguageModel(nn.Module):
         from `image_embd`. Supports an arbitrary number of image-token placeholders per sample.
         The first example in the batch might have 2 images and the second none.
         """
-        # Clone the original embeddings to avoid in-place issues
-        updated_token_embd = token_embd.clone()
+        # torch.compile friendly replacement:
+        # avoid boolean advanced indexing (nonzero -> dynamic shape) by using cumsum + where.
+        bsz, seq_len, dim = token_embd.shape
+        flat_token = token_embd.reshape(-1, dim)
+        mask_flat = (input_ids == self.image_token_id).reshape(-1)
 
-        # Build a mask of all image-token positions: shape [B, T_seq]
-        mask = (input_ids == self.tokenizer.image_token_id)
-        updated_token_embd[mask] = image_embd.view(-1, image_embd.size(-1)).to(updated_token_embd.dtype) # torch flattens before assigning
+        flat_img = image_embd.reshape(-1, dim).to(flat_token.dtype)
+        num_img_tokens = flat_img.shape[0]
 
-        return updated_token_embd
+        # For each position, compute its ordinal among True positions.
+        # For False positions the value is irrelevant (masked out later).
+        ordinals = torch.cumsum(mask_flat.to(torch.int64), dim=0) - 1
+
+        # Sanity: number of `<|image|>` placeholders must match provided image embeddings.
+        # Avoid data-dependent scalar ops inside torch.compile graphs (would force a graph break).
+        if not torch.compiler.is_compiling():
+            placeholder_count = int(mask_flat.to(torch.int64).sum().item())
+            if placeholder_count != int(num_img_tokens):
+                raise ValueError(
+                    "image placeholder count mismatch: "
+                    f"placeholders={placeholder_count} "
+                    f"image_embd_tokens={int(num_img_tokens)}"
+                )
+
+        ordinals_safe = ordinals.clamp(min=0)
+        gathered = flat_img[ordinals_safe]
+        out = torch.where(mask_flat.unsqueeze(-1), gathered, flat_token)
+        return out.view(bsz, seq_len, dim)
 
     def _process_images(self, images, device):
         if isinstance(images, list):
@@ -63,7 +87,7 @@ class VisionLanguageModel(nn.Module):
 
     def forward(self, input_ids, images, attention_mask=None, targets=None):
         images_tensor = self._process_images(images, input_ids.device)
-        is_vision = (input_ids == self.tokenizer.image_token_id)
+        is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
 
         if images_tensor is not None:
@@ -87,7 +111,7 @@ class VisionLanguageModel(nn.Module):
     @torch.inference_mode()
     def generate(self, input_ids, images, attention_mask=None, max_new_tokens=5, top_k=50, top_p=0.9, temperature=0.5, greedy=False):
         images_tensor = self._process_images(images, input_ids.device)
-        is_vision = (input_ids == self.tokenizer.image_token_id)
+        is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_prompt_text, D_lm]
 
         if images_tensor is not None:
@@ -170,11 +194,11 @@ class VisionLanguageModel(nn.Module):
         generated_ids = torch.cat(newly_generated_ids_list, dim=1)
 
         # Post-process to handle EOS token.
-        if self.tokenizer.eos_token_id is not None and generated_ids.numel() > 0: # Ensure generated_ids is not empty
+        if self.eos_token_id is not None and generated_ids.numel() > 0: # Ensure generated_ids is not empty
             seq_len = generated_ids.size(1)
             device = generated_ids.device
 
-            eos_mask = (generated_ids == self.tokenizer.eos_token_id) # Create a boolean mask for EOS tokens
+            eos_mask = (generated_ids == self.eos_token_id) # Create a boolean mask for EOS tokens
 
             col_indices_for_min = torch.arange(seq_len, device=device) # Create column indices [0, 1, ..., seq_len-1]
             
@@ -192,7 +216,7 @@ class VisionLanguageModel(nn.Module):
             # Tokens are replaced if their column index is greater than the index of the first EOS token
             replace_mask = col_indices_for_comparison > actual_first_eos_indices.unsqueeze(1)
             
-            generated_ids[replace_mask] = self.tokenizer.eos_token_id
+            generated_ids[replace_mask] = self.eos_token_id
         
         return generated_ids
 

@@ -8,6 +8,31 @@ from models.momh_attention import (
     create_momh_block_mask_from_modality,
 )
 
+
+@torch.compiler.disable
+def _build_momh_block_mask_prefill(
+    *,
+    n_q_heads: int,
+    seq_len: int,
+    is_vision: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pct_v: float,
+    pct_t: float,
+    device: str,
+):
+    # Building the BlockMask is expensive and produces a non-Tensor object; keep it out of
+    # the torch.compile graph and reuse it across all LM blocks in a forward pass.
+    return create_momh_block_mask_from_modality(
+        n_q_heads=n_q_heads,
+        q_len=seq_len,
+        kv_len=seq_len,
+        is_vision=is_vision,
+        attention_mask=attention_mask,
+        pct_v=pct_v,
+        pct_t=pct_t,
+        device=device,
+    )
+
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
 class RMSNorm(nn.Module):
     """
@@ -87,14 +112,11 @@ class RotaryEmbedding(nn.Module):
         """
 
         batch_size, seq_len = position_ids.shape
-        # Dynamic scaling for longer sequences
-        # Divide the angle frequency to fit more rotation into the embedding space.
-        max_seq = position_ids.max() + 1
-        if max_seq > self.original_max_seq_len:
-            scale = max_seq / self.original_max_seq_len
-            inv_freq = self.inv_freq / scale
-        else:
-            inv_freq = self.inv_freq
+        # Dynamic scaling for longer sequences without data-dependent branching (torch.compile friendly).
+        # If max position exceeds original max, scale down frequencies; otherwise scale=1.
+        max_seq = position_ids.max() + 1  # tensor scalar
+        scale = torch.clamp(max_seq / float(self.original_max_seq_len), min=1.0)
+        inv_freq = self.inv_freq / scale
             
         # Compute theta = position * frequency
         # Flatten position_ids for batch processing
@@ -230,6 +252,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask=None,
         block_kv_cache=None,
+        block_mask=None,
         content_starts=None,
         is_vision=None,
     ) -> tuple[torch.Tensor, dict]:
@@ -297,18 +320,19 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         )
 
         if use_momh:
-            is_vision_kv = is_vision[:, :T_kv]
-            attn_mask_kv = attention_mask[:, :T_kv]
-            block_mask = create_momh_block_mask_from_modality(
-                n_q_heads=self.n_heads,
-                q_len=T_curr,
-                kv_len=T_kv,
-                is_vision=is_vision_kv,
-                attention_mask=attn_mask_kv,
-                pct_v=self.momh_pct_vision,
-                pct_t=self.momh_pct_text,
-                device=str(x.device),
-            )
+            if block_mask is None:
+                is_vision_kv = is_vision[:, :T_kv]
+                attn_mask_kv = attention_mask[:, :T_kv]
+                block_mask = create_momh_block_mask_from_modality(
+                    n_q_heads=self.n_heads,
+                    q_len=T_curr,
+                    kv_len=T_kv,
+                    is_vision=is_vision_kv,
+                    attention_mask=attn_mask_kv,
+                    pct_v=self.momh_pct_vision,
+                    pct_t=self.momh_pct_text,
+                    device=str(x.device),
+                )
             # Ensure consistent dtypes (rotary embeddings may change q/k dtype)
             target_dtype = q.dtype
             k_exp = k_exp.to(target_dtype)
@@ -423,6 +447,7 @@ class LanguageModelBlock(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         block_kv_cache: dict | None = None,
+        block_mask = None,
         content_starts: torch.Tensor | None = None,
         is_vision: torch.Tensor | None = None,
     ):
@@ -453,6 +478,7 @@ class LanguageModelBlock(nn.Module):
             sin,
             attention_mask=attention_mask,
             block_kv_cache=block_kv_cache,
+            block_mask=block_mask,
             content_starts=content_starts,
             is_vision=is_vision,
         )
@@ -557,6 +583,26 @@ class LanguageModel(nn.Module):
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
+        prefill_block_mask = None
+        if (
+            attention_mask is not None
+            and is_vision is not None
+            and x.device.type == "cuda"
+            and len(self.blocks) > 0
+            and self.blocks[0].attn.momh_enabled
+            and start_pos == 0
+            and T_curr > 1
+        ):
+            prefill_block_mask = _build_momh_block_mask_prefill(
+                n_q_heads=int(self.blocks[0].attn.n_heads),
+                seq_len=int(T_curr),
+                is_vision=is_vision[:, :T_curr],
+                attention_mask=attention_mask[:, :T_curr],
+                pct_v=float(self.blocks[0].attn.momh_pct_vision),
+                pct_t=float(self.blocks[0].attn.momh_pct_text),
+                device=str(x.device),
+            )
+
         for i, block in enumerate(self.blocks):
             x, kv_cache[i] = block(
                 x,
@@ -564,6 +610,7 @@ class LanguageModel(nn.Module):
                 sin,
                 attention_mask=attention_mask,
                 block_kv_cache=kv_cache[i],
+                block_mask=prefill_block_mask,
                 content_starts=content_starts,
                 is_vision=is_vision,
             )
