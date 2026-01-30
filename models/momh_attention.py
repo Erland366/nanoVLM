@@ -7,6 +7,10 @@ Implements specialized attention patterns where different heads focus on differe
 - VT-heads (20%): Full cross-modal attention
 
 Uses PyTorch's flex_attention for efficient sparse attention computation.
+
+MoMH masking is driven by an explicit per-token modality mask (`is_vision`), typically derived
+from `<|image|>` placeholder token positions. This supports multi-image / multi-patch samples
+where vision tokens are not a fixed contiguous span.
 """
 
 import torch
@@ -17,6 +21,136 @@ flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
 
 # Increase dynamo cache for multiple mask configurations
 torch._dynamo.config.cache_size_limit = 1000
+
+
+def generate_momh_mask_mod_from_modality(
+    n_q_heads: int,
+    *,
+    is_vision: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    q_offset: int = 0,
+    pct_v: float = 0.4,
+    pct_t: float = 0.4,
+):
+    """
+    Generate a MoMH mask_mod based on per-token modality (vision vs text).
+
+    This avoids the flawed assumption that "vision tokens are a fixed span of length S_V".
+    Instead, callers provide a boolean mask `is_vision` marking which KV positions are
+    vision placeholder tokens (e.g. `<|image|>` positions).
+
+    Args:
+        n_q_heads: Total number of query heads.
+        is_vision: Bool tensor [B, KV_LEN] marking vision tokens.
+        attention_mask: Optional tensor [B, KV_LEN], where 1=content and 0=padding.
+        q_offset: Absolute offset to map local q_idx (0..Q_LEN-1) into KV positions.
+                  Use 0 for prefill (Q_LEN==KV_LEN) and (KV_LEN-Q_LEN) for decode.
+        pct_v: Percentage of heads for V->V attention.
+        pct_t: Percentage of heads for T->T attention.
+
+    Returns:
+        mask_mod function compatible with flex_attention's create_block_mask.
+    """
+    if is_vision.dtype is not torch.bool:
+        is_vision = is_vision.to(torch.bool)
+    if attention_mask is not None and attention_mask.dtype is not torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+
+    H_V = int(n_q_heads * pct_v)
+    H_T = int(n_q_heads * pct_t)
+    H_T_start = H_V
+    H_VT_start = H_V + H_T
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_abs = q_idx + q_offset
+        kv_abs = kv_idx
+
+        if attention_mask is None:
+            not_padding = torch.ones_like(q_abs, dtype=torch.bool) & torch.ones_like(
+                kv_abs, dtype=torch.bool
+            )
+        else:
+            q_is_content = attention_mask[b, q_abs]
+            kv_is_content = attention_mask[b, kv_abs]
+            not_padding = q_is_content & kv_is_content
+
+        q_is_vision = is_vision[b, q_abs]
+        kv_is_vision = is_vision[b, kv_abs]
+        q_is_text = ~q_is_vision
+        kv_is_text = ~kv_is_vision
+
+        # V-heads: V->V only (bidirectional within vision tokens)
+        head_V = (h < H_T_start) & q_is_vision & kv_is_vision & not_padding
+
+        # T-heads: T->T only (causal within text tokens)
+        head_T = (
+            (h >= H_T_start)
+            & (h < H_VT_start)
+            & q_is_text
+            & kv_is_text
+            & (q_abs >= kv_abs)
+            & not_padding
+        )
+
+        # VT-heads: cross-modal (full vision + causal non-vision)
+        head_VT = (h >= H_VT_start) & not_padding & (kv_is_vision | (q_abs >= kv_abs))
+
+        return head_V | head_T | head_VT
+
+    return mask_mod
+
+
+def create_momh_block_mask_from_modality(
+    *,
+    n_q_heads: int,
+    q_len: int,
+    kv_len: int,
+    is_vision: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    pct_v: float,
+    pct_t: float,
+    device: str = "cuda",
+):
+    """
+    Create a MoMH BlockMask for arbitrary (Q_LEN, KV_LEN) shapes.
+
+    During decode with KV cache, Q_LEN is typically 1 while KV_LEN grows; we map
+    q_idx into the absolute KV index space by using q_offset=(KV_LEN-Q_LEN).
+    """
+    if is_vision.ndim != 2:
+        raise ValueError(f"is_vision must have shape [B, KV_LEN], got {tuple(is_vision.shape)}")
+    if is_vision.shape[1] < kv_len:
+        raise ValueError(
+            f"is_vision second dim must be >= kv_len ({kv_len}), got {is_vision.shape[1]}"
+        )
+    if attention_mask is not None:
+        if attention_mask.ndim != 2:
+            raise ValueError(
+                f"attention_mask must have shape [B, KV_LEN], got {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[1] < kv_len:
+            raise ValueError(
+                f"attention_mask second dim must be >= kv_len ({kv_len}), got {attention_mask.shape[1]}"
+            )
+
+    q_offset = kv_len - q_len
+    mask_mod = generate_momh_mask_mod_from_modality(
+        n_q_heads,
+        is_vision=is_vision[:, :kv_len],
+        attention_mask=attention_mask[:, :kv_len] if attention_mask is not None else None,
+        q_offset=q_offset,
+        pct_v=pct_v,
+        pct_t=pct_t,
+    )
+    return create_block_mask(
+        mask_mod,
+        B=is_vision.shape[0],
+        H=n_q_heads,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        device=device,
+        _compile=True,
+    )
 
 
 def generate_momh_mask_mod(n_q_heads: int, S_V: int, content_starts: torch.Tensor,

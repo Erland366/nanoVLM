@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from models.momh_attention import (
     flex_attention_compiled,
-    create_momh_block_mask,
+    create_momh_block_mask_from_modality,
 )
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
@@ -187,7 +187,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             - momh_enabled (bool): Enable Mixture of Modality Heads.
             - momh_head_pct_vision (float): Percentage of heads for V->V.
             - momh_head_pct_text (float): Percentage of heads for T->T.
-            - mp_image_token_length (int): Number of vision tokens (S_V).
+            - mp_image_token_length (int): Legacy (span-based) vision length; not used for masking.
     """
     def __init__(self, cfg):
         super().__init__()
@@ -223,7 +223,16 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None, content_starts=None) -> tuple[torch.Tensor, dict]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask=None,
+        block_kv_cache=None,
+        content_starts=None,
+        is_vision=None,
+    ) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
 
@@ -237,8 +246,8 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             attention_mask (Tensor, optional): Attention mask tensor of shape (B, total_kv_length),
                                                with 1 for tokens to attend to and 0 for padding.
             block_kv_cache (dict, optional): Cache dict with 'key' and 'value' tensors for autoregressive decoding.
-            content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
-                                               for MoMH attention (where padding ends).
+            is_vision (Tensor, optional): Bool tensor of shape (B, total_kv_length) marking vision tokens
+                                          (typically `<|image|>` placeholder positions). Required for MoMH.
 
         Returns:
             tuple[Tensor, dict]:
@@ -278,20 +287,27 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         
         T_kv = k_exp.size(2) # Total sequence length of keys/values
 
-        # MoMH path: Use flex_attention with modality-specific masks during prefill
-        use_momh = (self.momh_enabled and is_prefill and content_starts is not None
-                    and x.device.type == 'cuda')
+        # MoMH path: Use flex_attention with modality-specific masks (prefill + decode).
+        # Requires an explicit per-token modality mask (is_vision) and an attention_mask for padding.
+        use_momh = (
+            self.momh_enabled
+            and (is_vision is not None)
+            and (attention_mask is not None)
+            and x.device.type == "cuda"
+        )
 
         if use_momh:
-            # Create MoMH block mask with per-batch content_start offsets
-            block_mask = create_momh_block_mask(
+            is_vision_kv = is_vision[:, :T_kv]
+            attn_mask_kv = attention_mask[:, :T_kv]
+            block_mask = create_momh_block_mask_from_modality(
                 n_q_heads=self.n_heads,
-                seq_len=T_kv,
-                S_V=self.S_V,
-                content_starts=content_starts,
+                q_len=T_curr,
+                kv_len=T_kv,
+                is_vision=is_vision_kv,
+                attention_mask=attn_mask_kv,
                 pct_v=self.momh_pct_vision,
                 pct_t=self.momh_pct_text,
-                device=str(x.device)
+                device=str(x.device),
             )
             # Ensure consistent dtypes (rotary embeddings may change q/k dtype)
             target_dtype = q.dtype
@@ -400,7 +416,16 @@ class LanguageModelBlock(nn.Module):
         self.norm1 = RMSNorm(cfg) # Input Norm
         self.norm2 = RMSNorm(cfg) # Post Attention Norm
     
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None, content_starts: torch.Tensor=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        block_kv_cache: dict | None = None,
+        content_starts: torch.Tensor | None = None,
+        is_vision: torch.Tensor | None = None,
+    ):
         """
         Forward pass of the Transformer block.
 
@@ -413,8 +438,8 @@ class LanguageModelBlock(nn.Module):
                 with 1 indicating tokens to attend to and 0 for padding tokens.
             block_kv_cache (dict, optional): Key-value cache dict for cached keys and values
                 during decoding. If None, no cache is used.
-            content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
-                for MoMH attention (where padding ends).
+            content_starts (Tensor, optional): Legacy MoMH parameter (span-based). Kept for compatibility.
+            is_vision (Tensor, optional): Bool tensor of shape (B, total_kv_length) marking vision tokens.
 
         Returns:
             Tuple[Tensor, dict]: Output tensor after the block (same shape as input),
@@ -422,7 +447,15 @@ class LanguageModelBlock(nn.Module):
         """
         res = x
         x = self.norm1(x)
-        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache, content_starts)
+        x, block_kv_cache = self.attn(
+            x,
+            cos,
+            sin,
+            attention_mask=attention_mask,
+            block_kv_cache=block_kv_cache,
+            content_starts=content_starts,
+            is_vision=is_vision,
+        )
         x = res + x
 
         res = x
@@ -462,7 +495,15 @@ class LanguageModel(nn.Module):
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0, content_starts: torch.Tensor=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        kv_cache: list[dict] | None = None,
+        start_pos: int = 0,
+        content_starts: torch.Tensor | None = None,
+        is_vision: torch.Tensor | None = None,
+    ):
         """
         Performs a forward pass through the language model.
 
@@ -479,8 +520,8 @@ class LanguageModel(nn.Module):
             start_pos (int, optional): The starting position index for the current input
                 sequence. Used to compute rotary positional embeddings correctly,
                 especially for cached sequences during generation. Default is 0.
-            content_starts (Tensor, optional): Tensor of shape (B,) with content start positions
-                for MoMH attention (where padding ends). Only used during prefill.
+            content_starts (Tensor, optional): Legacy MoMH parameter (span-based). Kept for compatibility.
+            is_vision (Tensor, optional): Bool tensor of shape (B, total_sequence_length) marking vision tokens.
 
         Returns:
             Tuple:
@@ -517,7 +558,15 @@ class LanguageModel(nn.Module):
             kv_cache = [None] * len(self.blocks)
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i], content_starts)
+            x, kv_cache[i] = block(
+                x,
+                cos,
+                sin,
+                attention_mask=attention_mask,
+                block_kv_cache=kv_cache[i],
+                content_starts=content_starts,
+                is_vision=is_vision,
+            )
 
         x = self.norm(x)
 

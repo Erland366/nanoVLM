@@ -1,8 +1,23 @@
 import torch
+import io
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from data.processors import get_image_string
 import logging
+
+
+def _to_pil_image(image) -> Image.Image:
+    if isinstance(image, Image.Image):
+        return image
+    if isinstance(image, dict):
+        raw = image.get("bytes")
+        path = image.get("path")
+        if raw is not None:
+            return Image.open(io.BytesIO(raw))
+        if path:
+            return Image.open(path)
+        raise ValueError(f"Unsupported image dict (expected 'bytes' or 'path'), keys={sorted(image.keys())}")
+    raise TypeError(f"Unsupported image type: {type(image)}")
 
 
 class BaseDataset(Dataset):
@@ -63,17 +78,18 @@ class BaseDataset(Dataset):
         processed_images = []
         splitted_image_counts = []
         for image in images:
-            if isinstance(image, Image.Image):
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                processed_image, splitted_image_count = self.image_processor(image)
-                if not hasattr(self.tokenizer, "global_image_token") and splitted_image_count[0]*splitted_image_count[1] == len(processed_image) - 1:
-                    # If the tokenizer doesn't have a global image token, but the processor generated it, remove it
-                    processed_image = processed_image[1:]
-                processed_images.append(processed_image)
-                splitted_image_counts.append(splitted_image_count)
-            else:
-                raise ValueError(f"Error processing image: {image}")
+            pil = _to_pil_image(image)
+            if pil.mode != "RGB":
+                pil = pil.convert("RGB")
+            processed_image, splitted_image_count = self.image_processor(pil)
+            if (
+                not hasattr(self.tokenizer, "global_image_token")
+                and splitted_image_count[0] * splitted_image_count[1] == len(processed_image) - 1
+            ):
+                # If the tokenizer doesn't have a global image token, but the processor generated it, remove it.
+                processed_image = processed_image[1:]
+            processed_images.append(processed_image)
+            splitted_image_counts.append(splitted_image_count)
         return processed_images, splitted_image_counts
 
 
@@ -219,16 +235,17 @@ class VQAIterableDataset(IterableDataset):
         processed_images = []
         splitted_image_counts = []
         for image in images:
-            if isinstance(image, Image.Image):
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                processed_image, splitted_image_count = self.image_processor(image)
-                if not hasattr(self.tokenizer, "global_image_token") and splitted_image_count[0]*splitted_image_count[1] == len(processed_image) - 1:
-                    processed_image = processed_image[1:]
-                processed_images.append(processed_image)
-                splitted_image_counts.append(splitted_image_count)
-            else:
-                raise ValueError(f"Error processing image: {image}")
+            pil = _to_pil_image(image)
+            if pil.mode != "RGB":
+                pil = pil.convert("RGB")
+            processed_image, splitted_image_count = self.image_processor(pil)
+            if (
+                not hasattr(self.tokenizer, "global_image_token")
+                and splitted_image_count[0] * splitted_image_count[1] == len(processed_image) - 1
+            ):
+                processed_image = processed_image[1:]
+            processed_images.append(processed_image)
+            splitted_image_counts.append(splitted_image_count)
         return processed_images, splitted_image_counts
 
     def _prepare_inputs_and_loss_mask(self, messages):

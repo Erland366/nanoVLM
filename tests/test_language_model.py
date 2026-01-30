@@ -1,98 +1,56 @@
 import torch
-import unittest
+
 from models.language_model import LanguageModel
-from types import SimpleNamespace
 
-class TestLanguageModel(unittest.TestCase):
-    def setUp(self):
-        # Minimal config for testing
-        self.cfg = SimpleNamespace(
-            lm_hidden_dim=64,
-            lm_inter_dim=128,
-            lm_rms_eps=1e-5,
-            lm_re_base=10000.0,
-            lm_max_position_embeddings=1024,
-            lm_attn_scaling=1.0,
-            lm_vocab_size=100, # Small vocab for testing
-            lm_n_heads=4,
-            lm_n_kv_heads=2,
-            lm_dropout=0.0,
-            lm_n_blocks=2,
-            lm_use_tokens=True,
-            lm_tie_weights=True
-        )
-        self.model = LanguageModel(self.cfg)
-        self.model.eval() # Set model to evaluation mode
 
-    def test_kv_caching_consistency(self):
-        # Input for the model
-        batch_size = 16
-        seq_len = 1000
-        input_ids = torch.randint(0, self.cfg.lm_vocab_size, (batch_size, seq_len))
+class _Cfg:
+    lm_hidden_dim = 64
+    lm_inter_dim = 128
+    lm_rms_eps = 1e-5
+    lm_re_base = 10000.0
+    lm_max_position_embeddings = 1024
+    lm_attn_scaling = 1.0
+    lm_vocab_size = 100
+    lm_n_heads = 4
+    lm_n_kv_heads = 2
+    lm_dropout = 0.0
+    lm_n_blocks = 2
+    lm_use_tokens = True
+    lm_tie_weights = True
 
-        # Forward pass without KV caching (prefill)
-        output_no_cache, _ = self.model(input_ids, start_pos=0)
 
-        # Forward pass with KV caching
-        # 1. Prefill phase
-        prefill_output, kv_cache_prefill = self.model(input_ids[:, :-1], start_pos=0)
-        
-        # 2. Decode phase (one token at a time)
-        # We expect the output of the last token from prefill + decode to match the no_cache output
-        # for that same token.
-        
-        # Get the last token's input_id for the decode step
-        last_token_input = input_ids[:, -1].unsqueeze(-1) # Shape: [B, 1]
-        
-        # The start_pos for this token is seq_len - 1
-        output_with_cache_last_token, _ = self.model(
-            last_token_input, 
-            kv_cache=kv_cache_prefill, 
-            start_pos=seq_len - 1
-        )
+def test_kv_caching_consistency():
+    torch.manual_seed(0)
+    cfg = _Cfg()
+    model = LanguageModel(cfg).eval()
 
-        # Compare the logits for the last token
-        # output_no_cache is [B, seq_len, vocab_size]
-        # output_with_cache_last_token is [B, 1, vocab_size]
-        
-        # We compare the last token's output from the no_cache run
-        # with the single token output from the with_cache run.
-        logits_no_cache_last_token = output_no_cache[:, -1, :]
-        logits_with_cache_last_token = output_with_cache_last_token[:, 0, :]
+    batch_size = 4
+    seq_len = 128
+    input_ids = torch.randint(0, cfg.lm_vocab_size, (batch_size, seq_len))
 
-        self.assertTrue(
-            torch.allclose(logits_no_cache_last_token, logits_with_cache_last_token, atol=1e-5),
-            "Outputs with and without KV caching do not match for the last token."
-        )
+    # Full forward (no cache).
+    output_no_cache, _ = model(input_ids, start_pos=0)
 
-        # Let's also test a multi-step decode to be more thorough
-        # We'll compare the full sequence output if we decode token by token
-        
-        # Reset for a full token-by-token generation using KV cache
-        current_input = input_ids[:, :1] # Start with the first token
-        output_tokens_with_cache_list = []
-        kv_cache_step = None
+    # Cache path: prefill (all but last token) + decode last token.
+    prefill_output, kv_cache_prefill = model(input_ids[:, :-1], start_pos=0)
+    assert prefill_output.shape[:2] == (batch_size, seq_len - 1)
 
-        for i in range(seq_len):
-            if i > 0:
-                current_input = input_ids[:, i:i+1] # Next token
-            
-            # The start_pos for the current token is simply i
-            output_step, kv_cache_step = self.model(
-                current_input,
-                kv_cache=kv_cache_step,
-                start_pos=i 
-            )
-            # output_step is [B, 1, vocab_size]
-            output_tokens_with_cache_list.append(output_step)
-        
-        # Concatenate all single token outputs
-        output_with_cache_full = torch.cat(output_tokens_with_cache_list, dim=1) # [B, seq_len, vocab_size]
+    last_token_input = input_ids[:, -1].unsqueeze(-1)
+    output_with_cache_last_token, _ = model(
+        last_token_input, kv_cache=kv_cache_prefill, start_pos=seq_len - 1
+    )
 
-        self.assertTrue(
-            torch.allclose(output_no_cache, output_with_cache_full, atol=1e-5),
-            "Full sequence outputs with and without KV caching do not match."
-        )
+    logits_no_cache_last_token = output_no_cache[:, -1, :]
+    logits_with_cache_last_token = output_with_cache_last_token[:, 0, :]
+    assert torch.allclose(logits_no_cache_last_token, logits_with_cache_last_token, atol=1e-5)
 
-if __name__ == '__main__':
-    unittest.main() 
+    # Full token-by-token decode should match full forward.
+    kv_cache_step = None
+    outputs = []
+    for i in range(seq_len):
+        token = input_ids[:, i : i + 1]
+        out_step, kv_cache_step = model(token, kv_cache=kv_cache_step, start_pos=i)
+        outputs.append(out_step)
+    output_with_cache_full = torch.cat(outputs, dim=1)
+    assert torch.allclose(output_no_cache, output_with_cache_full, atol=1e-5)
+

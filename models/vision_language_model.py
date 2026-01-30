@@ -10,7 +10,6 @@ from models.vision_transformer import ViT
 from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
 from models.config import VLMConfig
-from models.momh_attention import compute_content_starts
 
 from data.processors import get_tokenizer
 
@@ -20,7 +19,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_model, save_model
 
 class VisionLanguageModel(nn.Module):
-    def __init__(self, cfg: VLMConfig, load_backbone=True):
+    def __init__(self, cfg: VLMConfig, load_backbone=True, *, tokenizer=None):
         super().__init__()
         self.cfg = cfg
         if load_backbone:
@@ -32,7 +31,9 @@ class VisionLanguageModel(nn.Module):
             self.decoder = LanguageModel(cfg)
         self.MP = ModalityProjector(cfg)
         self.load_backbone = load_backbone
-        self.tokenizer = get_tokenizer(cfg.lm_tokenizer, cfg.vlm_extra_tokens, cfg.lm_chat_template)
+        self.tokenizer = tokenizer or get_tokenizer(
+            cfg.lm_tokenizer, cfg.vlm_extra_tokens, cfg.lm_chat_template
+        )
 
     def _replace_img_tokens_with_embd(self, input_ids, token_embd, image_embd):
         """
@@ -62,6 +63,7 @@ class VisionLanguageModel(nn.Module):
 
     def forward(self, input_ids, images, attention_mask=None, targets=None):
         images_tensor = self._process_images(images, input_ids.device)
+        is_vision = (input_ids == self.tokenizer.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
 
         if images_tensor is not None:
@@ -69,12 +71,9 @@ class VisionLanguageModel(nn.Module):
             image_embd = self.MP(image_embd)  # [num_images, mp_image_token_length, D_lm]
             token_embd = self._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
 
-        # Calculate content_starts for MoMH attention (where padding ends)
-        content_starts = None
-        if attention_mask is not None and getattr(self.cfg, 'momh_enabled', False):
-            content_starts = compute_content_starts(attention_mask)
-
-        logits, _ = self.decoder(token_embd, attention_mask=attention_mask, content_starts=content_starts)
+        logits, _ = self.decoder(
+            token_embd, attention_mask=attention_mask, content_starts=None, is_vision=is_vision
+        )
 
         loss = None
         if targets is not None:
@@ -88,6 +87,7 @@ class VisionLanguageModel(nn.Module):
     @torch.inference_mode()
     def generate(self, input_ids, images, attention_mask=None, max_new_tokens=5, top_k=50, top_p=0.9, temperature=0.5, greedy=False):
         images_tensor = self._process_images(images, input_ids.device)
+        is_vision = (input_ids == self.tokenizer.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_prompt_text, D_lm]
 
         if images_tensor is not None:
@@ -100,18 +100,14 @@ class VisionLanguageModel(nn.Module):
         current_total_seq_len = token_embd.size(1)
         batch_size = input_ids.size(0) # Or token_embd.size(0)
 
-        # Calculate content_starts for MoMH attention during prefill
-        content_starts = None
-        if attention_mask is not None and getattr(self.cfg, 'momh_enabled', False):
-            content_starts = compute_content_starts(attention_mask)
-
         # --- Multimodal Prefill Phase ---
         prefill_output, kv_cache_list = self.decoder(
             token_embd,
             attention_mask=attention_mask, # Use the provided attention mask
             kv_cache=None,
             start_pos=0,
-            content_starts=content_starts  # MoMH during prefill
+            content_starts=None,
+            is_vision=is_vision,
         )
         
         last_token_output_from_prefill = prefill_output[:, -1, :] 
@@ -145,15 +141,19 @@ class VisionLanguageModel(nn.Module):
             # update attention mask
             if attention_mask is not None:
                 attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
+            is_vision = torch.cat(
+                (is_vision, torch.zeros((batch_size, 1), device=is_vision.device, dtype=torch.bool)),
+                dim=1,
+            )
 
             # With KV cache: only process the new token
-            # Note: content_starts=None during decode (no MoMH, use standard causal attention)
             decode_step_output, kv_cache_list = self.decoder(
                 next_token_embed,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache_list,
                 start_pos=current_token_start_pos,
-                content_starts=None  # No MoMH during decode phase
+                content_starts=None,
+                is_vision=is_vision,
             )
       
             last_token_output = decode_step_output[:, -1, :] 

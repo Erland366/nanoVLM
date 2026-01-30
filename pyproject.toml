@@ -9,10 +9,12 @@ dependencies = [
     "numpy>=2.0.0",
     "torchvision>=0.22.1",
     "pillow>=11.0.0",
+    "einops>=0.8.0",
     "datasets>=3.0.0",
     "huggingface-hub>=0.26.0",
     "transformers>=4.46.0",
     "wandb>=0.18.0",
+    "pytest>=8.0.0",
 ]
 
 [tool.uv.sources]
