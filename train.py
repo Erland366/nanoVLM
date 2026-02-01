@@ -411,6 +411,16 @@ def train(train_cfg, vlm_cfg):
             attention_mask = batch["attention_mask"].to(device)
             data_load_time = time.time() - data_load_start
 
+            if train_cfg.compile and getattr(train_cfg, "compile_dynamic_shapes", False):
+                # Reduce torch.compile recompiles from variable batch size / seq length.
+                # Collation may drop too-long samples and produce smaller batches; we opt into dynamic dims.
+                torch._dynamo.maybe_mark_dynamic(input_ids, 0)
+                torch._dynamo.maybe_mark_dynamic(input_ids, 1)
+                torch._dynamo.maybe_mark_dynamic(labels, 0)
+                torch._dynamo.maybe_mark_dynamic(labels, 1)
+                torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
+                torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
+
             # When using DDP with gradient accumulation,
             # skip gradient synchronization on intermediate steps to save time.
             # Gradients only need to be synced at the end of each accumulation cycle.
@@ -497,6 +507,14 @@ def train(train_cfg, vlm_cfg):
                         input_ids = batch["input_ids"].to(device)
                         labels = batch["labels"].to(device)
                         attention_mask = batch["attention_mask"].to(device)
+
+                        if train_cfg.compile and getattr(train_cfg, "compile_dynamic_shapes", False):
+                            torch._dynamo.maybe_mark_dynamic(input_ids, 0)
+                            torch._dynamo.maybe_mark_dynamic(input_ids, 1)
+                            torch._dynamo.maybe_mark_dynamic(labels, 0)
+                            torch._dynamo.maybe_mark_dynamic(labels, 1)
+                            torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
+                            torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
 
                         with autocast_context:
                             _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
@@ -672,6 +690,7 @@ def main():
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
+    parser.add_argument('--compile_dynamic_shapes', type=bool, help='With torch.compile: mark (B,T) as dynamic to reduce recompilation on variable batch/seq lengths')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
@@ -696,6 +715,8 @@ def main():
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:
         train_cfg.compile = args.compile
+    if args.compile_dynamic_shapes is not None:
+        train_cfg.compile_dynamic_shapes = args.compile_dynamic_shapes
     if args.no_log_wandb is True:
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:

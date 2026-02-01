@@ -85,6 +85,12 @@ python train.py
 ```
 which will use the default `models/config.py`.
 
+### torch.compile + dynamic batch/seq
+
+If you enable `torch.compile` in `train.py` and your dataloader produces variable batch sizes (e.g. because the collator drops too-long samples), `torch.compile` can recompile on each new batch shape.
+
+To reduce recompilation, set `TrainConfig.compile_dynamic_shapes=True` (or run `python train.py --compile True --compile_dynamic_shapes True`). This uses `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask`.
+
 ### Training-step benchmark (Unsloth-style)
 
 To measure step time, tokens/s, and VRAM for a short forward+backward+optimizer loop (useful for A/B comparisons like MoMH on vs off):
@@ -102,9 +108,24 @@ python eval/benchmark_train_step.py --mode synthetic --momh --out-jsonl benchmar
 python eval/benchmark_train_step.py --mode synthetic --no-momh --out-jsonl benchmark_results/train_step.jsonl
 ```
 
+#### Shape-sweep (variable batch/seq)
+
+To surface `torch.compile` recompiles from varying batch size or sequence length, run a shape-sweep in a **single process** and enable `TORCH_LOGS`:
+
+```bash
+TORCH_LOGS="recompiles,guards" python eval/benchmark_train_step.py \
+  --mode synthetic \
+  --compile \
+  --vary-batch-sizes 4,3,4 \
+  --vary-seq-lens 2048,1536,2048 \
+  --shape-steps 1
+```
+
 ### MoMH masking sanity check
 
 MoMH masking classifies tokens as “vision” based on the `<|image|>` placeholder positions (the same positions that get replaced by image embeddings). This is important for multi-image / multi-patch samples where the number of `<|image|>` placeholders is much larger than `mp_image_token_length`.
+
+For performance, the MoMH `BlockMask` is built once per forward pass and reused across all language-model blocks (instead of recomputing it per block).
 
 To verify whether `models/momh_attention.py` is masking the correct image-token placeholders for a real dataset sample:
 

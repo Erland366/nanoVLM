@@ -71,6 +71,31 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4)
 
     p.add_argument(
+        "--vary-batch-sizes",
+        type=str,
+        default=None,
+        help="Comma-separated batch sizes for a shape-sweep run (e.g., '4,3,4').",
+    )
+    p.add_argument(
+        "--vary-seq-lens",
+        type=str,
+        default=None,
+        help="Comma-separated seq lengths for a shape-sweep run (e.g., '2048,1536,2048').",
+    )
+    p.add_argument(
+        "--shape-warmup-steps",
+        type=int,
+        default=0,
+        help="Warmup steps per shape in shape-sweep mode (default: 0).",
+    )
+    p.add_argument(
+        "--shape-steps",
+        type=int,
+        default=1,
+        help="Measured steps per shape in shape-sweep mode (default: 1).",
+    )
+
+    p.add_argument(
         "--dtype",
         choices=["bf16", "fp16"],
         default="bf16",
@@ -144,7 +169,47 @@ def _make_synthetic_batch(
     }
 
 
-def _find_hf_batch(args: argparse.Namespace, cfg: VLMConfig, device: torch.device) -> dict[str, Any]:
+def _parse_int_list(value: str | None, *, name: str) -> list[int] | None:
+    if value is None:
+        return None
+    items = [part.strip() for part in value.split(",") if part.strip()]
+    if not items:
+        raise ValueError(f"{name} must be a non-empty comma-separated list")
+    try:
+        return [int(part) for part in items]
+    except ValueError as exc:
+        raise ValueError(f"{name} must contain only integers") from exc
+
+
+def _build_shape_variants(args: argparse.Namespace) -> list[tuple[int, int]] | None:
+    batch_sizes = _parse_int_list(args.vary_batch_sizes, name="--vary-batch-sizes")
+    seq_lens = _parse_int_list(args.vary_seq_lens, name="--vary-seq-lens")
+    if batch_sizes is None and seq_lens is None:
+        return None
+    if batch_sizes is None:
+        batch_sizes = [int(args.batch_size)]
+    if seq_lens is None:
+        seq_lens = [int(args.seq_len)]
+    if len(batch_sizes) == len(seq_lens):
+        return list(zip(batch_sizes, seq_lens))
+    if len(batch_sizes) == 1:
+        return [(batch_sizes[0], seq_len) for seq_len in seq_lens]
+    if len(seq_lens) == 1:
+        return [(batch_size, seq_lens[0]) for batch_size in batch_sizes]
+    raise ValueError(
+        "Shape sweep expects matching lengths for --vary-batch-sizes and --vary-seq-lens, "
+        "or one of them must be length 1."
+    )
+
+
+def _find_hf_batch(
+    args: argparse.Namespace,
+    cfg: VLMConfig,
+    device: torch.device,
+    *,
+    batch_size: int | None = None,
+    seq_len: int | None = None,
+) -> dict[str, Any]:
     try:
         from datasets import load_dataset
     except Exception as e:  # pragma: no cover
@@ -158,7 +223,9 @@ def _find_hf_batch(args: argparse.Namespace, cfg: VLMConfig, device: torch.devic
     tokenizer = get_tokenizer(cfg.lm_tokenizer, cfg.vlm_extra_tokens, cfg.lm_chat_template)
     image_processor = get_image_processor(cfg.max_img_size, cfg.vit_img_size, cfg.resize_to_max_side_len)
     vqa_iter = VQAIterableDataset(ds, tokenizer, image_processor, cfg.mp_image_token_length)
-    collator = VQACollator(tokenizer, max_length=args.seq_len)
+    seq_len = int(seq_len if seq_len is not None else args.seq_len)
+    batch_size = int(batch_size if batch_size is not None else args.batch_size)
+    collator = VQACollator(tokenizer, max_length=seq_len)
 
     candidates: list[dict[str, Any]] = []
     for idx, sample in enumerate(vqa_iter):
@@ -170,11 +237,11 @@ def _find_hf_batch(args: argparse.Namespace, cfg: VLMConfig, device: torch.devic
         total_tiles = sum(int(t.shape[0]) for t in sample["images"])
         if raw_images < args.min_raw_images or total_tiles < args.min_total_tiles:
             continue
-        if len(sample["input_ids"]) > args.seq_len:
+        if len(sample["input_ids"]) > seq_len:
             continue
 
         candidates.append(sample)
-        if len(candidates) < args.batch_size:
+        if len(candidates) < batch_size:
             continue
 
         batch = collator(candidates)
@@ -203,13 +270,94 @@ def _find_hf_batch(args: argparse.Namespace, cfg: VLMConfig, device: torch.devic
     if not candidates:
         raise RuntimeError(
             f"No suitable sample found within search-limit={args.search_limit} "
-            f"(min_raw_images={args.min_raw_images}, min_total_tiles={args.min_total_tiles}, seq_len={args.seq_len})."
+            f"(min_raw_images={args.min_raw_images}, min_total_tiles={args.min_total_tiles}, seq_len={seq_len})."
         )
     raise RuntimeError(
-        f"Unable to build a valid batch of size {args.batch_size} within search-limit={args.search_limit} "
-        f"(min_raw_images={args.min_raw_images}, min_total_tiles={args.min_total_tiles}, seq_len={args.seq_len}). "
+        f"Unable to build a valid batch of size {batch_size} within search-limit={args.search_limit} "
+        f"(min_raw_images={args.min_raw_images}, min_total_tiles={args.min_total_tiles}, seq_len={seq_len}). "
         "Increase --search-limit, increase --seq-len, or relax constraints."
     )
+
+
+def _run_train_steps(
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    input_ids: torch.Tensor,
+    images: Any,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    tokens_per_step: int,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    warmup_steps: int,
+    steps: int,
+) -> tuple[float, float, float | None, float | None, float | None]:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
+        base_vram_bytes = torch.cuda.memory_allocated(device)
+    else:
+        base_vram_bytes = None
+
+    for _ in range(warmup_steps):
+        optimizer.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+        else:
+            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+        if loss is None:
+            raise RuntimeError("Model returned loss=None; cannot benchmark training step.")
+        loss.backward()
+        optimizer.step()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize()
+        base_vram_bytes = torch.cuda.memory_allocated(device)
+
+    step_times: list[float] = []
+    start = time.perf_counter()
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        if device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+        else:
+            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+        if loss is None:
+            raise RuntimeError("Model returned loss=None; cannot benchmark training step.")
+        loss.backward()
+        optimizer.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        step_times.append(t1 - t0)
+    end = time.perf_counter()
+
+    wall = end - start
+    step_time_mean = sum(step_times) / len(step_times)
+    tokens_per_second = (tokens_per_step * steps) / wall
+
+    if device.type == "cuda":
+        peak_vram_bytes = torch.cuda.max_memory_allocated(device)
+        base_vram_mb = float(base_vram_bytes) / (1024**2) if base_vram_bytes is not None else None
+        peak_vram_mb = float(peak_vram_bytes) / (1024**2)
+        training_vram_mb = (
+            float(peak_vram_bytes - base_vram_bytes) / (1024**2)
+            if base_vram_bytes is not None
+            else None
+        )
+    else:
+        base_vram_mb = peak_vram_mb = training_vram_mb = None
+
+    return step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb
 
 
 def _ensure_parent(path_str: str) -> Path:
@@ -243,121 +391,135 @@ def main(argv: list[str]) -> int:
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-
-    if args.mode == "synthetic":
-        batch = _make_synthetic_batch(
-            cfg=cfg,
-            tokenizer=tokenizer,  # type: ignore[arg-type]
-            device=device,
-            batch_size=args.batch_size,
-            seq_len=args.seq_len,
-            num_images=args.num_images,
-            tiles_per_image=args.tiles_per_image,
-        )
-    else:
-        batch = _find_hf_batch(args, cfg, device)
-
-    input_ids = batch["input_ids"]
-    images = batch["images"]
-    attention_mask = batch["attention_mask"]
-    labels = batch["labels"]
-    tokens_per_step = int(batch["tokens_per_step"])
-
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats(device)
-        base_vram_bytes = torch.cuda.memory_allocated(device)
-    else:
-        base_vram_bytes = None
-
     amp_dtype = _autocast_dtype(args)
+    variants = _build_shape_variants(args)
 
-    # Warmup
-    for _ in range(args.warmup_steps):
-        optimizer.zero_grad(set_to_none=True)
-        if device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+    if variants is None:
+        if args.mode == "synthetic":
+            batch = _make_synthetic_batch(
+                cfg=cfg,
+                tokenizer=tokenizer,  # type: ignore[arg-type]
+                device=device,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                num_images=args.num_images,
+                tiles_per_image=args.tiles_per_image,
+            )
         else:
-            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-        if loss is None:
-            raise RuntimeError("Model returned loss=None; cannot benchmark training step.")
-        loss.backward()
-        optimizer.step()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+            batch = _find_hf_batch(args, cfg, device)
 
-    # Benchmark
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-        torch.cuda.synchronize()
-        base_vram_bytes = torch.cuda.memory_allocated(device)
+        input_ids = batch["input_ids"]
+        images = batch["images"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+        tokens_per_step = int(batch["tokens_per_step"])
 
-    step_times: list[float] = []
-    start = time.perf_counter()
-    for _ in range(args.steps):
-        optimizer.zero_grad(set_to_none=True)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        if device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-        else:
-            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-        if loss is None:
-            raise RuntimeError("Model returned loss=None; cannot benchmark training step.")
-        loss.backward()
-        optimizer.step()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        step_times.append(t1 - t0)
-    end = time.perf_counter()
-
-    wall = end - start
-    step_time_mean = sum(step_times) / len(step_times)
-    tokens_per_second = (tokens_per_step * args.steps) / wall
-
-    if device.type == "cuda":
-        peak_vram_bytes = torch.cuda.max_memory_allocated(device)
-        base_vram_mb = float(base_vram_bytes) / (1024**2) if base_vram_bytes is not None else None
-        peak_vram_mb = float(peak_vram_bytes) / (1024**2)
-        training_vram_mb = (
-            float(peak_vram_bytes - base_vram_bytes) / (1024**2)
-            if base_vram_bytes is not None
-            else None
+        step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb = _run_train_steps(
+            model=model,
+            optimizer=optimizer,
+            input_ids=input_ids,
+            images=images,
+            attention_mask=attention_mask,
+            labels=labels,
+            tokens_per_step=tokens_per_step,
+            device=device,
+            amp_dtype=amp_dtype,
+            warmup_steps=args.warmup_steps,
+            steps=args.steps,
         )
-    else:
-        base_vram_mb = peak_vram_mb = training_vram_mb = None
 
-    result = BenchmarkResult(
-        mode=args.mode,
-        momh_enabled=bool(args.momh),
-        compile=bool(args.compile),
-        device=str(device),
-        dtype=args.dtype,
-        batch_size=int(args.batch_size),
-        seq_len=int(args.seq_len),
-        num_images=int(args.num_images),
-        tiles_per_image=int(args.tiles_per_image),
-        warmup_steps=int(args.warmup_steps),
-        steps=int(args.steps),
-        tokens_per_step=int(tokens_per_step),
-        step_time_ms_mean=float(step_time_mean * 1000.0),
-        tokens_per_second=float(tokens_per_second),
-        base_vram_mb=base_vram_mb,
-        peak_vram_mb=peak_vram_mb,
-        training_vram_mb=training_vram_mb,
-    )
+        result = BenchmarkResult(
+            mode=args.mode,
+            momh_enabled=bool(args.momh),
+            compile=bool(args.compile),
+            device=str(device),
+            dtype=args.dtype,
+            batch_size=int(args.batch_size),
+            seq_len=int(args.seq_len),
+            num_images=int(args.num_images),
+            tiles_per_image=int(args.tiles_per_image),
+            warmup_steps=int(args.warmup_steps),
+            steps=int(args.steps),
+            tokens_per_step=int(tokens_per_step),
+            step_time_ms_mean=float(step_time_mean * 1000.0),
+            tokens_per_second=float(tokens_per_second),
+            base_vram_mb=base_vram_mb,
+            peak_vram_mb=peak_vram_mb,
+            training_vram_mb=training_vram_mb,
+        )
 
+        out_path = _ensure_parent(args.out_jsonl)
+        record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **asdict(result)}
+        with out_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        print(json.dumps(record, indent=2))
+        print(f"Wrote: {out_path}")
+        return 0
+
+    # Shape-sweep mode: run multiple shapes in a single process to surface recompiles.
     out_path = _ensure_parent(args.out_jsonl)
-    record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **asdict(result)}
-    with out_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    for batch_size, seq_len in variants:
+        if args.mode == "synthetic":
+            batch = _make_synthetic_batch(
+                cfg=cfg,
+                tokenizer=tokenizer,  # type: ignore[arg-type]
+                device=device,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_images=args.num_images,
+                tiles_per_image=args.tiles_per_image,
+            )
+        else:
+            batch = _find_hf_batch(args, cfg, device, batch_size=batch_size, seq_len=seq_len)
 
-    print(json.dumps(record, indent=2))
-    print(f"Wrote: {out_path}")
+        input_ids = batch["input_ids"]
+        images = batch["images"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+        tokens_per_step = int(batch["tokens_per_step"])
+
+        step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb = _run_train_steps(
+            model=model,
+            optimizer=optimizer,
+            input_ids=input_ids,
+            images=images,
+            attention_mask=attention_mask,
+            labels=labels,
+            tokens_per_step=tokens_per_step,
+            device=device,
+            amp_dtype=amp_dtype,
+            warmup_steps=args.shape_warmup_steps,
+            steps=args.shape_steps,
+        )
+
+        result = BenchmarkResult(
+            mode=args.mode,
+            momh_enabled=bool(args.momh),
+            compile=bool(args.compile),
+            device=str(device),
+            dtype=args.dtype,
+            batch_size=int(batch_size),
+            seq_len=int(seq_len),
+            num_images=int(args.num_images),
+            tiles_per_image=int(args.tiles_per_image),
+            warmup_steps=int(args.shape_warmup_steps),
+            steps=int(args.shape_steps),
+            tokens_per_step=int(tokens_per_step),
+            step_time_ms_mean=float(step_time_mean * 1000.0),
+            tokens_per_second=float(tokens_per_second),
+            base_vram_mb=base_vram_mb,
+            peak_vram_mb=peak_vram_mb,
+            training_vram_mb=training_vram_mb,
+        )
+
+        record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **asdict(result)}
+        with out_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        print(json.dumps(record, indent=2))
+        print(f"Wrote: {out_path}")
+
     return 0
 
 
