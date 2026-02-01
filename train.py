@@ -163,6 +163,24 @@ def _save_fsdp2_checkpoint(model, save_directory: str):
     if is_dist():
         dist.barrier()
 
+def _compile_module_list(modules, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"):
+    for idx, block in enumerate(modules):
+        modules[idx] = torch.compile(block, dynamic=dynamic, mode=mode)
+
+
+def compile_regions(model, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"):
+    if not hasattr(model, "vision_encoder") or not hasattr(model, "decoder") or not hasattr(model, "MP"):
+        raise AttributeError("Model must expose vision_encoder, decoder, and MP for regional compile.")
+    if hasattr(model.vision_encoder, "blocks"):
+        _compile_module_list(model.vision_encoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.vision_encoder = torch.compile(model.vision_encoder, dynamic=dynamic, mode=mode)
+    if hasattr(model.decoder, "blocks"):
+        _compile_module_list(model.decoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.decoder = torch.compile(model.decoder, dynamic=dynamic, mode=mode)
+    model.MP = torch.compile(model.MP, dynamic=dynamic, mode=mode)
+
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
     max_training_steps = f"{train_cfg.max_training_steps}"
@@ -287,7 +305,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             train_dataset,
             batch_size=train_cfg.batch_size,    # =per device BS in DDP
             collate_fn=vqa_collator,
-            num_workers=3,
+            num_workers=train_cfg.data_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -298,7 +316,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             val_dataset,
             batch_size=train_cfg.batch_size,
             collate_fn=vqa_collator,
-            num_workers=1,
+            num_workers=train_cfg.val_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -309,7 +327,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             train_dataset,
             batch_size=train_cfg.batch_size,    # =per device BS in DDP
             collate_fn=vqa_collator,
-            num_workers=3,
+            num_workers=train_cfg.data_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -321,7 +339,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             val_dataset,
             batch_size=train_cfg.batch_size,
             collate_fn=vqa_collator,
-            num_workers=1,
+            num_workers=train_cfg.val_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -439,8 +457,8 @@ def train(train_cfg, vlm_cfg):
     print(f"Using device: {device}")
     model.to(device)
 
-    if train_cfg.compile and (not is_dist() or not _is_fsdp2(train_cfg)):
-        model = torch.compile(model)
+    if train_cfg.compile and not _is_fsdp2(train_cfg):
+        compile_regions(model, dynamic=None, mode="reduce-overhead")
     if is_dist() and _is_fsdp2(train_cfg):
         print("Wrapping model for FSDP2")
         model = _apply_fsdp2(model, train_cfg)
@@ -487,9 +505,8 @@ def train(train_cfg, vlm_cfg):
             attention_mask = batch["attention_mask"].to(device)
             data_load_time = time.time() - data_load_start
 
-            if train_cfg.compile and getattr(train_cfg, "compile_dynamic_shapes", False):
-                # Reduce torch.compile recompiles from variable batch size / seq length.
-                # Collation may drop too-long samples and produce smaller batches; we opt into dynamic dims.
+            if train_cfg.compile:
+                # Always mark (B,T) dynamic when compiling to reduce recompiles from variable batch/seq.
                 torch._dynamo.maybe_mark_dynamic(input_ids, 0)
                 torch._dynamo.maybe_mark_dynamic(input_ids, 1)
                 torch._dynamo.maybe_mark_dynamic(labels, 0)
@@ -586,7 +603,7 @@ def train(train_cfg, vlm_cfg):
                         labels = batch["labels"].to(device)
                         attention_mask = batch["attention_mask"].to(device)
 
-                        if train_cfg.compile and getattr(train_cfg, "compile_dynamic_shapes", False):
+                        if train_cfg.compile:
                             torch._dynamo.maybe_mark_dynamic(input_ids, 0)
                             torch._dynamo.maybe_mark_dynamic(input_ids, 1)
                             torch._dynamo.maybe_mark_dynamic(labels, 0)

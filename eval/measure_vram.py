@@ -17,6 +17,24 @@ import models.config as config
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+def _compile_module_list(modules, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"):
+    for idx, block in enumerate(modules):
+        modules[idx] = torch.compile(block, dynamic=dynamic, mode=mode)
+
+
+def compile_regions(model, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"):
+    if not hasattr(model, "vision_encoder") or not hasattr(model, "decoder") or not hasattr(model, "MP"):
+        raise AttributeError("Model must expose vision_encoder, decoder, and MP for regional compile.")
+    if hasattr(model.vision_encoder, "blocks"):
+        _compile_module_list(model.vision_encoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.vision_encoder = torch.compile(model.vision_encoder, dynamic=dynamic, mode=mode)
+    if hasattr(model.decoder, "blocks"):
+        _compile_module_list(model.decoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.decoder = torch.compile(model.decoder, dynamic=dynamic, mode=mode)
+    model.MP = torch.compile(model.MP, dynamic=dynamic, mode=mode)
+
 def measure_vram(args, vlm_cfg, train_cfg_defaults):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not torch.cuda.is_available():
@@ -29,9 +47,9 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
     model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
 
     if args.compile:
-        print("Compiling the model with torch.compile...")
-        model = torch.compile(model)
-        print("Model compiled.")
+        print("Compiling model submodules with torch.compile...")
+        compile_regions(model)
+        print("Model submodules compiled.")
 
     model.to(device)
 

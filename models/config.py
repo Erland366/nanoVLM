@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class VLMConfig:
     vit_hidden_dim: int = 256
-    vit_inter_dim: int = 4 * vit_hidden_dim
+    vit_inter_dim: int = 1024
     vit_patch_size: int = 16
     vit_img_size: int = 128
     vit_n_heads: int = 4
@@ -12,7 +12,7 @@ class VLMConfig:
     vit_n_blocks: int = 4
     vit_ln_eps: float = 1e-6
     vit_cls_flag: bool = False
-    vit_model_type: str = 'google/siglip2-base-patch16-512'
+    vit_model_type: str = "google/siglip2-base-patch16-512"
 
     lm_hidden_dim: int = 384
     lm_inter_dim: int = 1024
@@ -20,18 +20,18 @@ class VLMConfig:
     lm_re_base: int = 100000
     lm_max_position_embeddings: int = 1024
     lm_base_vocab_size: int = 49152
-    extra_token_amount: int = 66  # Number of extra tokens for the VLM (image start, image end, image token)
-    lm_vocab_size: int = lm_base_vocab_size + extra_token_amount # Not a great way to do this, but it works for now (vlm_extra_tokens cannot be a dict, since this is mutable, and a Field has no len() function)
+    extra_token_amount: int = 66
+    lm_vocab_size: int = 49218
     lm_n_heads: int = 6
     lm_n_kv_heads: int = 2
     lm_dropout: float = 0.0
     lm_n_blocks: int = 8
     lm_attn_scaling: float = 1.0
     lm_max_length: int = 1024
-    lm_use_tokens: bool = False # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
-    lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
-    lm_model_type: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
-    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
+    lm_use_tokens: bool = False
+    lm_tie_weights: bool = True
+    lm_model_type: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    lm_tokenizer: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
     lm_chat_template: str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
     mp_pixel_shuffle_factor: int = 4
@@ -55,9 +55,9 @@ class VLMConfig:
       "r6c1": "<row_6_col_1>", "r6c2": "<row_6_col_2>", "r6c3": "<row_6_col_3>", "r6c4": "<row_6_col_4>", "r6c5": "<row_6_col_5>", "r6c6": "<row_6_col_6>", "r6c7": "<row_6_col_7>", "r6c8": "<row_6_col_8>",
       "r7c1": "<row_7_col_1>", "r7c2": "<row_7_col_2>", "r7c3": "<row_7_col_3>", "r7c4": "<row_7_col_4>", "r7c5": "<row_7_col_5>", "r7c6": "<row_7_col_6>", "r7c7": "<row_7_col_7>", "r7c8": "<row_7_col_8>",
       "r8c1": "<row_8_col_1>", "r8c2": "<row_8_col_2>", "r8c3": "<row_8_col_3>", "r8c4": "<row_8_col_4>", "r8c5": "<row_8_col_5>", "r8c6": "<row_8_col_6>", "r8c7": "<row_8_col_7>", "r8c8": "<row_8_col_8>"})
-    vlm_load_backbone_weights: bool = False  # Train from scratch for MoMH (pretrained weights incompatible with restricted attention)
-    vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
-    hf_repo_name: str = 'nanoVLM'
+    vlm_load_backbone_weights: bool = False
+    vlm_checkpoint_path: str = "lusxvr/nanoVLM-230M-8k"
+    hf_repo_name: str = "nanoVLM"
 
 
 @dataclass

@@ -22,6 +22,7 @@ def _build_momh_block_mask_prefill(
 ):
     # Building the BlockMask is expensive and produces a non-Tensor object; keep it out of
     # the torch.compile graph and reuse it across all LM blocks in a forward pass.
+    seq_len = int(seq_len)
     return create_momh_block_mask_from_modality(
         n_q_heads=n_q_heads,
         q_len=seq_len,
@@ -529,6 +530,7 @@ class LanguageModel(nn.Module):
         start_pos: int = 0,
         content_starts: torch.Tensor | None = None,
         is_vision: torch.Tensor | None = None,
+        prefill_block_mask=None,
     ):
         """
         Performs a forward pass through the language model.
@@ -583,9 +585,9 @@ class LanguageModel(nn.Module):
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
-        prefill_block_mask = None
         if (
-            attention_mask is not None
+            prefill_block_mask is None
+            and attention_mask is not None
             and is_vision is not None
             and x.device.type == "cuda"
             and len(self.blocks) > 0
@@ -595,7 +597,7 @@ class LanguageModel(nn.Module):
         ):
             prefill_block_mask = _build_momh_block_mask_prefill(
                 n_q_heads=int(self.blocks[0].attn.n_heads),
-                seq_len=int(T_curr),
+                seq_len=T_curr,
                 is_vision=is_vision[:, :T_curr],
                 attention_mask=attention_mask[:, :T_curr],
                 pct_v=float(self.blocks[0].attn.momh_pct_vision),

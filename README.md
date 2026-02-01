@@ -86,7 +86,7 @@ python train.py
 which will use the default `models/config.py`.
 
 Default config highlights (see `models/config.py` for full details):
-- Smaller ViT/LM (256-dim ViT, 384-dim LM, 1024 max sequence length).
+- Small debug-scale setup (128px ViT, 1024-token LM, `mp_image_token_length=4`) for fast iteration.
 - Dataset defaults to `patrickamadeus/the_cauldron` with `config:sample_1pct`.
 
 ### Distributed training (DDP / FSDP2)
@@ -107,11 +107,11 @@ Optional FSDP2 flags:
 
 Note: `torch.compile` + FSDP2 is experimental here; disable `--compile` if you hit errors.
 
-### torch.compile + dynamic batch/seq
+### torch.compile (regional) + dynamic batch/seq
 
-If you enable `torch.compile` in `train.py` and your dataloader produces variable batch sizes (e.g. because the collator drops too-long samples), `torch.compile` can recompile on each new batch shape.
+When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
 
-To reduce recompilation, set `TrainConfig.compile_dynamic_shapes=True` (or run `python train.py --compile True --compile_dynamic_shapes True`). This uses `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask`.
+If `TrainConfig.compile_dynamic_shapes=True`, `train.py` applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance.
 
 ### Training-step benchmark (Unsloth-style)
 
@@ -121,6 +121,10 @@ To measure step time, tokens/s, and VRAM for a short forward+backward+optimizer 
 source .venv/bin/activate
 python eval/benchmark_train_step.py --mode synthetic --steps 10 --warmup-steps 3 --batch-size 1 --seq-len 2048
 ```
+
+<u>Important: this benchmark always reflects the **current `train.py` setup** (no optimization flags). All optimization changes must live in `train.py`, and the benchmark simply measures the current setup.</u>
+
+The benchmark reports `compile_time_ms` when `TrainConfig.compile=True` (time for the first step that triggers compilation). To change compile settings, edit `models/config.py` (this benchmark reflects the current training setup).
 
 Write results to JSONL (default `benchmark_results/train_step.jsonl`) and compare runs by toggling MoMH:
 
@@ -147,11 +151,15 @@ To surface `torch.compile` recompiles from varying batch size or sequence length
 ```bash
 TORCH_LOGS="recompiles,guards" python eval/benchmark_train_step.py \
   --mode synthetic \
-  --compile \
   --vary-batch-sizes 4,3,4 \
   --vary-seq-lens 2048,1536,2048 \
   --shape-steps 1
 ```
+
+Notes:
+- Dynamic `(B,T)` marking is applied automatically when compile is enabled in `train.py`.
+- This benchmark uses list-of-tensors image inputs (matching training), so variable image counts or tile counts can still introduce guards.
+- MoMH block masks are now built in the VLM wrapper (outside compiled decoder) to avoid graph breaks from `torch.compiler.disable` inside the compiled region. Direct calls to `model.decoder(...)` can still graph-break if they need a block mask.
 
 ### MoMH masking sanity check
 

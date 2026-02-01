@@ -9,6 +9,7 @@ from models.utils import top_k_top_p_filtering
 from models.vision_transformer import ViT
 from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
+from models.momh_attention import create_momh_block_mask_from_modality
 from models.config import VLMConfig
 
 from data.processors import get_tokenizer
@@ -90,13 +91,39 @@ class VisionLanguageModel(nn.Module):
         is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
 
+        prefill_block_mask = None
+        if (
+            attention_mask is not None
+            and is_vision is not None
+            and input_ids.device.type == "cuda"
+            and hasattr(self.decoder, "blocks")
+            and len(self.decoder.blocks) > 0
+            and self.decoder.blocks[0].attn.momh_enabled
+            and input_ids.size(1) > 1
+        ):
+            seq_len = int(input_ids.size(1))
+            prefill_block_mask = create_momh_block_mask_from_modality(
+                n_q_heads=int(self.decoder.blocks[0].attn.n_heads),
+                q_len=seq_len,
+                kv_len=seq_len,
+                is_vision=is_vision[:, :seq_len],
+                attention_mask=attention_mask[:, :seq_len],
+                pct_v=float(self.decoder.blocks[0].attn.momh_pct_vision),
+                pct_t=float(self.decoder.blocks[0].attn.momh_pct_text),
+                device=str(input_ids.device),
+            )
+
         if images_tensor is not None:
             image_embd = self.vision_encoder(images_tensor)
             image_embd = self.MP(image_embd)  # [num_images, mp_image_token_length, D_lm]
             token_embd = self._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
 
         logits, _ = self.decoder(
-            token_embd, attention_mask=attention_mask, content_starts=None, is_vision=is_vision
+            token_embd,
+            attention_mask=attention_mask,
+            content_starts=None,
+            is_vision=is_vision,
+            prefill_block_mask=prefill_block_mask,
         )
 
         loss = None
@@ -113,6 +140,28 @@ class VisionLanguageModel(nn.Module):
         images_tensor = self._process_images(images, input_ids.device)
         is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_prompt_text, D_lm]
+
+        prefill_block_mask = None
+        if (
+            attention_mask is not None
+            and is_vision is not None
+            and input_ids.device.type == "cuda"
+            and hasattr(self.decoder, "blocks")
+            and len(self.decoder.blocks) > 0
+            and self.decoder.blocks[0].attn.momh_enabled
+            and input_ids.size(1) > 1
+        ):
+            seq_len = int(input_ids.size(1))
+            prefill_block_mask = create_momh_block_mask_from_modality(
+                n_q_heads=int(self.decoder.blocks[0].attn.n_heads),
+                q_len=seq_len,
+                kv_len=seq_len,
+                is_vision=is_vision[:, :seq_len],
+                attention_mask=attention_mask[:, :seq_len],
+                pct_v=float(self.decoder.blocks[0].attn.momh_pct_vision),
+                pct_t=float(self.decoder.blocks[0].attn.momh_pct_text),
+                device=str(input_ids.device),
+            )
 
         if images_tensor is not None:
             # 1. Process image if present
@@ -132,6 +181,7 @@ class VisionLanguageModel(nn.Module):
             start_pos=0,
             content_starts=None,
             is_vision=is_vision,
+            prefill_block_mask=prefill_block_mask,
         )
         
         last_token_output_from_prefill = prefill_output[:, -1, :] 
