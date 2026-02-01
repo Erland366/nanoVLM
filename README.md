@@ -88,19 +88,19 @@ which will use the default `models/config.py`.
 Optional: add a `.env` file with `WANDB_API_KEY` and `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`).
 `train.py` will load `.env` and log into W&B/Hugging Face automatically for the master process.
 
-Default config in this worktree targets a smaller LR-efficiency setup: 256-d ViT (patch16, img 128, 4 blocks),
-SmolLM2-135M-Instruct (384 hidden, 8 blocks, 1024 max length), and `patrickamadeus/the_cauldron` `config:sample_1pct`
-with batch size 1, grad accum 8, lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000.
-See `models/config.py` for the full defaults.
+Note: the default config in this worktree is a **small debug-scale** setup for fast iteration:
+256-d ViT (patch16, img 128, 4 blocks, `mp_image_token_length=4`), SmolLM2-135M-Instruct (384 hidden, 8 blocks,
+1024 max length), and `patrickamadeus/the_cauldron` `config:sample_1pct` with batch size 1, grad accum 8,
+lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000. See `models/config.py` for full defaults.
 
 To use consumed tokens as the W&B x-axis, set `TrainConfig.wandb_xaxis_tokens=True`. This logs `tokens/consumed`
 alongside training and validation metrics and uses it as the step metric.
 
-### torch.compile + dynamic batch/seq
+### torch.compile (regional) + dynamic batch/seq
 
-If you enable `torch.compile` in `train.py` and your dataloader produces variable batch sizes (e.g. because the collator drops too-long samples), `torch.compile` can recompile on each new batch shape.
+When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
 
-To reduce recompilation, set `TrainConfig.compile_dynamic_shapes=True` (or run `python train.py --compile True --compile_dynamic_shapes True`). This uses `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask`.
+When compile is enabled, `train.py` always applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance. There is no separate flag for this.
 
 ### Training-step benchmark (Unsloth-style)
 
@@ -110,6 +110,10 @@ To measure step time, tokens/s, and VRAM for a short forward+backward+optimizer 
 source .venv/bin/activate
 python eval/benchmark_train_step.py --mode synthetic --steps 10 --warmup-steps 3 --batch-size 1 --seq-len 2048
 ```
+
+<u>Important: this benchmark always reflects the **current `train.py` setup** (no optimization flags). All optimization changes must live in `train.py`, and the benchmark simply measures the current setup.</u>
+
+The benchmark reports `compile_time_ms` when `TrainConfig.compile=True` (time for the first step that triggers compilation). To change compile settings, edit `models/config.py` (this benchmark reflects the current training setup).
 
 Write results to JSONL (default `benchmark_results/train_step.jsonl`) and compare runs by toggling MoMH:
 
@@ -126,11 +130,15 @@ To surface `torch.compile` recompiles from varying batch size or sequence length
 ```bash
 TORCH_LOGS="recompiles,guards" python eval/benchmark_train_step.py \
   --mode synthetic \
-  --compile \
   --vary-batch-sizes 4,3,4 \
   --vary-seq-lens 2048,1536,2048 \
   --shape-steps 1
 ```
+
+Notes:
+- Dynamic `(B,T)` marking is applied automatically when compile is enabled in `train.py`.
+- This benchmark uses list-of-tensors image inputs (matching training), so variable image counts or tile counts can still introduce guards.
+- MoMH block masks are now built in the VLM wrapper (outside compiled decoder) to avoid graph breaks from `torch.compiler.disable` inside the compiled region. Direct calls to `model.decoder(...)` can still graph-break if they need a block mask.
 
 ### MoMH masking sanity check
 

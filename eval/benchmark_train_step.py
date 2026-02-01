@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in os.sys.path:
     os.sys.path.insert(0, str(REPO_ROOT))
 
-from models.config import VLMConfig
+from models.config import TrainConfig, VLMConfig
 from models.vision_language_model import VisionLanguageModel
 
 
@@ -26,6 +26,7 @@ class BenchmarkResult:
     compile: bool
     device: str
     dtype: str
+    compile_time_ms: float | None
     batch_size: int
     seq_len: int
     num_images: int
@@ -59,7 +60,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--mode", choices=["synthetic", "hf"], default="synthetic")
 
     p.add_argument("--momh", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--compile", action="store_true", help="torch.compile the full VLM module (in addition to flex_attention compilation).")
 
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--seq-len", type=int, default=2048)
@@ -94,7 +94,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=1,
         help="Measured steps per shape in shape-sweep mode (default: 1).",
     )
-
     p.add_argument(
         "--dtype",
         choices=["bf16", "fp16"],
@@ -120,6 +119,27 @@ def _autocast_dtype(args: argparse.Namespace) -> torch.dtype:
     if args.dtype == "bf16":
         return torch.bfloat16
     return torch.float16
+
+
+def _compile_module_list(modules, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead") -> None:
+    for idx, block in enumerate(modules):
+        modules[idx] = torch.compile(block, dynamic=dynamic, mode=mode)
+
+
+def _compile_regions(
+    model: torch.nn.Module, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"
+) -> None:
+    if not hasattr(model, "vision_encoder") or not hasattr(model, "decoder") or not hasattr(model, "MP"):
+        raise AttributeError("Model must expose vision_encoder, decoder, and MP for regional compile.")
+    if hasattr(model.vision_encoder, "blocks"):
+        _compile_module_list(model.vision_encoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.vision_encoder = torch.compile(model.vision_encoder, dynamic=dynamic, mode=mode)
+    if hasattr(model.decoder, "blocks"):
+        _compile_module_list(model.decoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.decoder = torch.compile(model.decoder, dynamic=dynamic, mode=mode)
+    model.MP = torch.compile(model.MP, dynamic=dynamic, mode=mode)
 
 
 def _make_synthetic_batch(
@@ -151,9 +171,9 @@ def _make_synthetic_batch(
     labels[attention_mask == 0] = -100
     labels[input_ids == tokenizer.image_token_id] = -100
 
-    # images format: list[batch] of list[num_images] of tensor[tiles_per_image, 3, H, W]
     H = int(cfg.vit_img_size)
-    images: list[list[torch.Tensor]] = []
+    # images format: list[batch] of list[num_images] of tensor[tiles_per_image, 3, H, W]
+    images = []
     for _ in range(batch_size):
         per_sample: list[torch.Tensor] = []
         for _ in range(num_images):
@@ -292,7 +312,8 @@ def _run_train_steps(
     amp_dtype: torch.dtype,
     warmup_steps: int,
     steps: int,
-) -> tuple[float, float, float | None, float | None, float | None]:
+    measure_compile_time: bool,
+) -> tuple[float, float, float | None, float | None, float | None, float | None]:
     if device.type == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats(device)
@@ -300,28 +321,7 @@ def _run_train_steps(
     else:
         base_vram_bytes = None
 
-    for _ in range(warmup_steps):
-        optimizer.zero_grad(set_to_none=True)
-        if device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-        else:
-            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-        if loss is None:
-            raise RuntimeError("Model returned loss=None; cannot benchmark training step.")
-        loss.backward()
-        optimizer.step()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-        torch.cuda.synchronize()
-        base_vram_bytes = torch.cuda.memory_allocated(device)
-
-    step_times: list[float] = []
-    start = time.perf_counter()
-    for _ in range(steps):
+    def _train_step() -> float:
         optimizer.zero_grad(set_to_none=True)
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -338,7 +338,24 @@ def _run_train_steps(
         if device.type == "cuda":
             torch.cuda.synchronize()
         t1 = time.perf_counter()
-        step_times.append(t1 - t0)
+        return t1 - t0
+
+    compile_time_ms = None
+    if measure_compile_time:
+        compile_time_ms = float(_train_step() * 1000.0)
+
+    for _ in range(warmup_steps):
+        _train_step()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize()
+        base_vram_bytes = torch.cuda.memory_allocated(device)
+
+    step_times: list[float] = []
+    start = time.perf_counter()
+    for _ in range(steps):
+        step_times.append(_train_step())
     end = time.perf_counter()
 
     wall = end - start
@@ -357,7 +374,27 @@ def _run_train_steps(
     else:
         base_vram_mb = peak_vram_mb = training_vram_mb = None
 
-    return step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb
+    return step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb, compile_time_ms
+
+
+def _maybe_mark_dynamic(
+    *,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+    images: Any,
+    compile_enabled: bool,
+) -> None:
+    if not compile_enabled:
+        return
+    torch._dynamo.maybe_mark_dynamic(input_ids, 0)
+    torch._dynamo.maybe_mark_dynamic(input_ids, 1)
+    torch._dynamo.maybe_mark_dynamic(labels, 0)
+    torch._dynamo.maybe_mark_dynamic(labels, 1)
+    torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
+    torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
+    if isinstance(images, torch.Tensor):
+        torch._dynamo.maybe_mark_dynamic(images, 0)
 
 
 def _ensure_parent(path_str: str) -> Path:
@@ -372,6 +409,9 @@ def main(argv: list[str]) -> int:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Requested --device=cuda but CUDA is not available.")
 
+    train_cfg = TrainConfig()
+    compile_enabled = bool(train_cfg.compile)
+
     cfg = VLMConfig()
     cfg.momh_enabled = bool(args.momh)
 
@@ -385,8 +425,8 @@ def main(argv: list[str]) -> int:
         )
 
     model = VisionLanguageModel(cfg, load_backbone=False, tokenizer=tokenizer)
-    if args.compile:
-        model = torch.compile(model)
+    if compile_enabled:
+        _compile_regions(model, dynamic=None, mode="reduce-overhead")
     model.to(device)
     model.train()
 
@@ -413,8 +453,15 @@ def main(argv: list[str]) -> int:
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
         tokens_per_step = int(batch["tokens_per_step"])
+        _maybe_mark_dynamic(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            images=images,
+            compile_enabled=compile_enabled,
+        )
 
-        step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb = _run_train_steps(
+        step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb, compile_time_ms = _run_train_steps(
             model=model,
             optimizer=optimizer,
             input_ids=input_ids,
@@ -426,14 +473,16 @@ def main(argv: list[str]) -> int:
             amp_dtype=amp_dtype,
             warmup_steps=args.warmup_steps,
             steps=args.steps,
+            measure_compile_time=compile_enabled,
         )
 
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
-            compile=bool(args.compile),
+            compile=compile_enabled,
             device=str(device),
             dtype=args.dtype,
+            compile_time_ms=compile_time_ms,
             batch_size=int(args.batch_size),
             seq_len=int(args.seq_len),
             num_images=int(args.num_images),
@@ -478,8 +527,15 @@ def main(argv: list[str]) -> int:
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
         tokens_per_step = int(batch["tokens_per_step"])
+        _maybe_mark_dynamic(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            images=images,
+            compile_enabled=compile_enabled,
+        )
 
-        step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb = _run_train_steps(
+        step_time_mean, tokens_per_second, base_vram_mb, peak_vram_mb, training_vram_mb, compile_time_ms = _run_train_steps(
             model=model,
             optimizer=optimizer,
             input_ids=input_ids,
@@ -491,14 +547,16 @@ def main(argv: list[str]) -> int:
             amp_dtype=amp_dtype,
             warmup_steps=args.shape_warmup_steps,
             steps=args.shape_steps,
+            measure_compile_time=compile_enabled,
         )
 
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
-            compile=bool(args.compile),
+            compile=compile_enabled,
             device=str(device),
             dtype=args.dtype,
+            compile_time_ms=compile_time_ms,
             batch_size=int(batch_size),
             seq_len=int(seq_len),
             num_images=int(args.num_images),
