@@ -2,6 +2,10 @@
 
 Date: 2026-01-30
 
+> **Update (2026-02-01):** `TrainConfig.compile_dynamic_shapes` was removed. When `TrainConfig.compile=True`, `train.py`
+> always applies `torch._dynamo.maybe_mark_dynamic` on `(B, T)` for `input_ids`, `labels`, and `attention_mask`.
+> The train-step benchmark now reflects the current training setup without extra optimization flags.
+
 ## Context
 
 We want stable throughput improvements from `torch.compile` while training on data that can produce:
@@ -45,5 +49,4 @@ Note: results under GPU contention are valid for “shared GPU throughput” but
 1) Tile-count variance still likely recompiles (vision encoder input length changes).
    - Consider bucketing/padding number of tiles per batch, or tensorizing images in collator.
 2) Verify recompiles reduction on real training loop with:
-   - `TORCH_LOGS="recompiles,guards" python train.py --compile True --compile_dynamic_shapes True ...`
-
+   - `TORCH_LOGS="recompiles,guards" python train.py ...` (with `TrainConfig.compile=True`)

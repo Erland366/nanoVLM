@@ -11,6 +11,7 @@ metadata:
     - mark_dynamic
     - recompiles
     - nanovlm
+    - regional-compile
   domain: research
   created: 2026-01-30
   author: codex
@@ -24,7 +25,8 @@ In nanoVLM-style training, the collator can drop samples or produce variable-len
 With `torch.compile`, that typically triggers recompilations because graphs are guarded on tensor shapes.
 
 This skill captures an opt-in approach to reduce these recompiles by marking only the `(B, T)` dims dynamic while
-keeping hidden dims static.
+keeping hidden dims static, and by favoring **regional compile** (vision/decoder/MP) to reduce compile scope and
+avoid graph breaks from non-tensor helpers.
 
 ## When to Apply
 
@@ -43,23 +45,39 @@ Do NOT use when:
 
 ## Recommended Practice
 
-### Step 1: Enable dynamic `(B,T)` marking
+<u>Important: all optimization changes must land in `train.py` (single source of truth). The benchmark (`eval/benchmark_train_step.py`) does not accept optimization flags and only measures the current `train.py` setup.</u>
 
-In this repo:
-- Set `TrainConfig.compile_dynamic_shapes=True`, or
-- Run: `python train.py --compile True --compile_dynamic_shapes True`
+### Step 1: Use regional compile (per block)
 
-This marks dynamic dims for `input_ids`, `labels`, and `attention_mask` using:
-- `torch._dynamo.maybe_mark_dynamic(t, 0)` (batch)
-- `torch._dynamo.maybe_mark_dynamic(t, 1)` (seq)
+Compile only the repeated blocks (plus MP) to reduce compile time and avoid tracing Python/list-heavy glue code:
 
-### Step 2: Verify recompiles are gone
+```python
+for idx, block in enumerate(model.vision_encoder.blocks):
+    model.vision_encoder.blocks[idx] = torch.compile(block, mode="reduce-overhead")
+for idx, block in enumerate(model.decoder.blocks):
+    model.decoder.blocks[idx] = torch.compile(block, mode="reduce-overhead")
+model.MP = torch.compile(model.MP, mode="reduce-overhead")
+```
+
+### Step 2: Enable dynamic `(B,T)` marking (train.py default)
+
+In this repo, when `TrainConfig.compile=True`, `train.py` **always** applies `torch._dynamo.maybe_mark_dynamic`
+on the `(B,T)` dims of `input_ids`, `labels`, and `attention_mask`. There is no separate flag for this;
+set `TrainConfig.compile=True` in `models/config.py` to enable compile + dynamic marking.
+
+### Step 3: Verify recompiles are gone
 
 Run a short training slice with:
 ```
-TORCH_LOGS="recompiles,guards" python train.py --compile True --compile_dynamic_shapes True ...
+TORCH_LOGS="recompiles,guards" python train.py ...
 ```
-and confirm there are no recurring “Recompiling” messages after warmup.
+and confirm there are no recurring “Recompiling” messages after warmup (with `TrainConfig.compile=True`).
+
+### Step 4: Keep MoMH block-mask construction outside compiled regions
+
+When MoMH is enabled, building the block mask inside a compiled decoder graph causes a graph break. In this repo,
+the VLM wrapper now builds the prefill block mask and passes it to the decoder. If you call `model.decoder(...)`
+directly, you can still trigger a graph break unless you supply `prefill_block_mask`.
 
 ## Failure Modes
 
@@ -67,8 +85,11 @@ and confirm there are no recurring “Recompiling” messages after warmup.
 |-------------|-----|----------------|
 | Still recompiles | Another dynamic axis changed (e.g. image tile count) | Bucket/pad or tensorize images |
 | `mark_dynamic` errors | Dim specialized to a constant | Prefer `maybe_mark_dynamic` |
+| Graph break in MoMH prefill | Block-mask creation inside compiled decoder | Build mask in VLM wrapper and pass in |
+| Long compile times | Full-model compile or dynamic=True everywhere | Use regional compile and limit dynamic dims |
 
 ## References
 
 - Related reports: `training_reports/2026-01-30_torch-compile_dynamic-shapes_and_benchmark.md`
 - Related skills: `torch-compile-dynamic-shapes`, `torch-compile-dynamic-metadata-propagation`
+- Code: `train.py` (regional compile), `models/vision_language_model.py` (MoMH block-mask build)
