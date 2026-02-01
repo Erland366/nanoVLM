@@ -99,6 +99,70 @@ def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
     return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
+def _is_fsdp2(train_cfg) -> bool:
+    return str(train_cfg.distributed_backend).lower() == "fsdp2"
+
+def _apply_fsdp2(model, train_cfg):
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    fsdp_kwargs = {"reshard_after_forward": train_cfg.fsdp2_reshard_after_forward}
+    if train_cfg.fsdp2_mixed_precision:
+        fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+
+    if hasattr(model, "decoder") and hasattr(model.decoder, "blocks"):
+        for block in model.decoder.blocks:
+            fully_shard(block, **fsdp_kwargs)
+        fully_shard(model.decoder, **fsdp_kwargs)
+
+    if hasattr(model, "vision_encoder") and hasattr(model.vision_encoder, "blocks"):
+        for block in model.vision_encoder.blocks:
+            fully_shard(block, **fsdp_kwargs)
+        fully_shard(model.vision_encoder, **fsdp_kwargs)
+
+    if hasattr(model, "MP"):
+        fully_shard(model.MP, **fsdp_kwargs)
+
+    fully_shard(model, **fsdp_kwargs)
+    return model
+
+@contextlib.contextmanager
+def _maybe_no_sync(model, enabled: bool):
+    if not enabled:
+        yield
+        return
+    if hasattr(model, "set_requires_gradient_sync"):
+        model.set_requires_gradient_sync(False)
+        try:
+            yield
+        finally:
+            model.set_requires_gradient_sync(True)
+        return
+    if hasattr(model, "no_sync"):
+        with model.no_sync():
+            yield
+        return
+    yield
+
+def _unwrap_model(model):
+    return getattr(model, "_orig_mod", model)
+
+def _save_fsdp2_checkpoint(model, save_directory: str):
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    from models.vision_language_model import VisionLanguageModel
+
+    base_model = _unwrap_model(model)
+    state_dict = get_model_state_dict(
+        base_model,
+        options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+    )
+    if is_master():
+        VisionLanguageModel.save_pretrained_state_dict(base_model.cfg, state_dict, save_directory)
+    if is_dist():
+        dist.barrier()
+
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
     max_training_steps = f"{train_cfg.max_training_steps}"
@@ -295,6 +359,11 @@ def get_lr(it, max_lr, max_steps):
 def train(train_cfg, vlm_cfg):
     train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(train_cfg, vlm_cfg)
 
+    if _is_fsdp2(train_cfg) and not is_dist():
+        raise RuntimeError("FSDP2 requires torchrun/distributed launch (RANK/WORLD_SIZE).")
+    if is_dist() and str(train_cfg.distributed_backend).lower() not in {"ddp", "fsdp2"}:
+        raise ValueError(f"Unsupported distributed_backend: {train_cfg.distributed_backend}")
+
     if is_dist():
         print("Rank", get_rank(), "Waiting for all workers to get dataloaders...")
         if is_master():
@@ -305,9 +374,10 @@ def train(train_cfg, vlm_cfg):
 
     run_name = get_run_name(train_cfg, vlm_cfg)
     if train_cfg.log_wandb and is_master():
+        wandb_project = getattr(train_cfg, "wandb_project", None) or "nanoVLM"
         run = wandb.init(
             entity=train_cfg.wandb_entity,
-            project="nanoVLM",
+            project=wandb_project,
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -368,13 +438,19 @@ def train(train_cfg, vlm_cfg):
     
     print(f"Using device: {device}")
     model.to(device)
-    
-    if train_cfg.compile:
+
+    if train_cfg.compile and (not is_dist() or not _is_fsdp2(train_cfg)):
         model = torch.compile(model)
-    if is_dist():
+    if is_dist() and _is_fsdp2(train_cfg):
+        print("Wrapping model for FSDP2")
+        model = _apply_fsdp2(model, train_cfg)
+        print("Model wrapped for FSDP2")
+    if is_dist() and not _is_fsdp2(train_cfg):
         print("Wrapping model for DDP")
         model = wrap_model(model)
         print("Model wrapped for DDP")
+    if train_cfg.compile and is_dist() and _is_fsdp2(train_cfg):
+        model = torch.compile(model)
 
     epoch_times = []
     best_val_loss = float('inf')
@@ -424,12 +500,14 @@ def train(train_cfg, vlm_cfg):
             # When using DDP with gradient accumulation,
             # skip gradient synchronization on intermediate steps to save time.
             # Gradients only need to be synced at the end of each accumulation cycle.
-            if (is_dist()
-                and train_cfg.gradient_accumulation_steps > 1
-                and not is_update_step):
-                context = model.no_sync()
-            else:
-                context = contextlib.nullcontext()
+            context = _maybe_no_sync(
+                model,
+                enabled=(
+                    is_dist()
+                    and train_cfg.gradient_accumulation_steps > 1
+                    and not is_update_step
+                ),
+            )
 
             fw_bw_start = time.time()
             autocast_context = torch.autocast(
@@ -530,8 +608,13 @@ def train(train_cfg, vlm_cfg):
                     if is_master():
                         # Save a checkpoint for this evaluation step
                         checkpoint_path_step = os.path.join(vlm_cfg.vlm_checkpoint_path, run_name, f"step_{global_step}")
-                        save_model = model.module if is_dist() else model # unwrap the model for saving if DDP
-                        save_model.save_pretrained(save_directory=checkpoint_path_step)
+                        if is_dist() and _is_fsdp2(train_cfg):
+                            _save_fsdp2_checkpoint(model, checkpoint_path_step)
+                        else:
+                            save_model = _unwrap_model(model)
+                            if isinstance(save_model, DistributedDataParallel):
+                                save_model = save_model.module
+                            save_model.save_pretrained(save_directory=checkpoint_path_step)
 
                         if train_cfg.use_lmms_eval and global_step % (train_cfg.eval_interval*2) == 0:
                             # Submit evaluation job
@@ -691,6 +774,9 @@ def main():
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--compile_dynamic_shapes', type=bool, help='With torch.compile: mark (B,T) as dynamic to reduce recompilation on variable batch/seq lengths')
+    parser.add_argument('--distributed_backend', type=str, choices=['ddp', 'fsdp2'], help='Distributed backend when running under torchrun')
+    parser.add_argument('--fsdp2_mixed_precision', type=bool, help='Enable FSDP2 mixed precision policy (bf16 params, fp32 reduce)')
+    parser.add_argument('--fsdp2_reshard_after_forward', type=bool, help='FSDP2 reshard_after_forward (default: True)')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
@@ -704,6 +790,8 @@ def main():
 
     vlm_cfg = config.VLMConfig()
     train_cfg = config.TrainConfig()
+    if hasattr(train_cfg, "pack_sequences"):
+        train_cfg.use_packing = bool(train_cfg.pack_sequences)
 
     if args.lr_mp is not None:
         train_cfg.lr_mp = args.lr_mp
@@ -717,6 +805,12 @@ def main():
         train_cfg.compile = args.compile
     if args.compile_dynamic_shapes is not None:
         train_cfg.compile_dynamic_shapes = args.compile_dynamic_shapes
+    if args.distributed_backend is not None:
+        train_cfg.distributed_backend = args.distributed_backend
+    if args.fsdp2_mixed_precision is not None:
+        train_cfg.fsdp2_mixed_precision = args.fsdp2_mixed_precision
+    if args.fsdp2_reshard_after_forward is not None:
+        train_cfg.fsdp2_reshard_after_forward = args.fsdp2_reshard_after_forward
     if args.no_log_wandb is True:
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:

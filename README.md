@@ -85,6 +85,28 @@ python train.py
 ```
 which will use the default `models/config.py`.
 
+Default config highlights (see `models/config.py` for full details):
+- Smaller ViT/LM (256-dim ViT, 384-dim LM, 1024 max sequence length).
+- Dataset defaults to `patrickamadeus/the_cauldron` with `config:sample_1pct`.
+
+### Distributed training (DDP / FSDP2)
+
+DDP is the default when you launch under `torchrun`. To enable FSDP2 (fully_shard), pass `--distributed_backend fsdp2`.
+
+```bash
+# DDP (default)
+torchrun --nproc_per_node=8 train.py
+
+# FSDP2
+torchrun --nproc_per_node=8 train.py --distributed_backend fsdp2
+```
+
+Optional FSDP2 flags:
+- `--fsdp2_mixed_precision True` (bf16 params, fp32 reduce)
+- `--fsdp2_reshard_after_forward False` (trade memory for fewer all-gathers)
+
+Note: `torch.compile` + FSDP2 is experimental here; disable `--compile` if you hit errors.
+
 ### torch.compile + dynamic batch/seq
 
 If you enable `torch.compile` in `train.py` and your dataloader produces variable batch sizes (e.g. because the collator drops too-long samples), `torch.compile` can recompile on each new batch shape.
@@ -106,6 +128,16 @@ Write results to JSONL (default `benchmark_results/train_step.jsonl`) and compar
 source .venv/bin/activate
 python eval/benchmark_train_step.py --mode synthetic --momh --out-jsonl benchmark_results/train_step.jsonl
 python eval/benchmark_train_step.py --mode synthetic --no-momh --out-jsonl benchmark_results/train_step.jsonl
+```
+
+FSDP2 benchmark (multi-GPU, logs from rank 0 only, tokens/s reported as global):
+
+```bash
+source .venv/bin/activate
+torchrun --nproc_per_node=8 eval/benchmark_train_step.py \
+  --mode synthetic \
+  --fsdp2 \
+  --out-jsonl benchmark_results/train_step.jsonl
 ```
 
 #### Shape-sweep (variable batch/seq)

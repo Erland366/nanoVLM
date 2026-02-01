@@ -16,7 +16,7 @@ from data.processors import get_tokenizer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_model, save_model
+from safetensors.torch import load_model, save_file, save_model
 
 class VisionLanguageModel(nn.Module):
     def __init__(self, cfg: VLMConfig, load_backbone=True, *, tokenizer=None):
@@ -286,6 +286,18 @@ class VisionLanguageModel(nn.Module):
 
         # Save weights as safetensors
         save_model(self, os.path.join(save_directory, "model.safetensors"))
+
+    @staticmethod
+    def save_pretrained_state_dict(cfg: VLMConfig, state_dict: dict, save_directory: str) -> None:
+        """
+        Save a precomputed (full) state dict with the model config.
+        Intended for FSDP2 full-state checkpoints gathered on rank 0.
+        """
+        os.makedirs(save_directory, exist_ok=True)
+        with open(os.path.join(save_directory, "config.json"), "w") as f:
+            f.write(json.dumps(asdict(cfg), indent=4))
+        cpu_state = {k: v.detach().cpu() for k, v in state_dict.items()}
+        save_file(cpu_state, os.path.join(save_directory, "model.safetensors"))
 
     def push_to_hub(self, repo_id: str, private: bool = False) -> None:
         """

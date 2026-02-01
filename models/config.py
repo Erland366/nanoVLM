@@ -3,39 +3,39 @@ from dataclasses import dataclass, field
 
 @dataclass
 class VLMConfig:
-    vit_hidden_dim: int = 768
+    vit_hidden_dim: int = 256
     vit_inter_dim: int = 4 * vit_hidden_dim
     vit_patch_size: int = 16
-    vit_img_size: int = 512
-    vit_n_heads: int = 12
+    vit_img_size: int = 128
+    vit_n_heads: int = 4
     vit_dropout: float = 0.0
-    vit_n_blocks: int = 12
+    vit_n_blocks: int = 4
     vit_ln_eps: float = 1e-6
     vit_cls_flag: bool = False
     vit_model_type: str = 'google/siglip2-base-patch16-512'
 
-    lm_hidden_dim: int = 960
-    lm_inter_dim: int = 2560
+    lm_hidden_dim: int = 384
+    lm_inter_dim: int = 1024
     lm_rms_eps: float = 1e-5
     lm_re_base: int = 100000
-    lm_max_position_embeddings: int = 8192
+    lm_max_position_embeddings: int = 1024
     lm_base_vocab_size: int = 49152
     extra_token_amount: int = 66  # Number of extra tokens for the VLM (image start, image end, image token)
     lm_vocab_size: int = lm_base_vocab_size + extra_token_amount # Not a great way to do this, but it works for now (vlm_extra_tokens cannot be a dict, since this is mutable, and a Field has no len() function)
-    lm_n_heads: int = 15
-    lm_n_kv_heads: int = 5
+    lm_n_heads: int = 6
+    lm_n_kv_heads: int = 2
     lm_dropout: float = 0.0
-    lm_n_blocks: int = 32
+    lm_n_blocks: int = 8
     lm_attn_scaling: float = 1.0
-    lm_max_length: int = 4096
+    lm_max_length: int = 1024
     lm_use_tokens: bool = False # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
     lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
-    lm_model_type: str = 'HuggingFaceTB/SmolLM2-360M-Instruct' #'HuggingFaceTB/SmolLM2-135M' #
-    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-360M-Instruct'
+    lm_model_type: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
+    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
     lm_chat_template: str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
     mp_pixel_shuffle_factor: int = 4
-    mp_image_token_length: int = 64
+    mp_image_token_length: int = 4
 
     # Mixture of Modality Heads (MoMH) config
     momh_enabled: bool = True
@@ -43,7 +43,7 @@ class VLMConfig:
     momh_head_pct_text: float = 0.3    # 30% of heads for T->T only
     # Remaining 50% (1 - vision - text) for VT->VT cross-modal
 
-    max_img_size: int = 2048
+    max_img_size: int = 256
     resize_to_max_side_len: bool = True
 
     vlm_extra_tokens: dict[str, str] = field(default_factory=lambda: {"image_token": "<|image|>", "global_image_token": "<|global_image|>",
@@ -56,42 +56,99 @@ class VLMConfig:
       "r7c1": "<row_7_col_1>", "r7c2": "<row_7_col_2>", "r7c3": "<row_7_col_3>", "r7c4": "<row_7_col_4>", "r7c5": "<row_7_col_5>", "r7c6": "<row_7_col_6>", "r7c7": "<row_7_col_7>", "r7c8": "<row_7_col_8>",
       "r8c1": "<row_8_col_1>", "r8c2": "<row_8_col_2>", "r8c3": "<row_8_col_3>", "r8c4": "<row_8_col_4>", "r8c5": "<row_8_col_5>", "r8c6": "<row_8_col_6>", "r8c7": "<row_8_col_7>", "r8c8": "<row_8_col_8>"})
     vlm_load_backbone_weights: bool = False  # Train from scratch for MoMH (pretrained weights incompatible with restricted attention)
-    vlm_checkpoint_path: str = 'checkpoints'
+    vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
     hf_repo_name: str = 'nanoVLM'
 
 
 @dataclass
 class TrainConfig:
-    lr_mp: float = 1e-3  # Pretraining from scratch
-    lr_vision_backbone: float = 1e-4  # Pretraining from scratch
-    lr_language_backbone: float = 1e-4  # Pretraining from scratch
-    val_size: int = 50000
-    batch_size: int = 1  # Reduced for MoMH (disabled packing uses more memory)
-    gradient_accumulation_steps: int = 8
-    max_grad_norm: float = 1.0
-    eval_in_epochs: bool = True
-    eval_interval: int = 500
-    stats_log_interval: int = 100
-    max_training_steps: int = 40000
-    max_images_per_example: int = 4
-    max_images_per_knapsack: int = 18
-    max_sample_length: int = 4096
+    lr_mp: float = 5e-5
+    lr_vision_backbone: float = 1e-5
+    lr_language_backbone: float = 1e-5
     compile: bool = False
     # When using torch.compile, allow varying batch size / seq length without recompilation.
     # This uses torch._dynamo.maybe_mark_dynamic on (B, T) dims for input_ids/labels/attention_mask.
     compile_dynamic_shapes: bool = False
-    resume_from_vlm_checkpoint: bool = False # Indicate if the training should be resumed from a checkpoint of the whole VLM or you want to start from scratch
-    train_dataset_path: str = 'HuggingFaceM4/FineVision_concat_shuffled_2'
-    train_dataset_name: tuple[str, ...] = ("default", ) #('allava_laion', 'allava_vflan', 'cambrian(filtered)_processed', 'LLaVA_Instruct_150K', 'mmevol', 'sharegpt4o', 'sharegpt4v(coco)', 'sharegpt4v(knowledge)', 'sharegpt4v(llava)', 'sharegpt4v(sam)') # 'vision_flan(filtered)', 'lvis_instruct4v',
-    stream_dataset: bool = True
-    use_packing: bool = False  # Use ConstantLengthDataset for packing multiple samples (disabled for MoMH)
+    resume_from_vlm_checkpoint: bool = False
+
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+
+    train_dataset_path: str = "patrickamadeus/the_cauldron"
+    train_dataset_name: tuple[str, ...] = ("config:sample_1pct",)
+    use_custom_dataset: bool = False
+    stream_custom_train: bool = True
+    stream_custom_val: bool = True
+    custom_train_dataset_path: str = "jxie/coco_captions"
+    custom_train_dataset_split: str = "train"
+    custom_train_dataset_img_col: str = "image"
+    custom_train_dataset_prompt_col: str | None = None
+    custom_train_dataset_target_txt_col: str = "caption"
+    custom_val_dataset_path: str = "patrickamadeus/coco_caption_val_unique"
+    custom_val_dataset_split: str = "val"
+    custom_val_dataset_img_col: str = "image"
+    custom_val_dataset_prompt_col: str | None = None
+    custom_val_dataset_target_txt_col: str = "caption"
+    custom_input_prompt: str = "Describe the image."
+
+    stream_dataset: bool = False
+    data_num_workers: int = 4
+    val_num_workers: int = 4
+    interleave_datasets: bool = False
+    interleave_probabilities: list[float] | None = None
+    interleave_stopping_strategy: str = "all_exhausted"
+    streaming_shuffle_buffer: int = 0
+    stratified_val_split: bool = False
+    data_cutoff_idx: int | None = None
+
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1
     visual_dependency_min_rating: int = 1
     formatting_min_rating: int = 1
-    wandb_entity: str = "erlandpg" # Indicate the entity to log to in wandb
+    max_images_per_example: int = 10
+    max_images_per_knapsack: int = 18
+    pack_sequences: bool = False
+    use_packing: bool = False  # Backward-compatible alias for pack_sequences.
+    max_sample_length: int = 1024
+
+    max_training_steps: int = 30000
+    max_grad_norm: float = 1.0
+    enable_validation: bool = True
+    val_size: int = 5000
+    max_val_batches: int = 5000
+    eval_in_epochs: bool = False
+    eval_interval: int = 500
+    stats_log_interval: int = 10
+
     log_wandb: bool = True
-    use_lmms_eval: bool = True # Use lmms-eval for evaluation
-    lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
+    wandb_entity: str = ""
+    wandb_project: str = "dualtower"
+    prefix_run_name: str | None = None
+    save_code_cfg: bool = True
+    save_model_every_n_steps: int = 500
+    save_local: bool = False
+    local_model_cp_path: str = "checkpoints/vanilla-cauldron"
+    save_hf: bool = False
+    hf_model_cp_path: str = "patrickamadeus/vanilla-cauldron"
+
+    use_lmms_eval: bool = False
+    lmms_eval_tasks: str = "mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa"
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
+
+    # Distributed backend choice when launched under torchrun.
+    # Options: "ddp" (default) or "fsdp2".
+    distributed_backend: str = "ddp"
+    # FSDP2 options (only used when distributed_backend == "fsdp2").
+    fsdp2_reshard_after_forward: bool = True
+    fsdp2_mixed_precision: bool = False
+
+
+@dataclass
+class GlobalConfig:
+    seed: int = 42
+    hf_home: str | None = None
+    log_dir: str = "logs"
+    model_dir: str = "checkpoints"
+    eval_dir: str = "evals"
+    prefix_run_name: str | None = None

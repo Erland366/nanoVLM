@@ -4,12 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import time
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy
 import torch
+import torch.distributed as dist
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in os.sys.path:
@@ -60,6 +64,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
     p.add_argument("--momh", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--compile", action="store_true", help="torch.compile the full VLM module (in addition to flex_attention compilation).")
+    p.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=False, help="Expect torchrun-style env vars (RANK/WORLD_SIZE).")
+    p.add_argument("--fsdp2", action=argparse.BooleanOptionalAction, default=False, help="Use FSDP2 (fully_shard) wrapping.")
+    p.add_argument("--fsdp2-mixed-precision", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--fsdp2-reshard-after-forward", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--seq-len", type=int, default=2048)
@@ -69,6 +77,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--seed", type=int, default=0)
 
     p.add_argument(
         "--vary-batch-sizes",
@@ -120,6 +129,77 @@ def _autocast_dtype(args: argparse.Namespace) -> torch.dtype:
     if args.dtype == "bf16":
         return torch.bfloat16
     return torch.float16
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    numpy.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _init_dist_if_needed(args: argparse.Namespace) -> tuple[bool, int]:
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=30))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        return True, local_rank
+    if args.distributed:
+        raise RuntimeError("Distributed benchmark requested but RANK/WORLD_SIZE not set. Use torchrun.")
+    return False, 0
+
+
+def _apply_fsdp2(model, args: argparse.Namespace):
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    fsdp_kwargs = {"reshard_after_forward": bool(args.fsdp2_reshard_after_forward)}
+    if args.fsdp2_mixed_precision:
+        fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+
+    if hasattr(model, "decoder") and hasattr(model.decoder, "blocks"):
+        for block in model.decoder.blocks:
+            fully_shard(block, **fsdp_kwargs)
+        fully_shard(model.decoder, **fsdp_kwargs)
+
+    if hasattr(model, "vision_encoder") and hasattr(model.vision_encoder, "blocks"):
+        for block in model.vision_encoder.blocks:
+            fully_shard(block, **fsdp_kwargs)
+        fully_shard(model.vision_encoder, **fsdp_kwargs)
+
+    if hasattr(model, "MP"):
+        fully_shard(model.MP, **fsdp_kwargs)
+
+    fully_shard(model, **fsdp_kwargs)
+    return model
+
+
+def _collect_metadata(device: torch.device, args: argparse.Namespace) -> dict[str, Any]:
+    gpu_name = None
+    if device.type == "cuda" and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(device)
+    return {
+        "seed": int(args.seed),
+        "matmul_precision": torch.get_float32_matmul_precision(),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "gpu_name": gpu_name,
+        "command": " ".join(os.sys.argv),
+        "env": {
+            "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "TORCH_LOGS": os.environ.get("TORCH_LOGS"),
+            "NCCL_DEBUG": os.environ.get("NCCL_DEBUG"),
+        },
+        "distributed": dist.is_available() and dist.is_initialized(),
+        "world_size": dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1,
+        "rank": dist.get_rank() if dist.is_available() and dist.is_initialized() else 0,
+        "fsdp2": bool(args.fsdp2),
+    }
 
 
 def _make_synthetic_batch(
@@ -368,9 +448,21 @@ def _ensure_parent(path_str: str) -> Path:
 
 def main(argv: list[str]) -> int:
     args = _parse_args(argv)
-    device = torch.device(args.device)
+    is_dist, local_rank = _init_dist_if_needed(args)
+    if is_dist and not args.fsdp2:
+        raise RuntimeError("Distributed env detected; use --fsdp2 for a sharded benchmark.")
+
+    if is_dist:
+        if args.device != "cuda":
+            raise RuntimeError("FSDP2 benchmark requires --device=cuda.")
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(args.device)
+
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Requested --device=cuda but CUDA is not available.")
+
+    _seed_everything(args.seed)
 
     cfg = VLMConfig()
     cfg.momh_enabled = bool(args.momh)
@@ -385,9 +477,13 @@ def main(argv: list[str]) -> int:
         )
 
     model = VisionLanguageModel(cfg, load_backbone=False, tokenizer=tokenizer)
-    if args.compile:
+    if args.compile and not args.fsdp2:
         model = torch.compile(model)
     model.to(device)
+    if args.fsdp2:
+        model = _apply_fsdp2(model, args)
+    if args.compile and args.fsdp2:
+        model = torch.compile(model)
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -428,6 +524,10 @@ def main(argv: list[str]) -> int:
             steps=args.steps,
         )
 
+        metadata = _collect_metadata(device, args)
+        if metadata["distributed"]:
+            tokens_per_second *= metadata["world_size"]
+
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
@@ -449,16 +549,20 @@ def main(argv: list[str]) -> int:
         )
 
         out_path = _ensure_parent(args.out_jsonl)
-        record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **asdict(result)}
-        with out_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-
-        print(json.dumps(record, indent=2))
-        print(f"Wrote: {out_path}")
+        record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **asdict(result), "metadata": metadata}
+        if metadata["rank"] == 0:
+            with out_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            print(json.dumps(record, indent=2))
+            print(f"Wrote: {out_path}")
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
         return 0
 
     # Shape-sweep mode: run multiple shapes in a single process to surface recompiles.
     out_path = _ensure_parent(args.out_jsonl)
+    metadata = _collect_metadata(device, args)
     for batch_size, seq_len in variants:
         if args.mode == "synthetic":
             batch = _make_synthetic_batch(
@@ -493,6 +597,9 @@ def main(argv: list[str]) -> int:
             steps=args.shape_steps,
         )
 
+        if metadata["distributed"]:
+            tokens_per_second *= metadata["world_size"]
+
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
@@ -513,13 +620,16 @@ def main(argv: list[str]) -> int:
             training_vram_mb=training_vram_mb,
         )
 
-        record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **asdict(result)}
-        with out_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-
-        print(json.dumps(record, indent=2))
+        record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), **asdict(result), "metadata": metadata}
+        if metadata["rank"] == 0:
+            with out_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            print(json.dumps(record, indent=2))
         print(f"Wrote: {out_path}")
 
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
     return 0
 
 
