@@ -14,6 +14,7 @@ import torch.optim as optim
 from statistics import mean
 from dataclasses import asdict
 from datetime import timedelta
+from dotenv import load_dotenv
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
@@ -95,6 +96,23 @@ def dist_mean_scalar(x: float | int) -> float:
     t /= dist.get_world_size()
     return t.item()
 
+def maybe_login_services(train_cfg):
+    load_dotenv()
+
+    if train_cfg.log_wandb:
+        wandb_key = os.getenv("WANDB_API_KEY")
+        if wandb_key:
+            wandb.login(key=wandb_key, relogin=True)
+        else:
+            print("Warning: WANDB_API_KEY not set; wandb login skipped.")
+
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if hf_token:
+        from huggingface_hub import login
+        login(token=hf_token)
+    else:
+        print("Warning: HF_TOKEN/HUGGINGFACE_HUB_TOKEN not set; Hugging Face login skipped.")
+
 def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
     return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
@@ -111,7 +129,10 @@ def get_run_name(train_cfg, vlm_cfg):
 
     # Use momhVLM prefix when MoMH is enabled
     prefix = "momhVLM" if getattr(vlm_cfg, 'momh_enabled', False) else "nanoVLM"
-    return f"{prefix}_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
+    run_name = f"{prefix}_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
+    if train_cfg.prefix_run_name:
+        return f"{train_cfg.prefix_run_name}_{run_name}"
+    return run_name
 
 def get_dataloaders(train_cfg, vlm_cfg):
     print(f"Getting dataloaders from {train_cfg.train_dataset_path}")
@@ -202,7 +223,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
     )
 
     # Optionally wrap with ConstantLengthDataset for packing multiple samples
-    if train_cfg.use_packing:
+    if train_cfg.pack_sequences:
         train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
                                             max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
         val_dataset = ConstantLengthDataset(val_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
@@ -223,7 +244,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             train_dataset,
             batch_size=train_cfg.batch_size,    # =per device BS in DDP
             collate_fn=vqa_collator,
-            num_workers=3,
+            num_workers=train_cfg.data_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -234,7 +255,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             val_dataset,
             batch_size=train_cfg.batch_size,
             collate_fn=vqa_collator,
-            num_workers=1,
+            num_workers=train_cfg.val_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -245,7 +266,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             train_dataset,
             batch_size=train_cfg.batch_size,    # =per device BS in DDP
             collate_fn=vqa_collator,
-            num_workers=3,
+            num_workers=train_cfg.data_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -257,7 +278,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             val_dataset,
             batch_size=train_cfg.batch_size,
             collate_fn=vqa_collator,
-            num_workers=1,
+            num_workers=train_cfg.val_num_workers,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
@@ -304,18 +325,28 @@ def train(train_cfg, vlm_cfg):
             print("All workers have gotten dataloaders.")
 
     run_name = get_run_name(train_cfg, vlm_cfg)
+    tokens_step_metric = "tokens/consumed"
+    lmms_eval_step = "<lmms-eval-step>"
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
             entity=train_cfg.wandb_entity,
-            project="nanoVLM",
+            project=train_cfg.wandb_project,
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
             },
             name=run_name,
         )
+        if train_cfg.wandb_xaxis_tokens:
+            run.define_metric(tokens_step_metric)
+            run.define_metric("batch_loss", step_metric=tokens_step_metric)
+            run.define_metric("val_loss", step_metric=tokens_step_metric)
+            run.define_metric("grad_norm", step_metric=tokens_step_metric)
+            run.define_metric("training_stats/*", step_metric=tokens_step_metric)
+            run.define_metric("epoch_*", step_metric=tokens_step_metric)
+            lmms_eval_step = tokens_step_metric
+
         # Define a custom x-axis for lmms-eval metrics
-        lmms_eval_step = "<lmms-eval-step>"
         run.define_metric(name="lmms_eval/*", step_metric=lmms_eval_step)
 
     # Initialize model
@@ -382,6 +413,7 @@ def train(train_cfg, vlm_cfg):
     logged_eval_steps = set()
     global_step = 0
     epoch = 0
+    tokens_processed_global = 0
     
     # Training stats accumulators
     accumulated_stats = {
@@ -476,6 +508,7 @@ def train(train_cfg, vlm_cfg):
 
             num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens
             total_tokens_processed += num_tokens
+            tokens_processed_global += num_tokens
             post_process_time = time.time() - post_process_start
 
             images_per_sample = [len(image_pack) for image_pack in images]
@@ -491,7 +524,7 @@ def train(train_cfg, vlm_cfg):
             accumulated_stats['post_process_time'].append(post_process_time)
             accumulated_stats['images_per_sample'].extend(images_per_sample)
             
-            if train_cfg.eval_in_epochs and global_step % train_cfg.eval_interval == 0 and is_update_step:
+            if train_cfg.enable_validation and train_cfg.eval_in_epochs and global_step % train_cfg.eval_interval == 0 and is_update_step:
                 print("Starting evaluation")
                 model.eval()
                 if device == "cuda":
@@ -500,7 +533,7 @@ def train(train_cfg, vlm_cfg):
                     total_val_loss = 0
                     val_batches = 0
                     for batch in synchronized_dataloader_step(iter_val_loader, is_dist()):
-                        if val_batches > 64:
+                        if train_cfg.max_val_batches is not None and val_batches >= train_cfg.max_val_batches:
                             print(f"Evaluated {val_batches} batches")
                             break
                         images = batch["images"]
@@ -526,6 +559,10 @@ def train(train_cfg, vlm_cfg):
                     avg_val_loss = total_val_loss / val_batches if val_batches > 0 else 0
                     avg_val_loss = mean(dist_gather(avg_val_loss)) if is_dist() else avg_val_loss
 
+                    tokens_step_value = None
+                    if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+                        tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+
                     checkpoint_path_step = ""
                     if is_master():
                         # Save a checkpoint for this evaluation step
@@ -547,7 +584,10 @@ def train(train_cfg, vlm_cfg):
                     if is_master():
                         print(f"Step: {global_step}, Val Loss: {avg_val_loss:.4f}, Tokens/s: {tokens_per_second:.2f}")
                         if train_cfg.log_wandb:
-                            run.log({"val_loss": avg_val_loss}, step=global_step)
+                            log_payload = {"val_loss": avg_val_loss}
+                            if tokens_step_value is not None:
+                                log_payload[tokens_step_metric] = tokens_step_value
+                            run.log(log_payload, step=global_step)
 
                 model.train()
 
@@ -578,11 +618,18 @@ def train(train_cfg, vlm_cfg):
                 else:
                     stats['min_images_per_sample'] = min(accumulated_stats['images_per_sample'])
                 
+                tokens_step_value = None
+                if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+                    tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
-                    run.log({
+                    log_payload = {
                         **{f"training_stats/{key}": value for key, value in stats.items()},
-                    }, step=global_step)
+                    }
+                    if tokens_step_value is not None:
+                        log_payload[tokens_step_metric] = tokens_step_value
+                    run.log(log_payload, step=global_step)
 
                     # Check for and log new lmms-eval results
                     eval_results_dir = os.path.join('eval_results', run_name)
@@ -603,7 +650,10 @@ def train(train_cfg, vlm_cfg):
                                     lmms_results = eval_data.get('results', {})
                                     if lmms_results:
                                         metrics = {f"lmms_eval/{key}": value for key, value in lmms_results.items()}
-                                        metrics[lmms_eval_step] = eval_data['global_step']
+                                        if tokens_step_value is not None:
+                                            metrics[tokens_step_metric] = tokens_step_value
+                                        else:
+                                            metrics[lmms_eval_step] = eval_data['global_step']
                                         if logged_results_count > 0:
                                             print(f"Logging more than one lmms-eval result for step {global_step}, try to avoid this.")
                                         run.log(metrics, step=global_step + logged_results_count)
@@ -626,13 +676,20 @@ def train(train_cfg, vlm_cfg):
                     batch_loss_gathered = dist_mean_scalar(batch_loss)
                 else:
                     batch_loss_gathered = batch_loss
+
+                tokens_step_value = None
+                if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+                    tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
                     
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
-                    run.log({
+                    log_payload = {
                         "batch_loss": batch_loss_gathered,
                         **({"grad_norm": grad_norm} if train_cfg.max_grad_norm is not None else {})
-                    }, step=global_step)
+                    }
+                    if tokens_step_value is not None:
+                        log_payload[tokens_step_metric] = tokens_step_value
+                    run.log(log_payload, step=global_step)
                 
             if is_update_step:
                 global_step += 1
@@ -652,12 +709,20 @@ def train(train_cfg, vlm_cfg):
         # gather and sum total_tokens_processed across all ranks if DDP
         total_tokens_processed = sum(dist_gather(total_tokens_processed)) if is_dist() else total_tokens_processed  
         epoch_tokens_per_second = total_tokens_processed / epoch_duration
+        tokens_step_value = None
+        if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+            tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
 
         if is_master():
             if train_cfg.log_wandb:
-                run.log({"epoch_loss": avg_train_loss,
-                         "epoch_duration": epoch_duration,
-                         "epoch_tokens_per_second": epoch_tokens_per_second})
+                log_payload = {
+                    "epoch_loss": avg_train_loss,
+                    "epoch_duration": epoch_duration,
+                    "epoch_tokens_per_second": epoch_tokens_per_second,
+                }
+                if tokens_step_value is not None:
+                    log_payload[tokens_step_metric] = tokens_step_value
+                run.log(log_payload, step=global_step)
 
             print(f"Epoch: {epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
 
@@ -738,6 +803,9 @@ def main():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         init_dist()
         PG_CPU = dist.new_group(backend="gloo")   # host‑RAM, zero GPU allocations
+
+    if is_master():
+        maybe_login_services(train_cfg)
 
     if is_master():
         print("--- VLM Config ---")

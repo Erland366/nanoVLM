@@ -85,6 +85,17 @@ python train.py
 ```
 which will use the default `models/config.py`.
 
+Optional: add a `.env` file with `WANDB_API_KEY` and `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`).
+`train.py` will load `.env` and log into W&B/Hugging Face automatically for the master process.
+
+Default config in this worktree targets a smaller LR-efficiency setup: 256-d ViT (patch16, img 128, 4 blocks),
+SmolLM2-135M-Instruct (384 hidden, 8 blocks, 1024 max length), and `patrickamadeus/the_cauldron` `config:sample_1pct`
+with batch size 1, grad accum 8, lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000.
+See `models/config.py` for the full defaults.
+
+To use consumed tokens as the W&B x-axis, set `TrainConfig.wandb_xaxis_tokens=True`. This logs `tokens/consumed`
+alongside training and validation metrics and uses it as the step metric.
+
 ### torch.compile + dynamic batch/seq
 
 If you enable `torch.compile` in `train.py` and your dataloader produces variable batch sizes (e.g. because the collator drops too-long samples), `torch.compile` can recompile on each new batch shape.

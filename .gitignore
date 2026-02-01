@@ -15,6 +15,7 @@ wandb/
 logs/
 *.csv
 .vscode
+.env
 
 resources
 
