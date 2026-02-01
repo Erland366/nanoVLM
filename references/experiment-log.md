@@ -30,6 +30,55 @@ scale after the scheduler for all LR groups, and logged `effective_tokens`, `eff
 
 **Details:** Added `TrainConfig.max_training_tokens` and `--max_training_tokens` to stop training once the
 global effective-token count reaches the requested budget.
+## 2026-02-02 — Retrospective: activation checkpointing + compile tradeoffs
+
+**Type:** Retrospective  
+**General description:** Summarized activation checkpointing benchmarks and compile/recompile behavior under shape sweeps.
+
+### Details
+
+- Benchmarked manual vs selective activation checkpointing (no compile) and selective activation checkpointing under `torch.compile` in synthetic mode at `batch_size=1`, `seq_len=1024`.
+- Selective AC under `torch.compile` requires `allow_cache_entry_mutation=True` to avoid cached‑tensor mutation errors; activation checkpointing now auto-selects selective when compile is enabled.
+- Shape sweeps with `(B,T)=(1,512)->(2,1024)` and `(4,128)->(8,64)` still triggered recompiles in `flex_attention.create_block_mask` and block forwards due to batch-size guards; no graph breaks observed.
+
+### Links
+
+- Report: `training_reports/activation-checkpointing-benchmark-2026-02-02.md`
+- Report: `training_reports/activation-checkpointing-compile-benchmark-2026-02-02.md`
+- Report: `training_reports/compile-reduce-overhead-2026-02-02.md`
+
+## 2026-02-02 — Activation checkpointing benchmark with torch.compile (default mode)
+
+**Type:** Retrospective  
+**General description:** Benchmarked no-AC vs selective AC under torch.compile with static shapes.
+
+### Details
+
+- Ran `eval/benchmark_train_step.py` in synthetic mode at batch_size=1, seq_len=1024 (warmup_steps=2, steps=5), `--compile-mode default`.
+- Selective AC reduced peak VRAM by ~8.2% with ~17.4% throughput loss vs no-AC.
+- Selective AC under torch.compile requires `allow_cache_entry_mutation=True` to avoid cached-tensor mutation errors.
+- Activation checkpointing now auto-selects **selective** when compile is enabled; otherwise it uses manual checkpointing.
+- Results saved to `benchmark_results/train_step_compile.jsonl`.
+
+### Links
+
+- Report: `training_reports/activation-checkpointing-compile-benchmark-2026-02-02.md`
+
+## 2026-02-02 — Activation checkpointing benchmark (manual vs selective)
+
+**Type:** Retrospective  
+**General description:** Benchmarked no activation checkpointing vs manual vs selective (matmul/attention) with static shapes.
+
+### Details
+
+- Ran `eval/benchmark_train_step.py` in synthetic mode at batch_size=1, seq_len=1024 (warmup_steps=2, steps=5).
+- Manual AC reduced peak VRAM by ~16.6% with ~19.2% throughput loss vs no-AC.
+- Selective AC reduced peak VRAM by ~12.4% with ~33.3% throughput loss vs no-AC.
+- Results saved to `benchmark_results/train_step.jsonl`.
+
+### Links
+
+- Report: `training_reports/activation-checkpointing-benchmark-2026-02-02.md`
 
 ## 2026-02-01 — Benchmark reflects train.py (no optimization flags)
 

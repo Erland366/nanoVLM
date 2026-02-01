@@ -147,7 +147,7 @@ def get_run_name(train_cfg, vlm_cfg):
     llm = f"{vlm_cfg.lm_model_type.split('/')[-1]}"
 
     # Use momhVLM prefix when MoMH is enabled
-    prefix = "momhVLM" if getattr(vlm_cfg, 'momh_enabled', False) else "nanoVLM"
+    prefix = "momhVLM" if getattr(vlm_cfg, "momh_enabled", False) else "nanoVLM"
     run_name = f"{prefix}_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
     if train_cfg.prefix_run_name:
         return f"{train_cfg.prefix_run_name}_{run_name}"
@@ -379,6 +379,15 @@ def train(train_cfg, vlm_cfg):
         model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
     else:
         model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+
+    use_selective_ac = bool(train_cfg.compile and vlm_cfg.activation_checkpointing)
+    if hasattr(model, "set_activation_checkpointing_mode"):
+        model.set_activation_checkpointing_mode(
+            use_selective=use_selective_ac,
+            allow_cache_entry_mutation=use_selective_ac,
+        )
+        if is_master() and use_selective_ac:
+            print("Using selective activation checkpointing under torch.compile (allow_cache_entry_mutation=True).")
     
     if is_master():
         print(f"nanoVLM initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
@@ -423,7 +432,20 @@ def train(train_cfg, vlm_cfg):
     
     print(f"Using device: {device}")
     model.to(device)
-    
+
+    if train_cfg.activation_memory_budget is not None:
+        if not 0.0 <= train_cfg.activation_memory_budget <= 1.0:
+            raise ValueError("activation_memory_budget must be between 0 and 1.")
+        if not hasattr(torch._dynamo.config, "activation_memory_budget"):
+            raise RuntimeError("activation_memory_budget is not supported in this PyTorch build.")
+        if train_cfg.compile:
+            torch._dynamo.config.activation_memory_budget = train_cfg.activation_memory_budget
+            if is_master():
+                print(f"Using activation_memory_budget={train_cfg.activation_memory_budget}")
+        else:
+            if is_master():
+                print("activation_memory_budget set but compile is disabled; ignoring.")
+
     if train_cfg.compile:
         compile_regions(model)
     if is_dist():
@@ -814,12 +836,16 @@ def main():
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
+    parser.add_argument('--activation_checkpointing', type=bool, help='Enable activation checkpointing for LM/VIT blocks')
+    parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
+    parser.add_argument('--momh_enabled', type=bool, help='Enable MoMH attention')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
     parser.add_argument('--max_training_tokens', type=int, help='Stop after this many effective tokens (non-padding)')
+    parser.add_argument('--pack_sequences', type=bool, help='Enable packing multiple samples per sequence')
     parser.add_argument('--effective_token_lr_scale', type=bool, help='Scale LR by effective token ratio each step')
     parser.add_argument('--effective_token_lr_exponent', type=float, help='Exponent for effective token LR scaling')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
@@ -842,6 +868,12 @@ def main():
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:
         train_cfg.compile = args.compile
+    if args.activation_checkpointing is not None:
+        vlm_cfg.activation_checkpointing = args.activation_checkpointing
+    if args.activation_memory_budget is not None:
+        train_cfg.activation_memory_budget = args.activation_memory_budget
+    if args.momh_enabled is not None:
+        vlm_cfg.momh_enabled = args.momh_enabled
     if args.no_log_wandb is True:
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:
@@ -850,6 +882,8 @@ def main():
         train_cfg.max_training_steps = args.max_training_steps
     if args.max_training_tokens is not None:
         train_cfg.max_training_tokens = args.max_training_tokens
+    if args.pack_sequences is not None:
+        train_cfg.pack_sequences = args.pack_sequences
     if args.effective_token_lr_scale is not None:
         train_cfg.effective_token_lr_scale = args.effective_token_lr_scale
     if args.effective_token_lr_exponent is not None:

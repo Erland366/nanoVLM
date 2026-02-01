@@ -12,7 +12,7 @@ class VLMConfig:
     vit_n_blocks: int = 4
     vit_ln_eps: float = 1e-6
     vit_cls_flag: bool = False
-    vit_model_type: str = 'google/siglip2-base-patch16-512'
+    vit_model_type: str = "google/siglip2-base-patch16-512"
 
     lm_hidden_dim: int = 384
     lm_inter_dim: int = 1024
@@ -30,9 +30,11 @@ class VLMConfig:
     lm_max_length: int = 1024
     lm_use_tokens: bool = False  # Use tokens or embeddings as LM input.
     lm_tie_weights: bool = True  # Tie LM head weight to token embeddings.
-    lm_model_type: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
-    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
-    lm_chat_template: str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+    lm_model_type: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    lm_tokenizer: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    lm_chat_template: str = (
+        "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+    )
 
     mp_pixel_shuffle_factor: int = 4
     mp_image_token_length: int = 4
@@ -42,6 +44,7 @@ class VLMConfig:
     momh_head_pct_vision: float = 0.2  # 20% of heads for V->V only
     momh_head_pct_text: float = 0.3    # 30% of heads for T->T only
     # Remaining 50% (1 - vision - text) for VT->VT cross-modal
+    activation_checkpointing: bool = False  # Enable LM/ViT activation checkpointing during training.
 
     max_img_size: int = 256
     resize_to_max_side_len: bool = True
@@ -67,8 +70,8 @@ class VLMConfig:
         "r8c5": "<row_8_col_5>", "r8c6": "<row_8_col_6>", "r8c7": "<row_8_col_7>", "r8c8": "<row_8_col_8>",
     })
     vlm_load_backbone_weights: bool = False  # Pretrained weights incompatible with restricted attention.
-    vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
-    hf_repo_name: str = 'nanoVLM'
+    vlm_checkpoint_path: str = "lusxvr/nanoVLM-230M-8k"
+    hf_repo_name: str = "nanoVLM"
 
 
 @dataclass
@@ -89,9 +92,10 @@ class TrainConfig:
     max_images_per_knapsack: int = 18
     max_sample_length: int = 1024
     compile: bool = False
+    activation_memory_budget: float | None = None
     resume_from_vlm_checkpoint: bool = False
-    train_dataset_path: str = 'patrickamadeus/the_cauldron'
-    train_dataset_name: tuple[str, ...] = ("sample_1pct", )
+    train_dataset_path: str = "patrickamadeus/the_cauldron"
+    train_dataset_name: tuple[str, ...] = ("sample_1pct",)
     use_custom_dataset: bool = False
     stream_custom_train: bool = True
     stream_custom_val: bool = True
@@ -115,7 +119,7 @@ class TrainConfig:
     streaming_shuffle_buffer: int = 0
     stratified_val_split: bool = False
     data_cutoff_idx: int | None = None
-    pack_sequences: bool = False  # Use ConstantLengthDataset for packing multiple samples.
+    pack_sequences: bool = False
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1
     visual_dependency_min_rating: int = 1
@@ -137,9 +141,9 @@ class TrainConfig:
     effective_token_lr_exponent: float = 0.5
     use_lmms_eval: bool = False
     lmms_eval_tasks: str = (
-        'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa'
+        "mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa"
     )
-    lmms_eval_limit: float = None
+    lmms_eval_limit: float | None = None
     lmms_eval_batch_size: int = 64
 
 

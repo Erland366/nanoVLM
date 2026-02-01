@@ -104,11 +104,40 @@ exponent with `TrainConfig.effective_token_lr_exponent` or `--effective_token_lr
 To cap training for a short run, use `--max_training_steps N` or `--max_training_tokens N` (effective tokens).
 If both are set, training stops when either limit is reached.
 
+For vanilla attention, disable MoMH with `--momh_enabled False`. To toggle sequence packing, use
+`--pack_sequences True|False`.
+
 ### torch.compile (regional) + dynamic batch/seq
 
 When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
 
 When compile is enabled, `train.py` always applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance. There is no separate flag for this.
+
+### Activation checkpointing (memory saving)
+
+To reduce training-time activation memory at the cost of extra compute, enable activation checkpointing:
+
+```bash
+python train.py --activation_checkpointing True
+```
+
+This applies checkpointing to the language-model blocks during training (not during decode/inference).
+
+#### Selective activation checkpointing (SAC)
+
+When **activation checkpointing** is enabled **and** `--compile True`, we automatically switch to
+**selective activation checkpointing** with the matmul/attention policy. If `--compile` is disabled,
+activation checkpointing uses the standard (manual) checkpointing behavior instead.
+
+#### Compile-time memory budget (SAC via torch.compile)
+
+When using `torch.compile`, you can enable the memory budget API:
+
+```bash
+python train.py --compile True --activation_memory_budget 0.5
+```
+
+This applies selective recomputation inside compiled regions. Budget 0 behaves like plain AC, 1 behaves like default compile.
 
 ### Training-step benchmark (Unsloth-style)
 
@@ -119,9 +148,12 @@ source .venv/bin/activate
 python eval/benchmark_train_step.py --mode synthetic --steps 10 --warmup-steps 3 --batch-size 1 --seq-len 2048
 ```
 
-<u>Important: this benchmark always reflects the **current `train.py` setup** (no optimization flags). All optimization changes must live in `train.py`, and the benchmark simply measures the current setup.</u>
+<u>Important: this benchmark defaults to the **current `train.py` setup**. You can still override compile via CLI flags, but all optimization changes should ultimately land in `train.py`.</u>
 
-The benchmark reports `compile_time_ms` when `TrainConfig.compile=True` (time for the first step that triggers compilation). To change compile settings, edit `models/config.py` (this benchmark reflects the current training setup).
+The benchmark reports `compile_time_ms` when compile is enabled (first step that triggers compilation). Use `--compile` to force compile on, and `--compile-mode {default,reduce-overhead,max-autotune}` to select the compile mode.
+
+Selective activation checkpointing under `torch.compile` enables `allow_cache_entry_mutation=True` to avoid cached-tensor mutation
+errors. This disables a correctness guard; use with care.
 
 Write results to JSONL (default `benchmark_results/train_step.jsonl`) and compare runs by toggling MoMH:
 
