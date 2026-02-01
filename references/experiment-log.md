@@ -14,6 +14,22 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-02 — Activation checkpointing benchmark (manual vs selective)
+
+**Type:** Retrospective  
+**General description:** Benchmarked no activation checkpointing vs manual vs selective (matmul/attention) with static shapes.
+
+### Details
+
+- Ran `eval/benchmark_train_step.py` in synthetic mode at batch_size=1, seq_len=1024 (warmup_steps=2, steps=5).
+- Manual AC reduced peak VRAM by ~16.6% with ~19.2% throughput loss vs no-AC.
+- Selective AC reduced peak VRAM by ~12.4% with ~33.3% throughput loss vs no-AC.
+- Results saved to `benchmark_results/train_step.jsonl`.
+
+### Links
+
+- Report: `training_reports/activation-checkpointing-benchmark-2026-02-02.md`
+
 ## 2026-02-01 — Benchmark reflects train.py (no optimization flags)
 
 **Type:** Observation  
