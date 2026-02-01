@@ -390,7 +390,20 @@ def train(train_cfg, vlm_cfg):
     
     print(f"Using device: {device}")
     model.to(device)
-    
+
+    if train_cfg.activation_memory_budget is not None:
+        if not 0.0 <= train_cfg.activation_memory_budget <= 1.0:
+            raise ValueError("activation_memory_budget must be between 0 and 1.")
+        if not hasattr(torch._dynamo.config, "activation_memory_budget"):
+            raise RuntimeError("activation_memory_budget is not supported in this PyTorch build.")
+        if train_cfg.compile:
+            torch._dynamo.config.activation_memory_budget = train_cfg.activation_memory_budget
+            if is_master():
+                print(f"Using activation_memory_budget={train_cfg.activation_memory_budget}")
+        else:
+            if is_master():
+                print("activation_memory_budget set but compile is disabled; ignoring.")
+
     if train_cfg.compile:
         compile_regions(model)
     if is_dist():
@@ -713,6 +726,9 @@ def main():
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--compile_dynamic_shapes', type=bool, help='With torch.compile: mark (B,T) as dynamic to reduce recompilation on variable batch/seq lengths')
     parser.add_argument('--activation_checkpointing', type=bool, help='Enable activation checkpointing for LM blocks')
+    parser.add_argument('--activation_checkpointing_selective', type=bool, help='Use selective activation checkpointing policy')
+    parser.add_argument('--activation_checkpointing_policy', type=str, help='Selective activation checkpointing policy name')
+    parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
@@ -741,6 +757,12 @@ def main():
         train_cfg.compile_dynamic_shapes = args.compile_dynamic_shapes
     if args.activation_checkpointing is not None:
         vlm_cfg.activation_checkpointing = args.activation_checkpointing
+    if args.activation_checkpointing_selective is not None:
+        vlm_cfg.activation_checkpointing_selective = args.activation_checkpointing_selective
+    if args.activation_checkpointing_policy is not None:
+        vlm_cfg.activation_checkpointing_policy = args.activation_checkpointing_policy
+    if args.activation_memory_budget is not None:
+        train_cfg.activation_memory_budget = args.activation_memory_budget
     if args.no_log_wandb is True:
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:

@@ -103,6 +103,27 @@ python train.py --activation_checkpointing True
 
 This applies checkpointing to the language-model blocks during training (not during decode/inference).
 
+#### Selective activation checkpointing (SAC)
+
+To selectively save expensive ops (matmul/attention) while recomputing cheaper ops:
+
+```bash
+python train.py \
+  --activation_checkpointing True \
+  --activation_checkpointing_selective True \
+  --activation_checkpointing_policy matmul_attention
+```
+
+#### Compile-time memory budget (SAC via torch.compile)
+
+When using `torch.compile`, you can enable the memory budget API:
+
+```bash
+python train.py --compile True --activation_memory_budget 0.5
+```
+
+This applies selective recomputation inside compiled regions. Budget 0 behaves like plain AC, 1 behaves like default compile.
+
 ### Training-step benchmark (Unsloth-style)
 
 To measure step time, tokens/s, and VRAM for a short forward+backward+optimizer loop (useful for A/B comparisons like MoMH on vs off):

@@ -2,6 +2,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
+
+from models.activation_checkpointing import get_sac_context_fn
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/modeling_siglip.py#L245
 class ViTPatchEmbeddings(nn.Module):
@@ -156,8 +159,27 @@ class ViT(nn.Module):
     def forward(self, x):
         x = self.patch_embedding(x) 
         x = self.dropout(x)
+        use_activation_checkpointing = self.cfg.activation_checkpointing and self.training
+        checkpoint_context_fn = None
+        if use_activation_checkpointing and self.cfg.activation_checkpointing_selective:
+            checkpoint_context_fn = get_sac_context_fn(self.cfg.activation_checkpointing_policy)
+
         for block in self.blocks:
-            x = block(x)
+            if use_activation_checkpointing:
+                def _run_block(x_in: torch.Tensor) -> torch.Tensor:
+                    return block(x_in)
+
+                if checkpoint_context_fn is None:
+                    x = activation_checkpoint(_run_block, x, use_reentrant=False)
+                else:
+                    x = activation_checkpoint(
+                        _run_block,
+                        x,
+                        use_reentrant=False,
+                        context_fn=checkpoint_context_fn,
+                    )
+            else:
+                x = block(x)
 
         if self.cls_flag:
             x = self.layer_norm(x[:, 0])

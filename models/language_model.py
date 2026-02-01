@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+from models.activation_checkpointing import get_sac_context_fn
+
 from models.momh_attention import (
     flex_attention_compiled,
     create_momh_block_mask_from_modality,
@@ -592,6 +594,9 @@ class LanguageModel(nn.Module):
             and self.training
             and is_prefill
         )
+        checkpoint_context_fn = None
+        if use_activation_checkpointing and self.cfg.activation_checkpointing_selective:
+            checkpoint_context_fn = get_sac_context_fn(self.cfg.activation_checkpointing_policy)
 
         prefill_block_mask = None
         if (
@@ -629,7 +634,15 @@ class LanguageModel(nn.Module):
                     )
                     return x_out
 
-                x = activation_checkpoint(_run_block, x, use_reentrant=False)
+                if checkpoint_context_fn is None:
+                    x = activation_checkpoint(_run_block, x, use_reentrant=False)
+                else:
+                    x = activation_checkpoint(
+                        _run_block,
+                        x,
+                        use_reentrant=False,
+                        context_fn=checkpoint_context_fn,
+                    )
                 kv_cache[i] = None
             else:
                 x, kv_cache[i] = block(

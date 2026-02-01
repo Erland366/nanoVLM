@@ -27,6 +27,9 @@ class BenchmarkResult:
     momh_enabled: bool
     compile: bool
     activation_checkpointing: bool
+    activation_checkpointing_selective: bool
+    activation_checkpointing_policy: str
+    activation_memory_budget: float | None
     device: str
     dtype: str
     seed: int
@@ -73,10 +76,28 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Enable regional torch.compile (vision blocks/decoder/MP) for the benchmark.",
     )
     p.add_argument(
+        "--activation-memory-budget",
+        type=float,
+        default=None,
+        help="torch.compile activation memory budget (0-1). Requires --compile.",
+    )
+    p.add_argument(
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable LM block activation checkpointing during training steps.",
+    )
+    p.add_argument(
+        "--activation-checkpointing-selective",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use selective activation checkpointing policy when enabled.",
+    )
+    p.add_argument(
+        "--activation-checkpointing-policy",
+        type=str,
+        default="matmul_attention",
+        help="Selective checkpointing policy name.",
     )
 
     p.add_argument("--batch-size", type=int, default=1)
@@ -435,10 +456,20 @@ def main(argv: list[str]) -> int:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     compile_enabled = bool(args.compile or train_cfg.compile)
+    activation_memory_budget = args.activation_memory_budget
+    if activation_memory_budget is not None:
+        if not 0.0 <= activation_memory_budget <= 1.0:
+            raise ValueError("--activation-memory-budget must be between 0 and 1.")
+        if not hasattr(torch._dynamo.config, "activation_memory_budget"):
+            raise RuntimeError("activation_memory_budget is not supported in this PyTorch build.")
+        if compile_enabled:
+            torch._dynamo.config.activation_memory_budget = activation_memory_budget
 
     cfg = VLMConfig()
     cfg.momh_enabled = bool(args.momh)
     cfg.activation_checkpointing = bool(args.activation_checkpointing)
+    cfg.activation_checkpointing_selective = bool(args.activation_checkpointing_selective)
+    cfg.activation_checkpointing_policy = args.activation_checkpointing_policy
 
     # Synthetic mode uses a dummy tokenizer to avoid HF tokenizer overhead and to ensure a stable image_token_id.
     tokenizer = None
@@ -506,6 +537,9 @@ def main(argv: list[str]) -> int:
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
             activation_checkpointing=bool(args.activation_checkpointing),
+            activation_checkpointing_selective=bool(args.activation_checkpointing_selective),
+            activation_checkpointing_policy=args.activation_checkpointing_policy,
+            activation_memory_budget=activation_memory_budget,
             device=str(device),
             dtype=args.dtype,
             seed=int(args.seed),
@@ -585,6 +619,9 @@ def main(argv: list[str]) -> int:
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
             activation_checkpointing=bool(args.activation_checkpointing),
+            activation_checkpointing_selective=bool(args.activation_checkpointing_selective),
+            activation_checkpointing_policy=args.activation_checkpointing_policy,
+            activation_memory_budget=activation_memory_budget,
             device=str(device),
             dtype=args.dtype,
             seed=int(args.seed),

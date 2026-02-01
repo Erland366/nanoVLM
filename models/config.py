@@ -43,6 +43,8 @@ class VLMConfig:
     momh_head_pct_text: float = 0.3    # 30% of heads for T->T only
     # Remaining 50% (1 - vision - text) for VT->VT cross-modal
     activation_checkpointing: bool = False  # Enable LM block activation checkpointing during training.
+    activation_checkpointing_selective: bool = False  # Use selective activation checkpointing policy when enabled.
+    activation_checkpointing_policy: str = "matmul_attention"
 
     max_img_size: int = 256
     resize_to_max_side_len: bool = True
@@ -67,6 +69,7 @@ class TrainConfig:
     lr_vision_backbone: float = 1e-5
     lr_language_backbone: float = 1e-5
     compile: bool = False
+    activation_memory_budget: float | None = None
     # When using torch.compile, allow varying batch size / seq length without recompilation.
     # This uses torch._dynamo.maybe_mark_dynamic on (B, T) dims for input_ids/labels/attention_mask.
     compile_dynamic_shapes: bool = False
