@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
-from models.activation_checkpointing import get_sac_context_fn
+from models.activation_checkpointing import get_default_sac_policy, get_sac_context_fn
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/modeling_siglip.py#L245
 class ViTPatchEmbeddings(nn.Module):
@@ -142,6 +142,21 @@ class ViT(nn.Module):
         self.layer_norm = nn.LayerNorm(cfg.vit_hidden_dim, eps=cfg.vit_ln_eps)
 
         self.apply(self._init_weights)
+        self.use_selective_activation_checkpointing = False
+        self.allow_activation_checkpointing_mutation = False
+        self.activation_checkpointing_policy = get_default_sac_policy()
+
+    def set_activation_checkpointing_mode(
+        self,
+        *,
+        use_selective: bool,
+        allow_cache_entry_mutation: bool = False,
+        policy: str | None = None,
+    ) -> None:
+        self.use_selective_activation_checkpointing = bool(use_selective)
+        self.allow_activation_checkpointing_mutation = bool(allow_cache_entry_mutation)
+        if policy is not None:
+            self.activation_checkpointing_policy = policy
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -161,8 +176,11 @@ class ViT(nn.Module):
         x = self.dropout(x)
         use_activation_checkpointing = self.cfg.activation_checkpointing and self.training
         checkpoint_context_fn = None
-        if use_activation_checkpointing and self.cfg.activation_checkpointing_selective:
-            checkpoint_context_fn = get_sac_context_fn(self.cfg.activation_checkpointing_policy)
+        if use_activation_checkpointing and self.use_selective_activation_checkpointing:
+            checkpoint_context_fn = get_sac_context_fn(
+                self.activation_checkpointing_policy,
+                allow_cache_entry_mutation=self.allow_activation_checkpointing_mutation,
+            )
 
         for block in self.blocks:
             if use_activation_checkpointing:

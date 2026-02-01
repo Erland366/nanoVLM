@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in os.sys.path:
     os.sys.path.insert(0, str(REPO_ROOT))
 
+from models.activation_checkpointing import get_default_sac_policy
 from models.config import TrainConfig, VLMConfig
 from models.vision_language_model import VisionLanguageModel
 
@@ -26,9 +27,10 @@ class BenchmarkResult:
     mode: str
     momh_enabled: bool
     compile: bool
+    compile_mode: str | None
     activation_checkpointing: bool
-    activation_checkpointing_selective: bool
-    activation_checkpointing_policy: str
+    activation_checkpointing_mode: str
+    activation_checkpointing_policy: str | None
     activation_memory_budget: float | None
     device: str
     dtype: str
@@ -76,6 +78,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Enable regional torch.compile (vision blocks/decoder/MP) for the benchmark.",
     )
     p.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+        help="torch.compile mode to use when --compile is enabled.",
+    )
+    p.add_argument(
         "--activation-memory-budget",
         type=float,
         default=None,
@@ -85,19 +93,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Enable LM block activation checkpointing during training steps.",
-    )
-    p.add_argument(
-        "--activation-checkpointing-selective",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use selective activation checkpointing policy when enabled.",
-    )
-    p.add_argument(
-        "--activation-checkpointing-policy",
-        type=str,
-        default="matmul_attention",
-        help="Selective checkpointing policy name.",
+        help=(
+            "Enable activation checkpointing. When --compile is enabled, "
+            "this uses selective activation checkpointing; otherwise it uses manual "
+            "checkpointing."
+        ),
     )
 
     p.add_argument("--batch-size", type=int, default=1)
@@ -353,6 +353,7 @@ def _run_train_steps(
     warmup_steps: int,
     steps: int,
     measure_compile_time: bool,
+    cudagraph_mark_step: bool,
 ) -> tuple[float, float, float | None, float | None, float | None, float | None]:
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -362,6 +363,8 @@ def _run_train_steps(
         base_vram_bytes = None
 
     def _train_step() -> float:
+        if cudagraph_mark_step and hasattr(torch, "compiler"):
+            torch.compiler.cudagraph_mark_step_begin()
         optimizer.zero_grad(set_to_none=True)
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -456,6 +459,7 @@ def main(argv: list[str]) -> int:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     compile_enabled = bool(args.compile or train_cfg.compile)
+    compile_mode = args.compile_mode if compile_enabled else None
     activation_memory_budget = args.activation_memory_budget
     if activation_memory_budget is not None:
         if not 0.0 <= activation_memory_budget <= 1.0:
@@ -467,9 +471,16 @@ def main(argv: list[str]) -> int:
 
     cfg = VLMConfig()
     cfg.momh_enabled = bool(args.momh)
-    cfg.activation_checkpointing = bool(args.activation_checkpointing)
-    cfg.activation_checkpointing_selective = bool(args.activation_checkpointing_selective)
-    cfg.activation_checkpointing_policy = args.activation_checkpointing_policy
+    activation_checkpointing = bool(args.activation_checkpointing)
+    use_selective_ac = bool(compile_enabled and activation_checkpointing)
+    activation_checkpointing_mode = (
+        "off"
+        if not activation_checkpointing
+        else ("selective" if use_selective_ac else "manual")
+    )
+    activation_checkpointing_policy = get_default_sac_policy() if use_selective_ac else None
+
+    cfg.activation_checkpointing = activation_checkpointing
 
     # Synthetic mode uses a dummy tokenizer to avoid HF tokenizer overhead and to ensure a stable image_token_id.
     tokenizer = None
@@ -481,8 +492,16 @@ def main(argv: list[str]) -> int:
         )
 
     model = VisionLanguageModel(cfg, load_backbone=False, tokenizer=tokenizer)
+    if hasattr(model, "set_activation_checkpointing_mode"):
+        model.set_activation_checkpointing_mode(
+            use_selective=use_selective_ac,
+            allow_cache_entry_mutation=use_selective_ac,
+            policy=activation_checkpointing_policy,
+        )
+        if use_selective_ac:
+            print("Using selective activation checkpointing under torch.compile (allow_cache_entry_mutation=True).")
     if compile_enabled:
-        _compile_regions(model, dynamic=None, mode="reduce-overhead")
+        _compile_regions(model, dynamic=None, mode=compile_mode)
     model.to(device)
     model.train()
 
@@ -530,15 +549,17 @@ def main(argv: list[str]) -> int:
             warmup_steps=args.warmup_steps,
             steps=args.steps,
             measure_compile_time=compile_enabled,
+            cudagraph_mark_step=compile_enabled,
         )
 
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
-            activation_checkpointing=bool(args.activation_checkpointing),
-            activation_checkpointing_selective=bool(args.activation_checkpointing_selective),
-            activation_checkpointing_policy=args.activation_checkpointing_policy,
+            compile_mode=compile_mode,
+            activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_mode=activation_checkpointing_mode,
+            activation_checkpointing_policy=activation_checkpointing_policy,
             activation_memory_budget=activation_memory_budget,
             device=str(device),
             dtype=args.dtype,
@@ -612,15 +633,17 @@ def main(argv: list[str]) -> int:
             warmup_steps=args.shape_warmup_steps,
             steps=args.shape_steps,
             measure_compile_time=compile_enabled,
+            cudagraph_mark_step=compile_enabled,
         )
 
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
-            activation_checkpointing=bool(args.activation_checkpointing),
-            activation_checkpointing_selective=bool(args.activation_checkpointing_selective),
-            activation_checkpointing_policy=args.activation_checkpointing_policy,
+            compile_mode=compile_mode,
+            activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_mode=activation_checkpointing_mode,
+            activation_checkpointing_policy=activation_checkpointing_policy,
             activation_memory_budget=activation_memory_budget,
             device=str(device),
             dtype=args.dtype,

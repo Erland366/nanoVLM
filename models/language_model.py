@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
-from models.activation_checkpointing import get_sac_context_fn
+from models.activation_checkpointing import get_default_sac_policy, get_sac_context_fn
 
 from models.momh_attention import (
     flex_attention_compiled,
@@ -514,6 +514,21 @@ class LanguageModel(nn.Module):
             self.head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
+        self.use_selective_activation_checkpointing = False
+        self.allow_activation_checkpointing_mutation = False
+        self.activation_checkpointing_policy = get_default_sac_policy()
+
+    def set_activation_checkpointing_mode(
+        self,
+        *,
+        use_selective: bool,
+        allow_cache_entry_mutation: bool = False,
+        policy: str | None = None,
+    ) -> None:
+        self.use_selective_activation_checkpointing = bool(use_selective)
+        self.allow_activation_checkpointing_mutation = bool(allow_cache_entry_mutation)
+        if policy is not None:
+            self.activation_checkpointing_policy = policy
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -595,8 +610,11 @@ class LanguageModel(nn.Module):
             and is_prefill
         )
         checkpoint_context_fn = None
-        if use_activation_checkpointing and self.cfg.activation_checkpointing_selective:
-            checkpoint_context_fn = get_sac_context_fn(self.cfg.activation_checkpointing_policy)
+        if use_activation_checkpointing and self.use_selective_activation_checkpointing:
+            checkpoint_context_fn = get_sac_context_fn(
+                self.activation_checkpointing_policy,
+                allow_cache_entry_mutation=self.allow_activation_checkpointing_mutation,
+            )
 
         prefill_block_mask = None
         if (

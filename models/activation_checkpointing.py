@@ -6,6 +6,8 @@ from typing import Callable
 import torch
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+DEFAULT_SAC_POLICY = "matmul_attention"
+
 
 def _maybe_add_op(ops: set, name: str) -> None:
     try:
@@ -54,6 +56,14 @@ def get_sac_policy_fn(name: str) -> Callable:
     raise ValueError(f"Unknown activation checkpointing policy: {name}")
 
 
-def get_sac_context_fn(policy_name: str) -> Callable:
+def get_sac_context_fn(policy_name: str, *, allow_cache_entry_mutation: bool = False) -> Callable:
     policy_fn = get_sac_policy_fn(policy_name)
-    return partial(create_selective_checkpoint_contexts, policy_fn)
+    return partial(
+        create_selective_checkpoint_contexts,
+        policy_fn,
+        allow_cache_entry_mutation=allow_cache_entry_mutation,
+    )
+
+
+def get_default_sac_policy() -> str:
+    return DEFAULT_SAC_POLICY

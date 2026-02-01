@@ -346,6 +346,15 @@ def train(train_cfg, vlm_cfg):
         model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
     else:
         model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+
+    use_selective_ac = bool(train_cfg.compile and vlm_cfg.activation_checkpointing)
+    if hasattr(model, "set_activation_checkpointing_mode"):
+        model.set_activation_checkpointing_mode(
+            use_selective=use_selective_ac,
+            allow_cache_entry_mutation=use_selective_ac,
+        )
+        if is_master() and use_selective_ac:
+            print("Using selective activation checkpointing under torch.compile (allow_cache_entry_mutation=True).")
     
     if is_master():
         print(f"nanoVLM initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
@@ -725,9 +734,7 @@ def main():
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--compile_dynamic_shapes', type=bool, help='With torch.compile: mark (B,T) as dynamic to reduce recompilation on variable batch/seq lengths')
-    parser.add_argument('--activation_checkpointing', type=bool, help='Enable activation checkpointing for LM blocks')
-    parser.add_argument('--activation_checkpointing_selective', type=bool, help='Use selective activation checkpointing policy')
-    parser.add_argument('--activation_checkpointing_policy', type=str, help='Selective activation checkpointing policy name')
+    parser.add_argument('--activation_checkpointing', type=bool, help='Enable activation checkpointing for LM/VIT blocks')
     parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
@@ -757,10 +764,6 @@ def main():
         train_cfg.compile_dynamic_shapes = args.compile_dynamic_shapes
     if args.activation_checkpointing is not None:
         vlm_cfg.activation_checkpointing = args.activation_checkpointing
-    if args.activation_checkpointing_selective is not None:
-        vlm_cfg.activation_checkpointing_selective = args.activation_checkpointing_selective
-    if args.activation_checkpointing_policy is not None:
-        vlm_cfg.activation_checkpointing_policy = args.activation_checkpointing_policy
     if args.activation_memory_budget is not None:
         train_cfg.activation_memory_budget = args.activation_memory_budget
     if args.no_log_wandb is True:

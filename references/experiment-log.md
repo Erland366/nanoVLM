@@ -14,6 +14,23 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-02 — Activation checkpointing benchmark with torch.compile (default mode)
+
+**Type:** Retrospective  
+**General description:** Benchmarked no-AC vs selective AC under torch.compile with static shapes.
+
+### Details
+
+- Ran `eval/benchmark_train_step.py` in synthetic mode at batch_size=1, seq_len=1024 (warmup_steps=2, steps=5), `--compile-mode default`.
+- Selective AC reduced peak VRAM by ~8.2% with ~17.4% throughput loss vs no-AC.
+- Selective AC under torch.compile requires `allow_cache_entry_mutation=True` to avoid cached-tensor mutation errors.
+- Activation checkpointing now auto-selects **selective** when compile is enabled; otherwise it uses manual checkpointing.
+- Results saved to `benchmark_results/train_step_compile.jsonl`.
+
+### Links
+
+- Report: `training_reports/activation-checkpointing-compile-benchmark-2026-02-02.md`
+
 ## 2026-02-02 — Activation checkpointing benchmark (manual vs selective)
 
 **Type:** Retrospective  

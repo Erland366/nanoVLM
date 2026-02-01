@@ -40,6 +40,26 @@ class VisionLanguageModel(nn.Module):
         self.pad_token_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
 
+    def set_activation_checkpointing_mode(
+        self,
+        *,
+        use_selective: bool,
+        allow_cache_entry_mutation: bool = False,
+        policy: str | None = None,
+    ) -> None:
+        if hasattr(self.decoder, "set_activation_checkpointing_mode"):
+            self.decoder.set_activation_checkpointing_mode(
+                use_selective=use_selective,
+                allow_cache_entry_mutation=allow_cache_entry_mutation,
+                policy=policy,
+            )
+        if hasattr(self.vision_encoder, "set_activation_checkpointing_mode"):
+            self.vision_encoder.set_activation_checkpointing_mode(
+                use_selective=use_selective,
+                allow_cache_entry_mutation=allow_cache_entry_mutation,
+                policy=policy,
+            )
+
     def _replace_img_tokens_with_embd(self, input_ids, token_embd, image_embd):
         """
         Replace every image-token placeholder in `input_ids` with the corresponding slice

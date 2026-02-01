@@ -42,9 +42,7 @@ class VLMConfig:
     momh_head_pct_vision: float = 0.2  # 20% of heads for V->V only
     momh_head_pct_text: float = 0.3    # 30% of heads for T->T only
     # Remaining 50% (1 - vision - text) for VT->VT cross-modal
-    activation_checkpointing: bool = False  # Enable LM block activation checkpointing during training.
-    activation_checkpointing_selective: bool = False  # Use selective activation checkpointing policy when enabled.
-    activation_checkpointing_policy: str = "matmul_attention"
+    activation_checkpointing: bool = False  # Enable LM/ViT activation checkpointing during training.
 
     max_img_size: int = 256
     resize_to_max_side_len: bool = True
