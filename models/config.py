@@ -90,7 +90,7 @@ class TrainConfig:
     compile: bool = False
     resume_from_vlm_checkpoint: bool = False
     train_dataset_path: str = 'patrickamadeus/the_cauldron'
-    train_dataset_name: tuple[str, ...] = ("config:sample_1pct", )
+    train_dataset_name: tuple[str, ...] = ("sample_1pct", )
     use_custom_dataset: bool = False
     stream_custom_train: bool = True
     stream_custom_val: bool = True

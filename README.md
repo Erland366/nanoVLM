@@ -90,11 +90,13 @@ Optional: add a `.env` file with `WANDB_API_KEY` and `HF_TOKEN` (or `HUGGINGFACE
 
 Note: the default config in this worktree is a **small debug-scale** setup for fast iteration:
 256-d ViT (patch16, img 128, 4 blocks, `mp_image_token_length=4`), SmolLM2-135M-Instruct (384 hidden, 8 blocks,
-1024 max length), and `patrickamadeus/the_cauldron` `config:sample_1pct` with batch size 1, grad accum 8,
+1024 max length), and `patrickamadeus/the_cauldron` `sample_1pct` with batch size 1, grad accum 8,
 lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000. See `models/config.py` for full defaults.
 
-To use consumed tokens as the W&B x-axis, set `TrainConfig.wandb_xaxis_tokens=True`. This logs `tokens/consumed`
-alongside training and validation metrics and uses it as the step metric.
+`train.py` always logs `tokens/consumed` to W&B (when enabled), so you can switch the chart x-axis to that metric.
+If you want tokens to be the default step metric, set `TrainConfig.wandb_xaxis_tokens=True`.
+
+To cap training for a short run, use `--max_training_steps N`.
 
 ### torch.compile (regional) + dynamic batch/seq
 

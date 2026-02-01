@@ -578,7 +578,7 @@ def train(train_cfg, vlm_cfg):
                     avg_val_loss = mean(dist_gather(avg_val_loss)) if is_dist() else avg_val_loss
 
                     tokens_step_value = None
-                    if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+                    if train_cfg.log_wandb:
                         tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
 
                     checkpoint_path_step = ""
@@ -637,7 +637,7 @@ def train(train_cfg, vlm_cfg):
                     stats['min_images_per_sample'] = min(accumulated_stats['images_per_sample'])
                 
                 tokens_step_value = None
-                if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+                if train_cfg.log_wandb:
                     tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
 
                 # MASTER ONLY: Log to wandb
@@ -668,10 +668,9 @@ def train(train_cfg, vlm_cfg):
                                     lmms_results = eval_data.get('results', {})
                                     if lmms_results:
                                         metrics = {f"lmms_eval/{key}": value for key, value in lmms_results.items()}
+                                        metrics[lmms_eval_step] = eval_data['global_step']
                                         if tokens_step_value is not None:
                                             metrics[tokens_step_metric] = tokens_step_value
-                                        else:
-                                            metrics[lmms_eval_step] = eval_data['global_step']
                                         if logged_results_count > 0:
                                             print(f"Logging more than one lmms-eval result for step {global_step}, try to avoid this.")
                                         run.log(metrics, step=global_step + logged_results_count)
@@ -696,7 +695,7 @@ def train(train_cfg, vlm_cfg):
                     batch_loss_gathered = batch_loss
 
                 tokens_step_value = None
-                if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+                if train_cfg.log_wandb:
                     tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
                     
                 # MASTER ONLY: Log to wandb
@@ -728,7 +727,7 @@ def train(train_cfg, vlm_cfg):
         total_tokens_processed = sum(dist_gather(total_tokens_processed)) if is_dist() else total_tokens_processed  
         epoch_tokens_per_second = total_tokens_processed / epoch_duration
         tokens_step_value = None
-        if train_cfg.log_wandb and train_cfg.wandb_xaxis_tokens:
+        if train_cfg.log_wandb:
             tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
 
         if is_master():
@@ -777,6 +776,7 @@ def main():
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
+    parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
     parser.add_argument('--image_correspondence_min_rating', type=int, help='Minimum image correspondence rating of images per sample')
     parser.add_argument('--visual_dependency_min_rating', type=int, help='Minimum visual dependency rating of images per sample')
@@ -801,6 +801,8 @@ def main():
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:
         train_cfg.train_dataset_path = args.train_dataset_path
+    if args.max_training_steps is not None:
+        train_cfg.max_training_steps = args.max_training_steps
     if args.relevance_min_rating is not None:
         train_cfg.relevance_min_rating = args.relevance_min_rating
     if args.image_correspondence_min_rating is not None:
