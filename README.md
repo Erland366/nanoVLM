@@ -96,7 +96,13 @@ lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000. 
 `train.py` always logs `tokens/consumed` to W&B (when enabled), so you can switch the chart x-axis to that metric.
 If you want tokens to be the default step metric, set `TrainConfig.wandb_xaxis_tokens=True`.
 
-To cap training for a short run, use `--max_training_steps N`.
+To scale LR by effective (non-padding) tokens per update step, set `TrainConfig.effective_token_lr_scale=True`.
+We compute `ratio = effective_tokens / (B_global * lm_max_length)` and apply `ratio**0.5` **after** the LR scheduler.
+This logs `effective_tokens`, `effective_token_ratio`, and `effective_token_lr_scale` each update step. Override the
+exponent with `TrainConfig.effective_token_lr_exponent` or `--effective_token_lr_exponent`.
+
+To cap training for a short run, use `--max_training_steps N` or `--max_training_tokens N` (effective tokens).
+If both are set, training stops when either limit is reached.
 
 ### torch.compile (regional) + dynamic batch/seq
 

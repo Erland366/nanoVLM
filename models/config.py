@@ -84,6 +84,7 @@ class TrainConfig:
     eval_interval: int = 500
     stats_log_interval: int = 10
     max_training_steps: int = 30000
+    max_training_tokens: int | None = None
     max_images_per_example: int = 10
     max_images_per_knapsack: int = 18
     max_sample_length: int = 1024
@@ -132,6 +133,8 @@ class TrainConfig:
     local_model_cp_path: str = "checkpoints/vanilla-cauldron"
     save_hf: bool = False
     hf_model_cp_path: str = "patrickamadeus/vanilla-cauldron"
+    effective_token_lr_scale: bool = False
+    effective_token_lr_exponent: float = 0.5
     use_lmms_eval: bool = False
     lmms_eval_tasks: str = (
         'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa'

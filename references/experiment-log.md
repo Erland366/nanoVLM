@@ -14,6 +14,23 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-01 — Effective-token LR scaling
+
+**Type:** Observation  
+**General description:** Added optional LR scaling based on effective (non-padding) tokens per update step.
+
+**Details:** Introduced `TrainConfig.effective_token_lr_scale` and `effective_token_lr_exponent`, applied the
+scale after the scheduler for all LR groups, and logged `effective_tokens`, `effective_token_ratio`, and
+`effective_token_lr_scale` each update step.
+
+## 2026-02-01 — Token-based stopping
+
+**Type:** Observation  
+**General description:** Added an optional stop condition based on effective token count.
+
+**Details:** Added `TrainConfig.max_training_tokens` and `--max_training_tokens` to stop training once the
+global effective-token count reaches the requested budget.
+
 ## 2026-02-01 — Benchmark reflects train.py (no optimization flags)
 
 **Type:** Observation  

@@ -332,6 +332,11 @@ def get_lr(it, max_lr, max_steps):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
+def compute_effective_token_scale(effective_tokens: int, denom_tokens: int, exponent: float) -> tuple[float, float]:
+    ratio = effective_tokens / max(denom_tokens, 1)
+    ratio = min(max(ratio, 1e-6), 1.0)
+    return ratio, ratio ** exponent
+
 def train(train_cfg, vlm_cfg):
     train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(train_cfg, vlm_cfg)
 
@@ -433,6 +438,7 @@ def train(train_cfg, vlm_cfg):
     global_step = 0
     epoch = 0
     tokens_processed_global = 0
+    effective_tokens_accum = 0
     
     # Training stats accumulators
     accumulated_stats = {
@@ -445,6 +451,7 @@ def train(train_cfg, vlm_cfg):
     
     while global_step < train_cfg.max_training_steps:
         epoch += 1
+        stop_training = False
         epoch_start_time = time.time()
         model.train()
         total_train_loss = 0
@@ -455,12 +462,19 @@ def train(train_cfg, vlm_cfg):
         print("Starting training loop")
         for i, batch in enumerate(synchronized_dataloader_step(iter_train_loader, is_dist())):
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0
+            step_effective_tokens = None
+            step_effective_token_ratio = None
+            step_effective_token_lr_scale = 1.0
             batch_start_time = time.time()
             images = batch["images"]
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             data_load_time = time.time() - data_load_start
+            num_tokens = int(torch.sum(attention_mask).item())  # Sum of attention mask gives number of tokens
+            total_tokens_processed += num_tokens
+            tokens_processed_global += num_tokens
+            effective_tokens_accum += num_tokens
 
             if train_cfg.compile:
                 # Always mark (B,T) dynamic when compiling to reduce recompiles from variable batch/seq.
@@ -501,32 +515,49 @@ def train(train_cfg, vlm_cfg):
                 if train_cfg.max_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
 
+                denom_tokens = (
+                    train_cfg.batch_size
+                    * train_cfg.gradient_accumulation_steps
+                    * get_world_size()
+                    * vlm_cfg.lm_max_length
+                )
+                if train_cfg.effective_token_lr_scale or train_cfg.log_wandb:
+                    step_effective_tokens = effective_tokens_accum
+                    if is_dist():
+                        step_effective_tokens = sum(dist_gather(step_effective_tokens))
+                    step_effective_token_ratio = step_effective_tokens / max(denom_tokens, 1)
+                    _, step_effective_token_lr_scale = compute_effective_token_scale(
+                        step_effective_tokens,
+                        denom_tokens,
+                        train_cfg.effective_token_lr_exponent,
+                    )
+                    if not train_cfg.effective_token_lr_scale:
+                        step_effective_token_lr_scale = 1.0
+
                 param_group_idx = 0
                 if train_cfg.lr_mp > 0:
-                    adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps)
+                    adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps) * step_effective_token_lr_scale
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
                     param_group_idx += 1
 
                 if train_cfg.lr_vision_backbone > 0:
-                    adj_lr_vision_backbone = get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
+                    adj_lr_vision_backbone = get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps) * step_effective_token_lr_scale
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
                     param_group_idx += 1
 
                 if train_cfg.lr_language_backbone > 0:
-                    adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
+                    adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps) * step_effective_token_lr_scale
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
               
                 optimizer.step()
                 optimizer.zero_grad()
+                effective_tokens_accum = 0
 
             batch_loss = loss.item()
             if train_cfg.gradient_accumulation_steps > 1:
                 batch_loss = batch_loss * train_cfg.gradient_accumulation_steps
             total_train_loss += batch_loss
 
-            num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens
-            total_tokens_processed += num_tokens
-            tokens_processed_global += num_tokens
             post_process_time = time.time() - post_process_start
 
             images_per_sample = [len(image_pack) for image_pack in images]
@@ -704,17 +735,28 @@ def train(train_cfg, vlm_cfg):
                         "batch_loss": batch_loss_gathered,
                         **({"grad_norm": grad_norm} if train_cfg.max_grad_norm is not None else {})
                     }
+                    if step_effective_tokens is not None:
+                        log_payload["effective_tokens"] = step_effective_tokens
+                    if step_effective_token_ratio is not None:
+                        log_payload["effective_token_ratio"] = step_effective_token_ratio
+                        log_payload["effective_token_lr_scale"] = step_effective_token_lr_scale
                     if tokens_step_value is not None:
                         log_payload[tokens_step_metric] = tokens_step_value
                     run.log(log_payload, step=global_step)
                 
             if is_update_step:
                 global_step += 1
+                if train_cfg.max_training_tokens is not None:
+                    tokens_processed = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+                    if tokens_processed >= train_cfg.max_training_tokens:
+                        stop_training = True
                 if global_step >= train_cfg.max_training_steps:
                     break
             data_load_start = time.time()
 
         iter_train_loader = iter(train_loader)
+        if stop_training:
+            break
         avg_train_loss = total_train_loss / i
         # gather average batch loss from all ranks if DDP
         avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
@@ -777,6 +819,9 @@ def main():
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
+    parser.add_argument('--max_training_tokens', type=int, help='Stop after this many effective tokens (non-padding)')
+    parser.add_argument('--effective_token_lr_scale', type=bool, help='Scale LR by effective token ratio each step')
+    parser.add_argument('--effective_token_lr_exponent', type=float, help='Exponent for effective token LR scaling')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
     parser.add_argument('--image_correspondence_min_rating', type=int, help='Minimum image correspondence rating of images per sample')
     parser.add_argument('--visual_dependency_min_rating', type=int, help='Minimum visual dependency rating of images per sample')
@@ -803,6 +848,12 @@ def main():
         train_cfg.train_dataset_path = args.train_dataset_path
     if args.max_training_steps is not None:
         train_cfg.max_training_steps = args.max_training_steps
+    if args.max_training_tokens is not None:
+        train_cfg.max_training_tokens = args.max_training_tokens
+    if args.effective_token_lr_scale is not None:
+        train_cfg.effective_token_lr_scale = args.effective_token_lr_scale
+    if args.effective_token_lr_exponent is not None:
+        train_cfg.effective_token_lr_exponent = args.effective_token_lr_exponent
     if args.relevance_min_rating is not None:
         train_cfg.relevance_min_rating = args.relevance_min_rating
     if args.image_correspondence_min_rating is not None:
