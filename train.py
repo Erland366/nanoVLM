@@ -128,8 +128,11 @@ def get_run_name(train_cfg, vlm_cfg):
     mp = f"mp{vlm_cfg.mp_pixel_shuffle_factor}"
     llm = f"{vlm_cfg.lm_model_type.split('/')[-1]}"
 
-    # Use momhVLM prefix when MoMH is enabled
-    prefix = "momhVLM" if getattr(vlm_cfg, 'momh_enabled', False) else "nanoVLM"
+    if getattr(train_cfg, "prefix_run_name", None):
+        prefix = train_cfg.prefix_run_name
+    else:
+        # Use momhVLM prefix when MoMH is enabled
+        prefix = "momhVLM" if getattr(vlm_cfg, "momh_enabled", False) else "nanoVLM"
     return f"{prefix}_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
 
 def get_dataloaders(train_cfg, vlm_cfg):
@@ -221,7 +224,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
     )
 
     # Optionally wrap with ConstantLengthDataset for packing multiple samples
-    if train_cfg.use_packing:
+    if train_cfg.pack_sequences:
         train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
                                             max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
         val_dataset = ConstantLengthDataset(val_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
@@ -326,7 +329,7 @@ def train(train_cfg, vlm_cfg):
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
             entity=train_cfg.wandb_entity,
-            project="nanoVLM",
+            project=train_cfg.wandb_project,
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -708,6 +711,8 @@ def main():
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
+    parser.add_argument('--compile_dynamic_shapes', type=bool, help='With torch.compile: mark (B,T) as dynamic to reduce recompilation on variable batch/seq lengths')
+    parser.add_argument('--activation_checkpointing', type=bool, help='Enable activation checkpointing for LM blocks')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
@@ -732,6 +737,10 @@ def main():
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:
         train_cfg.compile = args.compile
+    if args.compile_dynamic_shapes is not None:
+        train_cfg.compile_dynamic_shapes = args.compile_dynamic_shapes
+    if args.activation_checkpointing is not None:
+        vlm_cfg.activation_checkpointing = args.activation_checkpointing
     if args.no_log_wandb is True:
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:

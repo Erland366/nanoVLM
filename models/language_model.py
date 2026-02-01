@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from models.momh_attention import (
     flex_attention_compiled,
@@ -582,9 +583,17 @@ class LanguageModel(nn.Module):
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
 
         # Initialize new KV cache if none provided
+        is_prefill = kv_cache is None
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
+        use_activation_checkpointing = (
+            self.cfg.activation_checkpointing
+            and self.training
+            and is_prefill
+        )
+
+        prefill_block_mask = None
         if (
             prefill_block_mask is None
             and attention_mask is not None
@@ -606,16 +615,33 @@ class LanguageModel(nn.Module):
             )
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(
-                x,
-                cos,
-                sin,
-                attention_mask=attention_mask,
-                block_kv_cache=kv_cache[i],
-                block_mask=prefill_block_mask,
-                content_starts=content_starts,
-                is_vision=is_vision,
-            )
+            if use_activation_checkpointing:
+                def _run_block(x_in: torch.Tensor) -> torch.Tensor:
+                    x_out, _ = block(
+                        x_in,
+                        cos,
+                        sin,
+                        attention_mask=attention_mask,
+                        block_kv_cache=None,
+                        block_mask=prefill_block_mask,
+                        content_starts=content_starts,
+                        is_vision=is_vision,
+                    )
+                    return x_out
+
+                x = activation_checkpoint(_run_block, x, use_reentrant=False)
+                kv_cache[i] = None
+            else:
+                x, kv_cache[i] = block(
+                    x,
+                    cos,
+                    sin,
+                    attention_mask=attention_mask,
+                    block_kv_cache=kv_cache[i],
+                    block_mask=prefill_block_mask,
+                    content_starts=content_starts,
+                    is_vision=is_vision,
+                )
 
         x = self.norm(x)
 

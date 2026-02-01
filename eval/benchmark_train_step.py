@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +26,13 @@ class BenchmarkResult:
     mode: str
     momh_enabled: bool
     compile: bool
+    activation_checkpointing: bool
     device: str
     dtype: str
+    seed: int
+    matmul_precision: str
+    cudnn_deterministic: bool
+    cudnn_benchmark: bool
     compile_time_ms: float | None
     batch_size: int
     seq_len: int
@@ -60,11 +67,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--mode", choices=["synthetic", "hf"], default="synthetic")
 
     p.add_argument("--momh", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable regional torch.compile (vision blocks/decoder/MP) for the benchmark.",
+    )
+    p.add_argument(
+        "--activation-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable LM block activation checkpointing during training steps.",
+    )
 
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--num-images", type=int, default=1, help="Number of images per sample (synthetic mode).")
     p.add_argument("--tiles-per-image", type=int, default=1, help="Number of ViT-sized tiles per image (synthetic mode).")
+    p.add_argument("--seed", type=int, default=1337, help="Random seed for reproducibility.")
 
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--steps", type=int, default=10)
@@ -410,10 +429,16 @@ def main(argv: list[str]) -> int:
         raise RuntimeError("Requested --device=cuda but CUDA is not available.")
 
     train_cfg = TrainConfig()
-    compile_enabled = bool(train_cfg.compile)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+    compile_enabled = bool(args.compile or train_cfg.compile)
 
     cfg = VLMConfig()
     cfg.momh_enabled = bool(args.momh)
+    cfg.activation_checkpointing = bool(args.activation_checkpointing)
 
     # Synthetic mode uses a dummy tokenizer to avoid HF tokenizer overhead and to ensure a stable image_token_id.
     tokenizer = None
@@ -480,8 +505,13 @@ def main(argv: list[str]) -> int:
             mode=args.mode,
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
+            activation_checkpointing=bool(args.activation_checkpointing),
             device=str(device),
             dtype=args.dtype,
+            seed=int(args.seed),
+            matmul_precision=str(torch.get_float32_matmul_precision()),
+            cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+            cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
             compile_time_ms=compile_time_ms,
             batch_size=int(args.batch_size),
             seq_len=int(args.seq_len),
@@ -554,8 +584,13 @@ def main(argv: list[str]) -> int:
             mode=args.mode,
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
+            activation_checkpointing=bool(args.activation_checkpointing),
             device=str(device),
             dtype=args.dtype,
+            seed=int(args.seed),
+            matmul_precision=str(torch.get_float32_matmul_precision()),
+            cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+            cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
             compile_time_ms=compile_time_ms,
             batch_size=int(batch_size),
             seq_len=int(seq_len),

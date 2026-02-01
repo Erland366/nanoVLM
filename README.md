@@ -85,13 +85,23 @@ python train.py
 ```
 which will use the default `models/config.py`.
 
-Note: the default config is now a **small debug-scale** setup (128px ViT, 1024‑token LM, `mp_image_token_length=4`) for fast iteration. Update `models/config.py` or pass CLI overrides for larger runs.
+Note: the default config is now a **small debug-scale** setup (128px ViT, 1024‑token LM, `mp_image_token_length=4`) and uses the `patrickamadeus/the_cauldron` sample_1pct dataset for fast iteration. Update `models/config.py` or pass CLI overrides for larger runs.
 
 ### torch.compile (regional) + dynamic batch/seq
 
 When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
 
 When compile is enabled, `train.py` always applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance. There is no separate flag for this.
+
+### Activation checkpointing (memory saving)
+
+To reduce training-time activation memory at the cost of extra compute, enable LM block activation checkpointing:
+
+```bash
+python train.py --activation_checkpointing True
+```
+
+This applies checkpointing to the language-model blocks during training (not during decode/inference).
 
 ### Training-step benchmark (Unsloth-style)
 

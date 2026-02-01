@@ -21,15 +21,15 @@ class VLMConfig:
     lm_max_position_embeddings: int = 1024
     lm_base_vocab_size: int = 49152
     extra_token_amount: int = 66  # Number of extra tokens for the VLM (image start, image end, image token)
-    lm_vocab_size: int = lm_base_vocab_size + extra_token_amount # Not a great way to do this, but it works for now (vlm_extra_tokens cannot be a dict, since this is mutable, and a Field has no len() function)
+    lm_vocab_size: int = 49218
     lm_n_heads: int = 6
     lm_n_kv_heads: int = 2
     lm_dropout: float = 0.0
     lm_n_blocks: int = 8
     lm_attn_scaling: float = 1.0
     lm_max_length: int = 1024
-    lm_use_tokens: bool = False # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
-    lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
+    lm_use_tokens: bool = False  # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
+    lm_tie_weights: bool = True  # Decide if you want to tie the LM Head weight to the token embedding weights
     lm_model_type: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
     lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
     lm_chat_template: str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
@@ -42,6 +42,7 @@ class VLMConfig:
     momh_head_pct_vision: float = 0.2  # 20% of heads for V->V only
     momh_head_pct_text: float = 0.3    # 30% of heads for T->T only
     # Remaining 50% (1 - vision - text) for VT->VT cross-modal
+    activation_checkpointing: bool = False  # Enable LM block activation checkpointing during training.
 
     max_img_size: int = 256
     resize_to_max_side_len: bool = True
@@ -62,24 +63,18 @@ class VLMConfig:
 
 @dataclass
 class TrainConfig:
-    lr_mp: float = 5e-5  # Pretraining from scratch
-    lr_vision_backbone: float = 1e-5  # Pretraining from scratch
-    lr_language_backbone: float = 1e-5  # Pretraining from scratch
-    val_size: int = 5000
-    batch_size: int = 1  # Reduced for MoMH (disabled packing uses more memory)
-    gradient_accumulation_steps: int = 8
-    max_grad_norm: float = 1.0
-    eval_in_epochs: bool = False
-    eval_interval: int = 500
-    stats_log_interval: int = 10
-    max_training_steps: int = 30000
-    max_images_per_example: int = 10
-    max_images_per_knapsack: int = 18
-    max_sample_length: int = 1024
+    lr_mp: float = 5e-5
+    lr_vision_backbone: float = 1e-5
+    lr_language_backbone: float = 1e-5
     compile: bool = False
-    resume_from_vlm_checkpoint: bool = False # Indicate if the training should be resumed from a checkpoint of the whole VLM or you want to start from scratch
-    train_dataset_path: str = 'patrickamadeus/the_cauldron'
-    train_dataset_name: tuple[str, ...] = ("config:sample_1pct", )
+    # When using torch.compile, allow varying batch size / seq length without recompilation.
+    # This uses torch._dynamo.maybe_mark_dynamic on (B, T) dims for input_ids/labels/attention_mask.
+    compile_dynamic_shapes: bool = False
+    resume_from_vlm_checkpoint: bool = False  # Indicate if resuming from a checkpoint of the whole VLM.
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    train_dataset_path: str = "patrickamadeus/the_cauldron"
+    train_dataset_name: tuple[str, ...] = ("config:sample_1pct",)
     use_custom_dataset: bool = False
     stream_custom_train: bool = True
     stream_custom_val: bool = True
@@ -98,31 +93,40 @@ class TrainConfig:
     data_num_workers: int = 4
     val_num_workers: int = 4
     interleave_datasets: bool = False
-    interleave_probabilities: tuple[float, ...] | None = None
+    interleave_probabilities: list[float] | None = None
     interleave_stopping_strategy: str = "all_exhausted"
     streaming_shuffle_buffer: int = 0
     stratified_val_split: bool = False
     data_cutoff_idx: int | None = None
-    use_packing: bool = False  # Use ConstantLengthDataset for packing multiple samples (disabled for MoMH)
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1
     visual_dependency_min_rating: int = 1
     formatting_min_rating: int = 1
+    max_images_per_example: int = 10
+    max_images_per_knapsack: int = 18
+    pack_sequences: bool = False
+    max_sample_length: int = 1024
+    max_training_steps: int = 30000
+    max_grad_norm: float = 1.0
     enable_validation: bool = True
+    val_size: int = 5000
     max_val_batches: int = 5000
-    wandb_entity: str = "" # Indicate the entity to log to in wandb
-    wandb_project: str = "dualtower"
+    eval_in_epochs: bool = False
+    eval_interval: int = 500
     log_wandb: bool = True
+    wandb_entity: str = ""
+    wandb_project: str = "dualtower"
     prefix_run_name: str | None = None
     save_code_cfg: bool = True
     save_model_every_n_steps: int = 500
+    stats_log_interval: int = 10
     save_local: bool = False
     local_model_cp_path: str = "checkpoints/vanilla-cauldron"
     save_hf: bool = False
     hf_model_cp_path: str = "patrickamadeus/vanilla-cauldron"
-    use_lmms_eval: bool = False # Use lmms-eval for evaluation
-    lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
-    lmms_eval_limit: float = None
+    use_lmms_eval: bool = False
+    lmms_eval_tasks: str = "mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa"
+    lmms_eval_limit: float | None = None
     lmms_eval_batch_size: int = 64
 
 
