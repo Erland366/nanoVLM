@@ -14,6 +14,23 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-02 — Retrospective: activation checkpointing + compile tradeoffs
+
+**Type:** Retrospective  
+**General description:** Summarized activation checkpointing benchmarks and compile/recompile behavior under shape sweeps.
+
+### Details
+
+- Benchmarked manual vs selective activation checkpointing (no compile) and selective activation checkpointing under `torch.compile` in synthetic mode at `batch_size=1`, `seq_len=1024`.
+- Selective AC under `torch.compile` requires `allow_cache_entry_mutation=True` to avoid cached‑tensor mutation errors; activation checkpointing now auto-selects selective when compile is enabled.
+- Shape sweeps with `(B,T)=(1,512)->(2,1024)` and `(4,128)->(8,64)` still triggered recompiles in `flex_attention.create_block_mask` and block forwards due to batch-size guards; no graph breaks observed.
+
+### Links
+
+- Report: `training_reports/activation-checkpointing-benchmark-2026-02-02.md`
+- Report: `training_reports/activation-checkpointing-compile-benchmark-2026-02-02.md`
+- Report: `training_reports/compile-reduce-overhead-2026-02-02.md`
+
 ## 2026-02-02 — Activation checkpointing benchmark with torch.compile (default mode)
 
 **Type:** Retrospective  
