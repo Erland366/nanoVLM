@@ -2,6 +2,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
+
+from models.activation_checkpointing import get_default_sac_policy, get_sac_context_fn
 
 from models.momh_attention import (
     flex_attention_compiled,
@@ -511,6 +514,21 @@ class LanguageModel(nn.Module):
             self.head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
+        self.use_selective_activation_checkpointing = False
+        self.allow_activation_checkpointing_mutation = False
+        self.activation_checkpointing_policy = get_default_sac_policy()
+
+    def set_activation_checkpointing_mode(
+        self,
+        *,
+        use_selective: bool,
+        allow_cache_entry_mutation: bool = False,
+        policy: str | None = None,
+    ) -> None:
+        self.use_selective_activation_checkpointing = bool(use_selective)
+        self.allow_activation_checkpointing_mutation = bool(allow_cache_entry_mutation)
+        if policy is not None:
+            self.activation_checkpointing_policy = policy
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -582,9 +600,23 @@ class LanguageModel(nn.Module):
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
 
         # Initialize new KV cache if none provided
+        is_prefill = kv_cache is None
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
+        use_activation_checkpointing = (
+            getattr(self.cfg, "activation_checkpointing", False)
+            and self.training
+            and is_prefill
+        )
+        checkpoint_context_fn = None
+        if use_activation_checkpointing and self.use_selective_activation_checkpointing:
+            checkpoint_context_fn = get_sac_context_fn(
+                self.activation_checkpointing_policy,
+                allow_cache_entry_mutation=self.allow_activation_checkpointing_mutation,
+            )
+
+        prefill_block_mask = None
         if (
             prefill_block_mask is None
             and attention_mask is not None
@@ -606,16 +638,41 @@ class LanguageModel(nn.Module):
             )
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(
-                x,
-                cos,
-                sin,
-                attention_mask=attention_mask,
-                block_kv_cache=kv_cache[i],
-                block_mask=prefill_block_mask,
-                content_starts=content_starts,
-                is_vision=is_vision,
-            )
+            if use_activation_checkpointing:
+                def _run_block(x_in: torch.Tensor) -> torch.Tensor:
+                    x_out, _ = block(
+                        x_in,
+                        cos,
+                        sin,
+                        attention_mask=attention_mask,
+                        block_kv_cache=None,
+                        block_mask=prefill_block_mask,
+                        content_starts=content_starts,
+                        is_vision=is_vision,
+                    )
+                    return x_out
+
+                if checkpoint_context_fn is None:
+                    x = activation_checkpoint(_run_block, x, use_reentrant=False)
+                else:
+                    x = activation_checkpoint(
+                        _run_block,
+                        x,
+                        use_reentrant=False,
+                        context_fn=checkpoint_context_fn,
+                    )
+                kv_cache[i] = None
+            else:
+                x, kv_cache[i] = block(
+                    x,
+                    cos,
+                    sin,
+                    attention_mask=attention_mask,
+                    block_kv_cache=kv_cache[i],
+                    block_mask=prefill_block_mask,
+                    content_starts=content_starts,
+                    is_vision=is_vision,
+                )
 
         x = self.norm(x)
 
