@@ -14,6 +14,22 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-02 — MoMH uptraining plan (gradual mask ramp)
+
+**Type:** Plan  
+**General description:** Uptrain pretrained VLM with MoMH masks using a gradual head-split ramp to avoid optimization shock.
+
+### Details
+
+- **Precondition:** set `VLMConfig.vlm_load_backbone_weights=True` and point `VLMConfig.vlm_checkpoint_path` to the pretrained VLM (uptraining requires loading weights).
+- **Phase A (warm start, 10–20% budget):** `momh_enabled=False`, low LR (~0.3× baseline). Optional: freeze vision encoder.
+- **Phase B (ramp, 40–50% budget):** enable MoMH and ramp head splits to target in 2–3 stages:
+  - B1: `pct_v=0.0`, `pct_t=0.0` (all VT)
+  - B2: `pct_v=0.1`, `pct_t=0.15`
+  - B3: `pct_v=0.2`, `pct_t=0.3` (target)
+- **Phase C (hold, 30–40% budget):** keep target splits; use ~0.5× baseline LR (or 0.3× if unstable).
+- **Monitoring:** watch loss spikes at mask switches, grad norms, and (optional) head usage/entropy.
+
 ## 2026-02-01 — Benchmark reflects train.py (no optimization flags)
 
 **Type:** Observation  
