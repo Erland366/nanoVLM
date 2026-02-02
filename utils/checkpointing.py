@@ -62,11 +62,11 @@ def load_trainer_state(checkpoint_dir: str, *, strict: bool) -> Optional[Dict[st
     checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pt")
 
     if os.path.exists(rank_path):
-        return torch.load(rank_path, map_location="cpu")
+        return torch.load(rank_path, map_location="cpu", weights_only=False)
     if os.path.exists(fallback_path):
-        return torch.load(fallback_path, map_location="cpu")
+        return torch.load(fallback_path, map_location="cpu", weights_only=False)
     if os.path.exists(checkpoint_path):
-        state = torch.load(checkpoint_path, map_location="cpu")
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         trainer = state.get("trainer")
         if trainer is None and strict:
             raise KeyError("checkpoint.pt missing 'trainer' state")
@@ -189,6 +189,6 @@ def load_model_optimizer_state(
             raise FileNotFoundError(f"Expected DCP checkpoint at {checkpoint_dir} but none found")
         raise FileNotFoundError(f"checkpoint.pt not found in {checkpoint_dir}")
 
-    state = torch.load(checkpoint_path, map_location="cpu")
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     unwrap_model(model).load_state_dict(state["model"], strict=strict)
     optimizer.load_state_dict(state["optimizer"])
