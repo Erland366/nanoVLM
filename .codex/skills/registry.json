@@ -19,6 +19,10 @@
     "torch-compile-dynamic-shapes-nanovlm": {
       "type": "result",
       "description": "Mark (B,T) dynamic to reduce torch.compile recompiles in training"
+    },
+    "padding-aware-lr-scaling": {
+      "type": "result",
+      "description": "Scale LR by effective-token ratio for non-pack training with heavy padding"
     }
   },
   "paths": {
