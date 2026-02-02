@@ -555,6 +555,15 @@ def train(train_cfg, vlm_cfg):
                     * get_world_size()
                     * vlm_cfg.lm_max_length
                 )
+                schedule_step = global_step
+                schedule_max_steps = train_cfg.max_training_steps
+                if train_cfg.lr_schedule_by_tokens:
+                    schedule_tokens = tokens_processed_global
+                    if is_dist():
+                        schedule_tokens = sum(dist_gather(schedule_tokens))
+                    schedule_step = schedule_tokens / max(denom_tokens, 1)
+                    if train_cfg.max_training_tokens is not None:
+                        schedule_max_steps = train_cfg.max_training_tokens / max(denom_tokens, 1)
                 if train_cfg.effective_token_lr_scale or train_cfg.log_wandb:
                     step_effective_tokens = effective_tokens_accum
                     if is_dist():
@@ -570,17 +579,17 @@ def train(train_cfg, vlm_cfg):
 
                 param_group_idx = 0
                 if train_cfg.lr_mp > 0:
-                    adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps) * step_effective_token_lr_scale
+                    adj_lr_mp = get_lr(schedule_step, train_cfg.lr_mp, schedule_max_steps) * step_effective_token_lr_scale
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
                     param_group_idx += 1
 
                 if train_cfg.lr_vision_backbone > 0:
-                    adj_lr_vision_backbone = get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps) * step_effective_token_lr_scale
+                    adj_lr_vision_backbone = get_lr(schedule_step, train_cfg.lr_vision_backbone, schedule_max_steps) * step_effective_token_lr_scale
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
                     param_group_idx += 1
 
                 if train_cfg.lr_language_backbone > 0:
-                    adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps) * step_effective_token_lr_scale
+                    adj_lr_language_backbone = get_lr(schedule_step, train_cfg.lr_language_backbone, schedule_max_steps) * step_effective_token_lr_scale
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
               
                 optimizer.step()
@@ -862,6 +871,7 @@ def main():
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
     parser.add_argument('--max_training_tokens', type=int, help='Stop after this many effective tokens (non-padding)')
+    parser.add_argument('--lr_schedule_by_tokens', type=str2bool, help='Use token-based LR scheduling')
     parser.add_argument('--pack_sequences', type=str2bool, help='Enable packing multiple samples per sequence')
     parser.add_argument('--effective_token_lr_scale', type=str2bool, help='Scale LR by effective token ratio each step')
     parser.add_argument('--effective_token_lr_exponent', type=float, help='Exponent for effective token LR scaling')
@@ -899,6 +909,8 @@ def main():
         train_cfg.max_training_steps = args.max_training_steps
     if args.max_training_tokens is not None:
         train_cfg.max_training_tokens = args.max_training_tokens
+    if args.lr_schedule_by_tokens is not None:
+        train_cfg.lr_schedule_by_tokens = args.lr_schedule_by_tokens
     if args.pack_sequences is not None:
         train_cfg.pack_sequences = args.pack_sequences
     if args.effective_token_lr_scale is not None:

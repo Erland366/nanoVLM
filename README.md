@@ -101,6 +101,11 @@ We compute `ratio = effective_tokens / (B_global * lm_max_length)` and apply `ra
 This logs `effective_tokens`, `effective_token_ratio`, and `effective_token_lr_scale` each update step. Override the
 exponent with `TrainConfig.effective_token_lr_exponent` or `--effective_token_lr_exponent`.
 
+If you want the LR schedule itself to advance by **tokens** instead of steps, set
+`TrainConfig.lr_schedule_by_tokens=True` (or `--lr_schedule_by_tokens True`). The scheduler step becomes
+`tokens_processed_global / (B_global * lm_max_length)`. If `max_training_tokens` is set, the scheduler max
+steps are derived from that token budget; otherwise it uses `max_training_steps`.
+
 To cap training for a short run, use `--max_training_steps N` or `--max_training_tokens N` (effective tokens).
 If both are set, training stops when either limit is reached.
 
