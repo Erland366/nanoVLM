@@ -117,20 +117,11 @@ Key config fields (`models/config.py`):
 - `checkpoint_dir`: base directory for checkpoints
 - `checkpoint_format`: `dcp` (default) or `torch`
 - `resume_from_checkpoint`: path to a checkpoint directory (e.g., `checkpoints/<run_name>/step_500`)
-- `resume_run_name`: override the run name when resuming (useful to separate W&B runs)
-- `strict_resume`: fail fast if required checkpoint data is missing
-- `wandb_group`: optional W&B group to keep related runs together
 
 Example (save every 50 steps, resume):
 ```bash
 python train.py --checkpoint_every_n_steps 50 --checkpoint_dir checkpoints
 python train.py --resume_from_checkpoint checkpoints/<run_name>/step_50
-```
-
-Example (separate W&B runs for steps 1–50 and 51–100):
-```bash
-python train.py --checkpoint_every_n_steps 50 --checkpoint_dir checkpoints --wandb_group ckpt-50
-python train.py --resume_from_checkpoint checkpoints/<run_name>/step_50 --max_training_steps 100 --resume_run_name ckpt-50b --wandb_group ckpt-50
 ```
 
 Notes:
