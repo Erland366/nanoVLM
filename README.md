@@ -85,7 +85,28 @@ python train.py
 ```
 which will use the default `models/config.py`.
 
-Note: the default config is now a **small debug-scale** setup (128px ViT, 1024‑token LM, `mp_image_token_length=4`) for fast iteration. Update `models/config.py` or pass CLI overrides for larger runs.
+Optional: add a `.env` file with `WANDB_API_KEY` and `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`).
+`train.py` will load `.env` and log into W&B/Hugging Face automatically for the master process.
+
+Note: the default config in this worktree is a **small debug-scale** setup for fast iteration:
+256-d ViT (patch16, img 128, 4 blocks, `mp_image_token_length=4`), SmolLM2-135M-Instruct (384 hidden, 8 blocks,
+1024 max length), and `patrickamadeus/the_cauldron` `sample_1pct` with batch size 1, grad accum 8,
+lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000. See `models/config.py` for full defaults.
+
+`train.py` always logs `tokens/consumed` to W&B (when enabled), so you can switch the chart x-axis to that metric.
+If you want tokens to be the default step metric, set `TrainConfig.wandb_xaxis_tokens=True`.
+
+To scale LR by effective (non-padding) tokens per update step, set `TrainConfig.effective_token_lr_scale=True`.
+We compute `ratio = effective_tokens / (B_global * lm_max_length)` and apply `ratio**effective_token_lr_exponent`
+**after** the LR scheduler (default exponent is 0.5). This logs `effective_tokens`, `effective_token_ratio`, and
+`effective_token_lr_scale` each update step. Override the exponent with
+`TrainConfig.effective_token_lr_exponent` or `--effective_token_lr_exponent`.
+
+To cap training for a short run, use `--max_training_steps N` or `--max_training_tokens N` (effective tokens).
+If both are set, training stops when either limit is reached.
+
+For vanilla attention, disable MoMH with `--momh_enabled False`. To toggle sequence packing, use
+`--pack_sequences True|False`.
 
 ### Checkpointing and resume
 
@@ -115,6 +136,32 @@ When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each
 
 When compile is enabled, `train.py` always applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance. There is no separate flag for this.
 
+### Activation checkpointing (memory saving)
+
+To reduce training-time activation memory at the cost of extra compute, enable activation checkpointing:
+
+```bash
+python train.py --activation_checkpointing True
+```
+
+This applies checkpointing to the language-model blocks during training (not during decode/inference).
+
+#### Selective activation checkpointing (SAC)
+
+When **activation checkpointing** is enabled **and** `--compile True`, we automatically switch to
+**selective activation checkpointing** with the matmul/attention policy. If `--compile` is disabled,
+activation checkpointing uses the standard (manual) checkpointing behavior instead.
+
+#### Compile-time memory budget (SAC via torch.compile)
+
+When using `torch.compile`, you can enable the memory budget API:
+
+```bash
+python train.py --compile True --activation_memory_budget 0.5
+```
+
+This applies selective recomputation inside compiled regions. Budget 0 behaves like plain AC, 1 behaves like default compile.
+
 ### Training-step benchmark (Unsloth-style)
 
 To measure step time, tokens/s, and VRAM for a short forward+backward+optimizer loop (useful for A/B comparisons like MoMH on vs off):
@@ -124,9 +171,12 @@ source .venv/bin/activate
 python eval/benchmark_train_step.py --mode synthetic --steps 10 --warmup-steps 3 --batch-size 1 --seq-len 2048
 ```
 
-<u>Important: this benchmark always reflects the **current `train.py` setup** (no optimization flags). All optimization changes must live in `train.py`, and the benchmark simply measures the current setup.</u>
+<u>Important: this benchmark defaults to the **current `train.py` setup**. You can still override compile via CLI flags, but all optimization changes should ultimately land in `train.py`.</u>
 
-The benchmark reports `compile_time_ms` when `TrainConfig.compile=True` (time for the first step that triggers compilation). To change compile settings, edit `models/config.py` (this benchmark reflects the current training setup).
+The benchmark reports `compile_time_ms` when compile is enabled (first step that triggers compilation). Use `--compile` to force compile on, and `--compile-mode {default,reduce-overhead,max-autotune}` to select the compile mode.
+
+Selective activation checkpointing under `torch.compile` enables `allow_cache_entry_mutation=True` to avoid cached-tensor mutation
+errors. This disables a correctness guard; use with care.
 
 Write results to JSONL (default `benchmark_results/train_step.jsonl`) and compare runs by toggling MoMH:
 

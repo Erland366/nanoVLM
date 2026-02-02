@@ -4,17 +4,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in os.sys.path:
     os.sys.path.insert(0, str(REPO_ROOT))
 
+from models.activation_checkpointing import get_default_sac_policy
 from models.config import TrainConfig, VLMConfig
 from models.vision_language_model import VisionLanguageModel
 
@@ -24,8 +27,17 @@ class BenchmarkResult:
     mode: str
     momh_enabled: bool
     compile: bool
+    compile_mode: str | None
+    activation_checkpointing: bool
+    activation_checkpointing_mode: str
+    activation_checkpointing_policy: str | None
+    activation_memory_budget: float | None
     device: str
     dtype: str
+    seed: int
+    matmul_precision: str
+    cudnn_deterministic: bool
+    cudnn_benchmark: bool
     compile_time_ms: float | None
     batch_size: int
     seq_len: int
@@ -60,11 +72,39 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--mode", choices=["synthetic", "hf"], default="synthetic")
 
     p.add_argument("--momh", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable regional torch.compile (vision blocks/decoder/MP) for the benchmark.",
+    )
+    p.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+        help="torch.compile mode to use when --compile is enabled.",
+    )
+    p.add_argument(
+        "--activation-memory-budget",
+        type=float,
+        default=None,
+        help="torch.compile activation memory budget (0-1). Requires --compile.",
+    )
+    p.add_argument(
+        "--activation-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable activation checkpointing. When --compile is enabled, "
+            "this uses selective activation checkpointing; otherwise it uses manual "
+            "checkpointing."
+        ),
+    )
 
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--num-images", type=int, default=1, help="Number of images per sample (synthetic mode).")
     p.add_argument("--tiles-per-image", type=int, default=1, help="Number of ViT-sized tiles per image (synthetic mode).")
+    p.add_argument("--seed", type=int, default=1337, help="Random seed for reproducibility.")
 
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--steps", type=int, default=10)
@@ -313,6 +353,7 @@ def _run_train_steps(
     warmup_steps: int,
     steps: int,
     measure_compile_time: bool,
+    cudagraph_mark_step: bool,
 ) -> tuple[float, float, float | None, float | None, float | None, float | None]:
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -322,6 +363,8 @@ def _run_train_steps(
         base_vram_bytes = None
 
     def _train_step() -> float:
+        if cudagraph_mark_step and hasattr(torch, "compiler"):
+            torch.compiler.cudagraph_mark_step_begin()
         optimizer.zero_grad(set_to_none=True)
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -410,10 +453,34 @@ def main(argv: list[str]) -> int:
         raise RuntimeError("Requested --device=cuda but CUDA is not available.")
 
     train_cfg = TrainConfig()
-    compile_enabled = bool(train_cfg.compile)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+    compile_enabled = bool(args.compile or train_cfg.compile)
+    compile_mode = args.compile_mode if compile_enabled else None
+    activation_memory_budget = args.activation_memory_budget
+    if activation_memory_budget is not None:
+        if not 0.0 <= activation_memory_budget <= 1.0:
+            raise ValueError("--activation-memory-budget must be between 0 and 1.")
+        if not hasattr(torch._dynamo.config, "activation_memory_budget"):
+            raise RuntimeError("activation_memory_budget is not supported in this PyTorch build.")
+        if compile_enabled:
+            torch._dynamo.config.activation_memory_budget = activation_memory_budget
 
     cfg = VLMConfig()
     cfg.momh_enabled = bool(args.momh)
+    activation_checkpointing = bool(args.activation_checkpointing)
+    use_selective_ac = bool(compile_enabled and activation_checkpointing)
+    activation_checkpointing_mode = (
+        "off"
+        if not activation_checkpointing
+        else ("selective" if use_selective_ac else "manual")
+    )
+    activation_checkpointing_policy = get_default_sac_policy() if use_selective_ac else None
+
+    cfg.activation_checkpointing = activation_checkpointing
 
     # Synthetic mode uses a dummy tokenizer to avoid HF tokenizer overhead and to ensure a stable image_token_id.
     tokenizer = None
@@ -425,8 +492,16 @@ def main(argv: list[str]) -> int:
         )
 
     model = VisionLanguageModel(cfg, load_backbone=False, tokenizer=tokenizer)
+    if hasattr(model, "set_activation_checkpointing_mode"):
+        model.set_activation_checkpointing_mode(
+            use_selective=use_selective_ac,
+            allow_cache_entry_mutation=use_selective_ac,
+            policy=activation_checkpointing_policy,
+        )
+        if use_selective_ac:
+            print("Using selective activation checkpointing under torch.compile (allow_cache_entry_mutation=True).")
     if compile_enabled:
-        _compile_regions(model, dynamic=None, mode="reduce-overhead")
+        _compile_regions(model, dynamic=None, mode=compile_mode)
     model.to(device)
     model.train()
 
@@ -474,14 +549,24 @@ def main(argv: list[str]) -> int:
             warmup_steps=args.warmup_steps,
             steps=args.steps,
             measure_compile_time=compile_enabled,
+            cudagraph_mark_step=compile_enabled,
         )
 
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
+            compile_mode=compile_mode,
+            activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_mode=activation_checkpointing_mode,
+            activation_checkpointing_policy=activation_checkpointing_policy,
+            activation_memory_budget=activation_memory_budget,
             device=str(device),
             dtype=args.dtype,
+            seed=int(args.seed),
+            matmul_precision=str(torch.get_float32_matmul_precision()),
+            cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+            cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
             compile_time_ms=compile_time_ms,
             batch_size=int(args.batch_size),
             seq_len=int(args.seq_len),
@@ -548,14 +633,24 @@ def main(argv: list[str]) -> int:
             warmup_steps=args.shape_warmup_steps,
             steps=args.shape_steps,
             measure_compile_time=compile_enabled,
+            cudagraph_mark_step=compile_enabled,
         )
 
         result = BenchmarkResult(
             mode=args.mode,
             momh_enabled=bool(args.momh),
             compile=compile_enabled,
+            compile_mode=compile_mode,
+            activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_mode=activation_checkpointing_mode,
+            activation_checkpointing_policy=activation_checkpointing_policy,
+            activation_memory_budget=activation_memory_budget,
             device=str(device),
             dtype=args.dtype,
+            seed=int(args.seed),
+            matmul_precision=str(torch.get_float32_matmul_precision()),
+            cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+            cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
             compile_time_ms=compile_time_ms,
             batch_size=int(batch_size),
             seq_len=int(seq_len),
