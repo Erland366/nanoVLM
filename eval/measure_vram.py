@@ -149,11 +149,20 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
+                document_ids = batch.get("document_ids")
+                if isinstance(document_ids, torch.Tensor):
+                    document_ids = document_ids.to(device)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16): # Doing autocast to stay close the train.py script
-                    _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                    _, loss = model(
+                        input_ids,
+                        images,
+                        attention_mask=attention_mask,
+                        targets=labels,
+                        document_ids=document_ids,
+                    )
 
                 if loss is not None:
                     loss.backward()

@@ -156,6 +156,9 @@ class VQADataset(BaseDataset):  # Visual Question Answering Dataset
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            # Document ids are used for packed sequence masking (document masking).
+            # For non-packed samples this is a single document, so all zeros.
+            "document_ids": torch.zeros_like(input_ids, dtype=torch.long),
         }
 
     def _get_labels(self, input_ids, mask):
@@ -304,6 +307,9 @@ class VQAIterableDataset(IterableDataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            # Document ids are used for packed sequence masking (document masking).
+            # For non-packed samples this is a single document, so all zeros.
+            "document_ids": torch.zeros_like(input_ids, dtype=torch.long),
         }
 
     def _get_labels(self, input_ids, mask):

@@ -108,6 +108,10 @@ If both are set, training stops when either limit is reached.
 For vanilla attention, disable MoMH with `--momh_enabled False`. To toggle sequence packing, use
 `--pack_sequences True|False`.
 
+When `pack_sequences=True`, the dataloader also produces `document_ids` (one id per token) so attention can be
+restricted to the current packed document. MoMH uses `document_ids` to enforce document masking (no cross-sample
+attention) while still splitting heads into vision-only, text-only, and cross-modal patterns.
+
 ### Checkpointing and resume
 
 Training checkpoints now include **model weights, optimizer state, RNG state, and data-loader progress** so you can resume deterministically (map-style datasets).
@@ -205,6 +209,9 @@ Notes:
 ### MoMH masking sanity check
 
 MoMH masking classifies tokens as “vision” based on the `<|image|>` placeholder positions (the same positions that get replaced by image embeddings). This is important for multi-image / multi-patch samples where the number of `<|image|>` placeholders is much larger than `mp_image_token_length`.
+
+With packing enabled, MoMH additionally applies **document masking** using the per-token `document_ids` produced by the
+collator to prevent attention across packed samples.
 
 For performance, the MoMH `BlockMask` is built once per forward pass and reused across all language-model blocks (instead of recomputing it per block).
 

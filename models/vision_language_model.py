@@ -106,7 +106,7 @@ class VisionLanguageModel(nn.Module):
                 return torch.cat(images, dim=0).to(device)
         return images # Already a tensor
 
-    def forward(self, input_ids, images, attention_mask=None, targets=None):
+    def forward(self, input_ids, images, attention_mask=None, targets=None, *, document_ids=None):
         images_tensor = self._process_images(images, input_ids.device)
         is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
@@ -128,6 +128,7 @@ class VisionLanguageModel(nn.Module):
                 kv_len=seq_len,
                 is_vision=is_vision[:, :seq_len],
                 attention_mask=attention_mask[:, :seq_len],
+                document_ids=document_ids[:, :seq_len] if document_ids is not None else None,
                 pct_v=float(self.decoder.blocks[0].attn.momh_pct_vision),
                 pct_t=float(self.decoder.blocks[0].attn.momh_pct_text),
                 device=str(input_ids.device),
@@ -144,6 +145,7 @@ class VisionLanguageModel(nn.Module):
             content_starts=None,
             is_vision=is_vision,
             prefill_block_mask=prefill_block_mask,
+            document_ids=document_ids,
         )
 
         loss = None
@@ -156,7 +158,7 @@ class VisionLanguageModel(nn.Module):
         return logits, loss
 
     @torch.inference_mode()
-    def generate(self, input_ids, images, attention_mask=None, max_new_tokens=5, top_k=50, top_p=0.9, temperature=0.5, greedy=False):
+    def generate(self, input_ids, images, attention_mask=None, max_new_tokens=5, top_k=50, top_p=0.9, temperature=0.5, greedy=False, *, document_ids=None):
         images_tensor = self._process_images(images, input_ids.device)
         is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_prompt_text, D_lm]
@@ -178,6 +180,7 @@ class VisionLanguageModel(nn.Module):
                 kv_len=seq_len,
                 is_vision=is_vision[:, :seq_len],
                 attention_mask=attention_mask[:, :seq_len],
+                document_ids=document_ids[:, :seq_len] if document_ids is not None else None,
                 pct_v=float(self.decoder.blocks[0].attn.momh_pct_vision),
                 pct_t=float(self.decoder.blocks[0].attn.momh_pct_text),
                 device=str(input_ids.device),
@@ -202,6 +205,7 @@ class VisionLanguageModel(nn.Module):
             content_starts=None,
             is_vision=is_vision,
             prefill_block_mask=prefill_block_mask,
+            document_ids=document_ids,
         )
         
         last_token_output_from_prefill = prefill_output[:, -1, :] 
@@ -239,6 +243,9 @@ class VisionLanguageModel(nn.Module):
                 (is_vision, torch.zeros((batch_size, 1), device=is_vision.device, dtype=torch.bool)),
                 dim=1,
             )
+            if document_ids is not None:
+                last_doc = document_ids[:, -1:].to(torch.long)
+                document_ids = torch.cat((document_ids, last_doc), dim=1)
 
             # With KV cache: only process the new token
             decode_step_output, kv_cache_list = self.decoder(
@@ -248,6 +255,7 @@ class VisionLanguageModel(nn.Module):
                 start_pos=current_token_start_pos,
                 content_starts=None,
                 is_vision=is_vision,
+                document_ids=document_ids,
             )
       
             last_token_output = decode_step_output[:, -1, :] 

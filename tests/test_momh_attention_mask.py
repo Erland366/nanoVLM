@@ -94,3 +94,34 @@ def test_multi_image_cross_attention_allowed():
     out = _eval(mask_mod, b=0, h=v_head, q_abs=[1], kv_abs=[4])
     assert out[0, 0].item() is True  # vision->vision across images allowed
 
+
+def test_document_ids_block_cross_doc_attention():
+    # Two packed documents in a single sequence: positions 0..3 are doc0, 4..7 are doc1.
+    attention_mask = torch.ones((1, 8), dtype=torch.bool)
+    document_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.long)
+
+    # Vision tokens exist in both documents.
+    is_vision = torch.tensor([[0, 1, 0, 0, 0, 1, 0, 0]], dtype=torch.bool)
+
+    mask_mod = generate_momh_mask_mod_from_modality(
+        10,
+        is_vision=is_vision,
+        attention_mask=attention_mask,
+        document_ids=document_ids,
+        q_offset=0,
+        pct_v=0.4,
+        pct_t=0.4,
+    )
+
+    # V-head: vision->vision is allowed only within the same document.
+    v_head = 0
+    out_v = _eval(mask_mod, b=0, h=v_head, q_abs=[1], kv_abs=[1, 5])
+    assert out_v[0, 0].item() is True   # same doc, same token
+    assert out_v[0, 1].item() is False  # other doc blocked
+
+    # VT-head: can attend to vision + causal text, but still must stay within doc boundary.
+    vt_head = 8  # first VT head (H_V=4, H_T=4)
+    out_vt = _eval(mask_mod, b=0, h=vt_head, q_abs=[6], kv_abs=[1, 5, 6])
+    assert out_vt[0, 0].item() is False  # other doc vision blocked
+    assert out_vt[0, 1].item() is True   # same doc vision allowed
+    assert out_vt[0, 2].item() is True   # same doc self allowed

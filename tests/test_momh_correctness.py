@@ -23,11 +23,12 @@ from models.momh_attention import (
     create_momh_block_mask,
     generate_momh_score_mod_with_offset,
 )
+from tests.cuda_utils import cuda_is_usable
 
-# Skip all tests if CUDA not available
+# Skip all tests if CUDA is not usable in this environment (e.g., unsupported GPU arch for this PyTorch build).
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA not available, flex_attention requires CUDA"
+    not cuda_is_usable(),
+    reason="CUDA not usable (flex_attention requires CUDA and a compatible PyTorch build)"
 )
 
 

@@ -546,9 +546,18 @@ def evaluate_validation(model, val_loader, device, train_cfg):
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            document_ids = batch.get("document_ids")
+            if isinstance(document_ids, torch.Tensor):
+                document_ids = document_ids.to(device)
 
             with autocast_context:
-                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                _, loss = model(
+                    input_ids,
+                    images,
+                    attention_mask=attention_mask,
+                    targets=labels,
+                    document_ids=document_ids,
+                )
 
             batch_loss = loss.item()
             min_batch_loss = min(min_batch_loss, batch_loss)

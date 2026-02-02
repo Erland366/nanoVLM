@@ -362,6 +362,9 @@ def train(train_cfg, vlm_cfg, global_cfg):
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            document_ids = batch.get("document_ids")
+            if isinstance(document_ids, torch.Tensor):
+                document_ids = document_ids.to(device)
             data_load_time = time.time() - data_load_start
 
             num_tokens = int(torch.sum(attention_mask).item())
@@ -376,6 +379,9 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 torch._dynamo.maybe_mark_dynamic(labels, 1)
                 torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
                 torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
+                if isinstance(document_ids, torch.Tensor):
+                    torch._dynamo.maybe_mark_dynamic(document_ids, 0)
+                    torch._dynamo.maybe_mark_dynamic(document_ids, 1)
 
             # When using DDP with gradient accumulation,
             # skip gradient synchronization on intermediate steps to save time.
@@ -394,7 +400,13 @@ def train(train_cfg, vlm_cfg, global_cfg):
             )
             with autocast_context:
                 with context:
-                    _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                    _, loss = model(
+                        input_ids,
+                        images,
+                        attention_mask=attention_mask,
+                        targets=labels,
+                        document_ids=document_ids,
+                    )
 
             if train_cfg.gradient_accumulation_steps > 1:
                 loss = loss / train_cfg.gradient_accumulation_steps

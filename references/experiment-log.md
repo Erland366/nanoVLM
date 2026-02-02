@@ -22,6 +22,16 @@ Each entry should include:
 **Links:**  
 - Report: `training_reports/effective-token-lr-scaling-2026-02-02.md`
 
+## 2026-02-02 — Retrospective: MoMH packing document masking + benchmark
+
+**Type:** Retrospective  
+**General description:** Added per-token `document_ids` so MoMH supports packed sequences without cross-sample attention, and benchmarked overhead on GPU.
+
+**Details:** Implemented document-aware MoMH masking by requiring `document_ids[q]==document_ids[kv]` for all head types (V/T/VT). This prevents cross-document leakage when `pack_sequences=True`. Benchmarked prefill-style `BlockMask` build and `flex_attention_compiled` on GPU at `B=1,H=15,T=2048,D=64` (fp16). BlockMask build cost increased slightly in the single-doc case (~+0.09 ms), while packed doc masking increased sparsity and significantly reduced attention kernel time. Also upgraded PyTorch to a cu128 build to support Blackwell (sm_120) after hitting “no kernel image is available” errors with older builds.
+
+**Links:**  
+- Report: `training_reports/momh-packing-document-masking-benchmark-2026-02-02.md`
+
 ## 2026-02-02 — Retrospective: activation checkpointing + compile tradeoffs
 
 **Type:** Retrospective  

@@ -23,12 +23,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.config import VLMConfig
 from models.language_model import LanguageModel
 from models.momh_attention import compute_content_starts
+from tests.cuda_utils import cuda_is_usable
 
 
-# Skip all tests if CUDA not available
+# Skip all tests if CUDA is not usable in this environment (e.g., unsupported GPU arch for this PyTorch build).
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA not available, flex_attention requires CUDA"
+    not cuda_is_usable(),
+    reason="CUDA not usable (flex_attention requires CUDA and a compatible PyTorch build)"
 )
 
 

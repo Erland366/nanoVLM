@@ -30,6 +30,7 @@ def generate_momh_mask_mod_from_modality(
     *,
     is_vision: torch.Tensor,
     attention_mask: torch.Tensor | None,
+    document_ids: torch.Tensor | None = None,
     q_offset: int = 0,
     pct_v: float = 0.4,
     pct_t: float = 0.4,
@@ -45,6 +46,7 @@ def generate_momh_mask_mod_from_modality(
         n_q_heads: Total number of query heads.
         is_vision: Bool tensor [B, KV_LEN] marking vision tokens.
         attention_mask: Optional tensor [B, KV_LEN], where 1=content and 0=padding.
+        document_ids: Optional long tensor [B, KV_LEN] assigning each token to a packed document.
         q_offset: Absolute offset to map local q_idx (0..Q_LEN-1) into KV positions.
                   Use 0 for prefill (Q_LEN==KV_LEN) and (KV_LEN-Q_LEN) for decode.
         pct_v: Percentage of heads for V->V attention.
@@ -57,6 +59,8 @@ def generate_momh_mask_mod_from_modality(
         is_vision = is_vision.to(torch.bool)
     if attention_mask is not None and attention_mask.dtype is not torch.bool:
         attention_mask = attention_mask.to(torch.bool)
+    if document_ids is not None and document_ids.dtype is not torch.long:
+        document_ids = document_ids.to(torch.long)
 
     H_V = int(n_q_heads * pct_v)
     H_T = int(n_q_heads * pct_t)
@@ -76,13 +80,18 @@ def generate_momh_mask_mod_from_modality(
             kv_is_content = attention_mask[b, kv_abs]
             not_padding = q_is_content & kv_is_content
 
+        if document_ids is None:
+            same_doc = torch.ones_like(not_padding, dtype=torch.bool)
+        else:
+            same_doc = document_ids[b, q_abs] == document_ids[b, kv_abs]
+
         q_is_vision = is_vision[b, q_abs]
         kv_is_vision = is_vision[b, kv_abs]
         q_is_text = ~q_is_vision
         kv_is_text = ~kv_is_vision
 
         # V-heads: V->V only (bidirectional within vision tokens)
-        head_V = (h < H_T_start) & q_is_vision & kv_is_vision & not_padding
+        head_V = (h < H_T_start) & q_is_vision & kv_is_vision & same_doc & not_padding
 
         # T-heads: T->T only (causal within text tokens)
         head_T = (
@@ -91,11 +100,17 @@ def generate_momh_mask_mod_from_modality(
             & q_is_text
             & kv_is_text
             & (q_abs >= kv_abs)
+            & same_doc
             & not_padding
         )
 
         # VT-heads: cross-modal (full vision + causal non-vision)
-        head_VT = (h >= H_VT_start) & not_padding & (kv_is_vision | (q_abs >= kv_abs))
+        head_VT = (
+            (h >= H_VT_start)
+            & same_doc
+            & not_padding
+            & (kv_is_vision | (q_abs >= kv_abs))
+        )
 
         return head_V | head_T | head_VT
 
@@ -109,6 +124,7 @@ def create_momh_block_mask_from_modality(
     kv_len: int,
     is_vision: torch.Tensor,
     attention_mask: torch.Tensor | None,
+    document_ids: torch.Tensor | None = None,
     pct_v: float,
     pct_t: float,
     device: str = "cuda",
@@ -135,11 +151,22 @@ def create_momh_block_mask_from_modality(
                 f"attention_mask second dim must be >= kv_len ({kv_len}), got {attention_mask.shape[1]}"
             )
 
+    if document_ids is not None:
+        if document_ids.ndim != 2:
+            raise ValueError(
+                f"document_ids must have shape [B, KV_LEN], got {tuple(document_ids.shape)}"
+            )
+        if document_ids.shape[1] < kv_len:
+            raise ValueError(
+                f"document_ids second dim must be >= kv_len ({kv_len}), got {document_ids.shape[1]}"
+            )
+
     q_offset = kv_len - q_len
     mask_mod = generate_momh_mask_mod_from_modality(
         n_q_heads,
         is_vision=is_vision[:, :kv_len],
         attention_mask=attention_mask[:, :kv_len] if attention_mask is not None else None,
+        document_ids=document_ids[:, :kv_len] if document_ids is not None else None,
         q_offset=q_offset,
         pct_v=pct_v,
         pct_t=pct_t,

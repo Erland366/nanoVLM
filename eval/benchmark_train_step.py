@@ -225,6 +225,7 @@ def _make_synthetic_batch(
         "attention_mask": attention_mask,
         "labels": labels,
         "images": images,
+        "document_ids": torch.zeros_like(input_ids, dtype=torch.long),
         "tokens_per_step": int(attention_mask.sum().item()),
     }
 
@@ -314,6 +315,11 @@ def _find_hf_batch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        document_ids = batch.get("document_ids")
+        if isinstance(document_ids, torch.Tensor):
+            document_ids = document_ids.to(device)
+        else:
+            document_ids = None
 
         # Ensure we do not train on image placeholders.
         labels[input_ids == tokenizer.image_token_id] = -100
@@ -324,6 +330,7 @@ def _find_hf_batch(
             "attention_mask": attention_mask,
             "labels": labels,
             "images": batch["images"],
+            "document_ids": document_ids,
             "tokens_per_step": tokens_per_step,
         }
 
@@ -347,6 +354,7 @@ def _run_train_steps(
     images: Any,
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
+    document_ids: torch.Tensor | None,
     tokens_per_step: int,
     device: torch.device,
     amp_dtype: torch.dtype,
@@ -371,9 +379,21 @@ def _run_train_steps(
         t0 = time.perf_counter()
         if device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                _, loss = model(
+                    input_ids,
+                    images,
+                    attention_mask=attention_mask,
+                    targets=labels,
+                    document_ids=document_ids,
+                )
         else:
-            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+            _, loss = model(
+                input_ids,
+                images,
+                attention_mask=attention_mask,
+                targets=labels,
+                document_ids=document_ids,
+            )
         if loss is None:
             raise RuntimeError("Model returned loss=None; cannot benchmark training step.")
         loss.backward()
@@ -426,6 +446,7 @@ def _maybe_mark_dynamic(
     labels: torch.Tensor,
     attention_mask: torch.Tensor,
     images: Any,
+    document_ids: torch.Tensor | None = None,
     compile_enabled: bool,
 ) -> None:
     if not compile_enabled:
@@ -436,6 +457,9 @@ def _maybe_mark_dynamic(
     torch._dynamo.maybe_mark_dynamic(labels, 1)
     torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
     torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
+    if isinstance(document_ids, torch.Tensor):
+        torch._dynamo.maybe_mark_dynamic(document_ids, 0)
+        torch._dynamo.maybe_mark_dynamic(document_ids, 1)
     if isinstance(images, torch.Tensor):
         torch._dynamo.maybe_mark_dynamic(images, 0)
 
@@ -527,12 +551,14 @@ def main(argv: list[str]) -> int:
         images = batch["images"]
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
+        document_ids = batch.get("document_ids")
         tokens_per_step = int(batch["tokens_per_step"])
         _maybe_mark_dynamic(
             input_ids=input_ids,
             labels=labels,
             attention_mask=attention_mask,
             images=images,
+            document_ids=document_ids if isinstance(document_ids, torch.Tensor) else None,
             compile_enabled=compile_enabled,
         )
 
@@ -543,6 +569,7 @@ def main(argv: list[str]) -> int:
             images=images,
             attention_mask=attention_mask,
             labels=labels,
+            document_ids=document_ids if isinstance(document_ids, torch.Tensor) else None,
             tokens_per_step=tokens_per_step,
             device=device,
             amp_dtype=amp_dtype,
@@ -611,12 +638,14 @@ def main(argv: list[str]) -> int:
         images = batch["images"]
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
+        document_ids = batch.get("document_ids")
         tokens_per_step = int(batch["tokens_per_step"])
         _maybe_mark_dynamic(
             input_ids=input_ids,
             labels=labels,
             attention_mask=attention_mask,
             images=images,
+            document_ids=document_ids if isinstance(document_ids, torch.Tensor) else None,
             compile_enabled=compile_enabled,
         )
 
@@ -627,6 +656,7 @@ def main(argv: list[str]) -> int:
             images=images,
             attention_mask=attention_mask,
             labels=labels,
+            document_ids=document_ids if isinstance(document_ids, torch.Tensor) else None,
             tokens_per_step=tokens_per_step,
             device=device,
             amp_dtype=amp_dtype,

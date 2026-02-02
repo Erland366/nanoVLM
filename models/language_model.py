@@ -22,6 +22,7 @@ def _build_momh_block_mask_prefill(
     seq_len: int,
     is_vision: torch.Tensor,
     attention_mask: torch.Tensor,
+    document_ids: torch.Tensor | None,
     pct_v: float,
     pct_t: float,
     device: str,
@@ -35,6 +36,7 @@ def _build_momh_block_mask_prefill(
         kv_len=seq_len,
         is_vision=is_vision,
         attention_mask=attention_mask,
+        document_ids=document_ids,
         pct_v=pct_v,
         pct_t=pct_t,
         device=device,
@@ -282,6 +284,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         block_mask=None,
         content_starts=None,
         is_vision=None,
+        document_ids=None,
         position_offset: int | torch.Tensor = 0,
     ) -> tuple[torch.Tensor, dict]:
         """
@@ -365,6 +368,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                     kv_len=T_kv,
                     is_vision=is_vision_kv,
                     attention_mask=attn_mask_kv,
+                    document_ids=document_ids[:, :T_kv] if document_ids is not None else None,
                     pct_v=self.momh_pct_vision,
                     pct_t=self.momh_pct_text,
                     device=str(x.device),
@@ -531,6 +535,7 @@ class LanguageModelBlock(nn.Module):
         block_mask = None,
         content_starts: torch.Tensor | None = None,
         is_vision: torch.Tensor | None = None,
+        document_ids: torch.Tensor | None = None,
         position_offset: int | torch.Tensor = 0,
     ):
         """
@@ -563,6 +568,7 @@ class LanguageModelBlock(nn.Module):
             block_mask=block_mask,
             content_starts=content_starts,
             is_vision=is_vision,
+            document_ids=document_ids,
             position_offset=position_offset,
         )
         x = res + x
@@ -628,6 +634,7 @@ class LanguageModel(nn.Module):
         content_starts: torch.Tensor | None = None,
         is_vision: torch.Tensor | None = None,
         prefill_block_mask=None,
+        document_ids: torch.Tensor | None = None,
         position_offset: int | torch.Tensor | None = None,
     ):
         """
@@ -699,7 +706,6 @@ class LanguageModel(nn.Module):
                 allow_cache_entry_mutation=self.allow_activation_checkpointing_mutation,
             )
 
-        prefill_block_mask = None
         if (
             prefill_block_mask is None
             and attention_mask is not None
@@ -715,6 +721,7 @@ class LanguageModel(nn.Module):
                 seq_len=T_curr,
                 is_vision=is_vision[:, :T_curr],
                 attention_mask=attention_mask[:, :T_curr],
+                document_ids=document_ids[:, :T_curr] if document_ids is not None else None,
                 pct_v=float(self.blocks[0].attn.momh_pct_vision),
                 pct_t=float(self.blocks[0].attn.momh_pct_text),
                 device=str(x.device),
@@ -732,6 +739,7 @@ class LanguageModel(nn.Module):
                         block_mask=prefill_block_mask,
                         content_starts=content_starts,
                         is_vision=is_vision,
+                        document_ids=document_ids,
                         position_offset=position_offset,
                     )
                     return x_out
@@ -756,6 +764,7 @@ class LanguageModel(nn.Module):
                     block_mask=prefill_block_mask,
                     content_starts=content_starts,
                     is_vision=is_vision,
+                    document_ids=document_ids,
                     position_offset=position_offset,
                 )
 

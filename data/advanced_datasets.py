@@ -159,6 +159,14 @@ class ConstantLengthDataset(IterableDataset):
                     [sample["attention_mask"], torch.tensor([0])]
                 )
                 sample["labels"] = torch.cat([sample["labels"], torch.tensor([-100])])
+                if "document_ids" not in sample:
+                    raise KeyError(
+                        "Packed dataset requires each sample to provide `document_ids`. "
+                        "Ensure the base dataset returns `document_ids` (LongTensor of shape [T])."
+                    )
+                sample["document_ids"] = torch.cat(
+                    [sample["document_ids"], torch.tensor([0], dtype=sample["document_ids"].dtype)]
+                )
 
                 buffer.append(sample)
                 buffer_len += len(sample["input_ids"])
@@ -182,6 +190,7 @@ class ConstantLengthDataset(IterableDataset):
                     "labels":         packed[1],
                     "attention_mask": packed[2],
                     "images":         packed[3],
+                    "document_ids":   packed[4],
                 })
 
             if packed_group:
@@ -252,15 +261,34 @@ class ConstantLengthDataset(IterableDataset):
 
     def _pack_one_group(self, group_indices, batch, max_len):
         ids, lbl, am, ims = [], [], [], []
+        doc_id_chunks = []
 
-        for i in group_indices:
+        for doc_idx_in_pack, i in enumerate(group_indices):
             ids.extend(batch[i]["input_ids"])
             lbl.extend(batch[i]["labels"])
             am.extend(batch[i]["attention_mask"])
             ims.extend(batch[i]["images"])
 
+            if "document_ids" not in batch[i]:
+                raise KeyError(
+                    "Packed dataset requires each sample to provide `document_ids`. "
+                    "Ensure the base dataset returns `document_ids` (LongTensor of shape [T])."
+                )
+            doc = batch[i]["document_ids"]
+            if doc.ndim != 1:
+                raise ValueError(
+                    f"Expected document_ids to be 1D [T], got shape={tuple(doc.shape)}"
+                )
+            if doc.numel() != len(batch[i]["input_ids"]):
+                raise ValueError(
+                    "document_ids length mismatch: "
+                    f"len(document_ids)={int(doc.numel())} vs len(input_ids)={int(len(batch[i]['input_ids']))}"
+                )
+            doc_id_chunks.append(torch.full_like(doc, fill_value=int(doc_idx_in_pack)))
+
         # safety: assert we never overflow
         if len(ids) > max_len:
             raise ValueError(f"Packed length {len(ids)} > max_len {max_len}")
 
-        return torch.stack(ids), torch.stack(lbl), torch.stack(am), ims
+        document_ids = torch.cat(doc_id_chunks) if doc_id_chunks else torch.empty((0,), dtype=torch.long)
+        return torch.stack(ids), torch.stack(lbl), torch.stack(am), ims, document_ids
