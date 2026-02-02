@@ -177,6 +177,7 @@ class TrainConfig:
     log_wandb: bool = True
     wandb_entity: str = "erlandpg"
     wandb_project: str = "nanoVLM"
+    wandb_group: str | None = None
     wandb_xaxis_tokens: bool = False
     prefix_run_name: str | None = None
 
@@ -186,6 +187,12 @@ class TrainConfig:
     local_model_cp_path: str = "checkpoints/vanilla-cauldron"
     save_hf: bool = False
     hf_model_cp_path: str = "patrickamadeus/vanilla-cauldron"
+    checkpoint_every_n_steps: int = 500
+    checkpoint_dir: str = "checkpoints"
+    checkpoint_format: str = "dcp"  # "dcp" or "torch"
+    resume_from_checkpoint: str | None = None
+    resume_run_name: str | None = None
+    strict_resume: bool = True
 
     effective_token_lr_scale: bool = False
     effective_token_lr_exponent: float = 0.5

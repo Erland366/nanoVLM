@@ -24,6 +24,14 @@ from train_utils import (
     get_world_size, init_dist, is_dist, is_master,
     save_model_checkpoint, set_pg_cpu, set_seed, wrap_model,
 )
+from utils.checkpointing import (
+    capture_rng_state,
+    load_model_optimizer_state,
+    load_trainer_state,
+    restore_rng_state,
+    save_model_optimizer_state,
+    save_trainer_state,
+)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -44,6 +52,23 @@ def str2bool(value):
     if value_lower in {"false", "0", "no", "n", "f"}:
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def fast_forward_dataloader(iter_loader, num_batches: int, *, strict: bool):
+    if num_batches <= 0:
+        return iter_loader
+
+    skipped = 0
+    for _ in synchronized_dataloader_step(iter_loader, is_dist()):
+        skipped += 1
+        if skipped >= num_batches:
+            break
+
+    if skipped < num_batches and strict:
+        raise RuntimeError(
+            f"Unable to fast-forward dataloader by {num_batches} batches; only skipped {skipped}."
+        )
+    return iter_loader
 
 
 def _compile_module_list(modules, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"):
@@ -91,8 +116,32 @@ def get_lr(it, max_lr, max_steps):
 
 
 def train(train_cfg, vlm_cfg, global_cfg):
+    resume_state = None
+    resume_global_step = 0
+    resume_epoch = 0
+    resume_micro_step = 0
+    resume_warmup_batches = 0
+    resume_tokens_processed_global = 0
+    resume_source_run_name = None
+
+    if train_cfg.resume_from_checkpoint:
+        resume_state = load_trainer_state(train_cfg.resume_from_checkpoint, strict=train_cfg.strict_resume)
+        if resume_state:
+            resume_global_step = int(resume_state.get("global_step", 0))
+            resume_epoch = int(resume_state.get("epoch", 0))
+            resume_micro_step = int(resume_state.get("micro_step_in_epoch", 0))
+            resume_warmup_batches = int(resume_state.get("warmup_batches", 0))
+            resume_tokens_processed_global = int(resume_state.get("tokens_processed_global", 0))
+            resume_source_run_name = resume_state.get("run_name")
+            rng_state = resume_state.get("rng_state")
+            if rng_state:
+                restore_rng_state(rng_state)
+
+    do_warmup = not train_cfg.resume_from_checkpoint
+    warmup_batches = 1 if do_warmup else 0
+
     train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(
-        train_cfg, vlm_cfg, global_cfg
+        train_cfg, vlm_cfg, global_cfg, do_warmup=do_warmup
     )
 
     if is_dist():
@@ -103,7 +152,30 @@ def train(train_cfg, vlm_cfg, global_cfg):
         if is_master():
             print("All workers have gotten dataloaders.")
 
+    resume_skip_batches = resume_warmup_batches + resume_micro_step
+    if resume_skip_batches > 0:
+        if train_cfg.stream_dataset:
+            if is_master():
+                print("Warning: resume_from_checkpoint with stream_dataset=True will not be bitwise deterministic.")
+        else:
+            iter_train_loader = fast_forward_dataloader(
+                iter_train_loader,
+                resume_skip_batches,
+                strict=train_cfg.strict_resume,
+            )
+
     run_name = get_run_name(train_cfg, vlm_cfg)
+    if train_cfg.resume_from_checkpoint:
+        run_name = train_cfg.resume_run_name or resume_source_run_name or run_name
+    if train_cfg.checkpoint_format not in ("dcp", "torch"):
+        raise ValueError(f"Unsupported checkpoint_format: {train_cfg.checkpoint_format}")
+    if train_cfg.resume_from_checkpoint and is_master():
+        print(
+            f"Resuming from checkpoint: {train_cfg.resume_from_checkpoint} "
+            f"(global_step={resume_global_step}, epoch={resume_epoch}, micro_step_in_epoch={resume_micro_step})"
+        )
+        if train_cfg.resume_run_name and resume_source_run_name and train_cfg.resume_run_name != resume_source_run_name:
+            print(f"Using resume_run_name={train_cfg.resume_run_name} (checkpoint run_name={resume_source_run_name})")
     tokens_step_metric = "tokens/consumed"
     lmms_eval_step = "<lmms-eval-step>"
     run = None
@@ -111,6 +183,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
         run = wandb.init(
             entity=train_cfg.wandb_entity,
             project=train_cfg.wandb_project,
+            group=train_cfg.wandb_group,
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg),
@@ -130,7 +203,13 @@ def train(train_cfg, vlm_cfg, global_cfg):
         run.define_metric(name="lmms_eval/*", step_metric=lmms_eval_step)
 
     # Initialize model
-    if train_cfg.resume_from_vlm_checkpoint:
+    if train_cfg.resume_from_checkpoint:
+        if vlm_cfg.vlm_load_backbone_weights:
+            if is_master():
+                print("resume_from_checkpoint enabled: disabling backbone weight loading.")
+            vlm_cfg.vlm_load_backbone_weights = False
+        model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+    elif train_cfg.resume_from_vlm_checkpoint:
         print(f"Resuming from VLM checkpoint: {vlm_cfg.vlm_checkpoint_path}")
         model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
     else:
@@ -192,6 +271,16 @@ def train(train_cfg, vlm_cfg, global_cfg):
     print(f"Using device: {device}")
     model.to(device)
 
+    if train_cfg.resume_from_checkpoint:
+        use_dcp = train_cfg.checkpoint_format == "dcp"
+        load_model_optimizer_state(
+            train_cfg.resume_from_checkpoint,
+            model,
+            optimizer,
+            use_dcp=use_dcp,
+            strict=train_cfg.strict_resume,
+        )
+
     if getattr(train_cfg, "activation_memory_budget", None) is not None:
         if not 0.0 <= train_cfg.activation_memory_budget <= 1.0:
             raise ValueError("activation_memory_budget must be between 0 and 1.")
@@ -216,11 +305,12 @@ def train(train_cfg, vlm_cfg, global_cfg):
     best_val_loss = float('inf')
     best_model_path = None
     logged_eval_steps = set()
-    global_step = 0
-    epoch = 0
+    global_step = resume_global_step
+    epoch = resume_epoch
+    micro_step_in_epoch = resume_micro_step
     train_pbar = None
     current_lrs = {}
-    tokens_processed_global = 0
+    tokens_processed_global = resume_tokens_processed_global
     effective_tokens_accum = 0
     if train_cfg.stream_dataset:
         train_pbar = tqdm(
@@ -242,7 +332,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
     }
     
     while global_step < train_cfg.max_training_steps:
-        epoch += 1
+        current_epoch = epoch + 1
         epoch_start_time = time.time()
         model.train()
         total_train_loss = 0
@@ -254,15 +344,19 @@ def train(train_cfg, vlm_cfg, global_cfg):
         if not train_cfg.stream_dataset:
             train_pbar = tqdm(
                 total=len(train_loader),
-                desc=f"Epoch {epoch}",
+                desc=f"Epoch {current_epoch}",
                 leave=False,
                 disable=not is_master(),
             )
 
         print("Starting training loop")
-        for i, batch in enumerate(synchronized_dataloader_step(iter_train_loader, is_dist())):
+        for i, batch in enumerate(
+            synchronized_dataloader_step(iter_train_loader, is_dist()),
+            start=micro_step_in_epoch,
+        ):
             num_batches += 1
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0
+            micro_step_in_epoch = i + 1
             step_effective_tokens = None
             step_effective_token_ratio = None
             step_effective_token_lr_scale = 1.0
@@ -564,6 +658,53 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 global_step += 1
                 if train_cfg.save_model_every_n_steps and global_step % train_cfg.save_model_every_n_steps == 0:
                     save_model_checkpoint(model, train_cfg, global_step=global_step)
+                if (
+                    train_cfg.checkpoint_every_n_steps > 0
+                    and global_step % train_cfg.checkpoint_every_n_steps == 0
+                ):
+                    checkpoint_path = os.path.join(
+                        train_cfg.checkpoint_dir,
+                        run_name,
+                        f"step_{global_step}",
+                    )
+                    use_dcp = train_cfg.checkpoint_format == "dcp"
+                    save_format = save_model_optimizer_state(
+                        checkpoint_path,
+                        model,
+                        optimizer,
+                        use_dcp=use_dcp,
+                        strict=train_cfg.strict_resume,
+                    )
+                    trainer_state = {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "micro_step_in_epoch": micro_step_in_epoch,
+                        "warmup_batches": warmup_batches,
+                        "tokens_processed_global": tokens_processed_global,
+                        "run_name": run_name,
+                        "rng_state": capture_rng_state(),
+                        "train_cfg": asdict(train_cfg),
+                        "vlm_cfg": asdict(vlm_cfg),
+                    }
+                    save_trainer_state(checkpoint_path, trainer_state)
+
+                    if is_master():
+                        meta_path = os.path.join(checkpoint_path, "meta.json")
+                        with open(meta_path, "w") as f:
+                            json.dump(
+                                {
+                                    "global_step": global_step,
+                                    "epoch": epoch,
+                                    "micro_step_in_epoch": micro_step_in_epoch,
+                                    "warmup_batches": warmup_batches,
+                                    "tokens_processed_global": tokens_processed_global,
+                                    "run_name": run_name,
+                                    "checkpoint_format": save_format,
+                                },
+                                f,
+                                indent=2,
+                            )
+                        print(f"Saved checkpoint to {checkpoint_path} ({save_format})")
                 if getattr(train_cfg, "max_training_tokens", None) is not None:
                     tokens_processed = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
                     if tokens_processed >= train_cfg.max_training_tokens:
@@ -606,7 +747,9 @@ def train(train_cfg, vlm_cfg, global_cfg):
                     log_payload[tokens_step_metric] = tokens_step_value
                 run.log(log_payload)
 
-            print(f"Epoch: {epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
+            print(f"Epoch: {current_epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
+        epoch += 1
+        micro_step_in_epoch = 0
 
     if train_cfg.stream_dataset and train_pbar is not None and is_master():
         train_pbar.close()
@@ -645,6 +788,7 @@ def main():
     parser.add_argument('--activation_checkpointing', type=str2bool, help='Enable activation checkpointing for LM/VIT blocks')
     parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
     parser.add_argument('--momh_enabled', type=str2bool, help='Enable MoMH attention')
+    parser.add_argument('--wandb_group', type=str, help='W&B group name for related runs')
     parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
     parser.add_argument('--max_training_tokens', type=int, help='Stop after this many effective tokens (non-padding)')
     parser.add_argument('--pack_sequences', type=str2bool, help='Enable packing multiple samples per sequence')
@@ -653,6 +797,12 @@ def main():
     parser.add_argument('--wandb_xaxis_tokens', type=str2bool, help='Use tokens as wandb x-axis')
     parser.add_argument('--log_wandb', type=str2bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=str2bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
+    parser.add_argument('--checkpoint_every_n_steps', type=int, help='Save training state every N optimizer steps')
+    parser.add_argument('--checkpoint_dir', type=str, help='Base directory for training checkpoints')
+    parser.add_argument('--checkpoint_format', type=str, help='Checkpoint format: dcp or torch')
+    parser.add_argument('--resume_from_checkpoint', type=str, help='Path to checkpoint directory to resume from')
+    parser.add_argument('--resume_run_name', type=str, help='Override run name when resuming from checkpoint')
+    parser.add_argument('--strict_resume', type=str2bool, help='Fail if checkpoint is missing expected keys')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
@@ -682,6 +832,20 @@ def main():
         train_cfg.activation_memory_budget = args.activation_memory_budget
     if args.momh_enabled is not None:
         vlm_cfg.momh_enabled = args.momh_enabled
+    if args.wandb_group is not None:
+        train_cfg.wandb_group = args.wandb_group
+    if args.checkpoint_every_n_steps is not None:
+        train_cfg.checkpoint_every_n_steps = args.checkpoint_every_n_steps
+    if args.checkpoint_dir is not None:
+        train_cfg.checkpoint_dir = args.checkpoint_dir
+    if args.checkpoint_format is not None:
+        train_cfg.checkpoint_format = args.checkpoint_format
+    if args.resume_from_checkpoint is not None:
+        train_cfg.resume_from_checkpoint = args.resume_from_checkpoint
+    if args.resume_run_name is not None:
+        train_cfg.resume_run_name = args.resume_run_name
+    if args.strict_resume is not None:
+        train_cfg.strict_resume = args.strict_resume
     if args.max_training_steps is not None:
         train_cfg.max_training_steps = args.max_training_steps
     if args.max_training_tokens is not None:
@@ -709,6 +873,9 @@ def main():
     if args.formatting_min_rating is not None:
         train_cfg.formatting_min_rating = args.formatting_min_rating
 
+    if args.resume_from_checkpoint is not None:
+        train_cfg.resume_from_vlm_checkpoint = False
+        vlm_cfg.vlm_load_backbone_weights = False
     if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
         train_cfg.resume_from_vlm_checkpoint = True
         # When resuming a full VLM, we don't need to load individual backbone weights from original sources

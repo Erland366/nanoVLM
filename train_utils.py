@@ -211,7 +211,7 @@ def _maybe_shuffle_streaming_dataset(dataset, train_cfg, global_cfg, seed_offset
     return dataset.shuffle(buffer_size=buffer_size, seed=global_cfg.seed + seed_offset)
 
 
-def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
+def get_dataloaders(train_cfg, vlm_cfg, global_cfg, *, do_warmup: bool = True):
     print(f"Getting dataloaders from {train_cfg.train_dataset_path}")
     image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens, vlm_cfg.lm_chat_template)
@@ -465,12 +465,14 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg):
         generator=g,
     )
 
-    print("Warming up dataloaders...")
     iter_train_loader = iter(train_loader)
     iter_val_loader = iter(val_loader)
-    next(iter_train_loader)
-    next(iter_val_loader)
-    print("Warmup complete.")
+
+    if do_warmup:
+        print("Warming up dataloaders...")
+        next(iter_train_loader)
+        next(iter_val_loader)
+        print("Warmup complete.")
 
     return train_loader, val_loader, iter_train_loader, iter_val_loader
 
