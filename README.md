@@ -97,14 +97,10 @@ lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000. 
 If you want tokens to be the default step metric, set `TrainConfig.wandb_xaxis_tokens=True`.
 
 To scale LR by effective (non-padding) tokens per update step, set `TrainConfig.effective_token_lr_scale=True`.
-We compute `ratio = effective_tokens / (B_global * lm_max_length)` and apply `ratio**0.5` **after** the LR scheduler.
-This logs `effective_tokens`, `effective_token_ratio`, and `effective_token_lr_scale` each update step. Override the
-exponent with `TrainConfig.effective_token_lr_exponent` or `--effective_token_lr_exponent`.
-
-If you want the LR schedule itself to advance by **tokens** instead of steps, set
-`TrainConfig.lr_schedule_by_tokens=True` (or `--lr_schedule_by_tokens True`). The scheduler step becomes
-`tokens_processed_global / (B_global * lm_max_length)`. If `max_training_tokens` is set, the scheduler max
-steps are derived from that token budget; otherwise it uses `max_training_steps`.
+We compute `ratio = effective_tokens / (B_global * lm_max_length)` and apply `ratio**effective_token_lr_exponent`
+**after** the LR scheduler (default exponent is 0.5). This logs `effective_tokens`, `effective_token_ratio`, and
+`effective_token_lr_scale` each update step. Override the exponent with
+`TrainConfig.effective_token_lr_exponent` or `--effective_token_lr_exponent`.
 
 To cap training for a short run, use `--max_training_steps N` or `--max_training_tokens N` (effective tokens).
 If both are set, training stops when either limit is reached.

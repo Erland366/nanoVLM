@@ -88,7 +88,6 @@ class TrainConfig:
     stats_log_interval: int = 10
     max_training_steps: int = 30000
     max_training_tokens: int | None = None
-    lr_schedule_by_tokens: bool = False
     max_images_per_example: int = 10
     max_images_per_knapsack: int = 18
     max_sample_length: int = 1024

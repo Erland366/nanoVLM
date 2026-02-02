@@ -557,23 +557,13 @@ def train(train_cfg, vlm_cfg):
                 )
                 schedule_step = global_step
                 schedule_max_steps = train_cfg.max_training_steps
-                if train_cfg.lr_schedule_by_tokens:
-                    schedule_tokens = tokens_processed_global
-                    if is_dist():
-                        schedule_tokens = sum(dist_gather(schedule_tokens))
-                    schedule_step = schedule_tokens / max(denom_tokens, 1)
-                    if train_cfg.max_training_tokens is not None:
-                        schedule_max_steps = train_cfg.max_training_tokens / max(denom_tokens, 1)
                 if train_cfg.effective_token_lr_scale or train_cfg.log_wandb:
                     step_effective_tokens = effective_tokens_accum
                     if is_dist():
                         step_effective_tokens = sum(dist_gather(step_effective_tokens))
                     step_effective_token_ratio = step_effective_tokens / max(denom_tokens, 1)
-                    _, step_effective_token_lr_scale = compute_effective_token_scale(
-                        step_effective_tokens,
-                        denom_tokens,
-                        train_cfg.effective_token_lr_exponent,
-                    )
+                    ratio_clamped = min(max(step_effective_token_ratio, 1e-6), 1.0)
+                    step_effective_token_lr_scale = ratio_clamped ** train_cfg.effective_token_lr_exponent
                     if not train_cfg.effective_token_lr_scale:
                         step_effective_token_lr_scale = 1.0
 
@@ -871,7 +861,6 @@ def main():
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
     parser.add_argument('--max_training_tokens', type=int, help='Stop after this many effective tokens (non-padding)')
-    parser.add_argument('--lr_schedule_by_tokens', type=str2bool, help='Use token-based LR scheduling')
     parser.add_argument('--pack_sequences', type=str2bool, help='Enable packing multiple samples per sequence')
     parser.add_argument('--effective_token_lr_scale', type=str2bool, help='Scale LR by effective token ratio each step')
     parser.add_argument('--effective_token_lr_exponent', type=float, help='Exponent for effective token LR scaling')
@@ -909,8 +898,6 @@ def main():
         train_cfg.max_training_steps = args.max_training_steps
     if args.max_training_tokens is not None:
         train_cfg.max_training_tokens = args.max_training_tokens
-    if args.lr_schedule_by_tokens is not None:
-        train_cfg.lr_schedule_by_tokens = args.lr_schedule_by_tokens
     if args.pack_sequences is not None:
         train_cfg.pack_sequences = args.pack_sequences
     if args.effective_token_lr_scale is not None:

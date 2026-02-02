@@ -14,6 +14,16 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-02 — Retrospective: effective-token LR scaling vs packed baseline
+
+**Type:** Retrospective  
+**General description:** Compared effective-token LR scaling variants against packed training to reduce padding-induced noise.
+
+**Details:** Evaluated non-pack runs with effective-token LR scaling exponents (0.5, 1.0, 1.5, 2.0), step vs token scheduling, and EMA smoothing over a 500k-token budget. Best MAE vs packed came from exponent 1.5 step schedule (MAE ~1.54), with exponent 1.0 close behind (MAE ~1.56). Token-based scheduling and EMA did not improve results, and exponent 2.0 degraded performance. Non-pack still lags packed under the same token budget.
+
+**Links:**  
+- Report: `training_reports/effective-token-lr-scaling-2026-02-02.md`
+
 ## 2026-02-01 — Effective-token LR scaling
 
 **Type:** Observation  
