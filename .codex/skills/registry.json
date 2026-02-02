@@ -35,6 +35,10 @@
     "padding-aware-lr-scaling": {
       "type": "result",
       "description": "Scale LR by effective-token ratio for non-pack training with heavy padding"
+    },
+    "nanovlm-checkpointing-determinism": {
+      "type": "result",
+      "description": "Deterministic resume with full-state checkpoints for nanoVLM training"
     }
   },
   "paths": {

@@ -162,3 +162,17 @@ Added an opt-in `TrainConfig.compile_dynamic_shapes` switch that uses `torch._dy
 **Files**: See `training_reports/momh_flex_attention_retrospective.md` for full details.
 
 <!-- New entries go above this line -->
+
+## 2026-02-02 — Checkpointing + deterministic resume validation
+
+**Type:** Retrospective  
+**General description:** Added full-state checkpointing and validated deterministic resume from step 50 to 100.
+
+### Details
+
+- Checkpoints now include model weights, optimizer state, RNG state, and dataloader progress (global_step, epoch, micro_step_in_epoch, warmup_batches, tokens_processed_global).
+- Resume restores RNG, fast-forwards dataloader for in-epoch resumption, disables warmup on resume, and reloads optimizer state.
+- Determinism verified on GPU: a baseline 100-step run matched the resumed run (from step_50) for batch_loss and grad_norm on steps 50–99.
+  - Baseline run: `ckpt-100full-gpu_...` (W&B run id `l0lrs914`)
+  - Resume run: `ckpt-100resume-gpu-...` (W&B run id `9zf5afcy`)
+- Updated PyTorch to 2.10.0+cu128 to support Blackwell (sm_120) GPUs after `no kernel image` failures on older builds.

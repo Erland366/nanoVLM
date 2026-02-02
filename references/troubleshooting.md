@@ -22,6 +22,8 @@ This file documents error patterns encountered and their solutions.
 | Input shape mismatch | `ValueError: not enough values to unpack` | Passing 2D token IDs when model expects 3D embeddings (`lm_use_tokens=False`) | Use embeddings `[B, T, D]` not token IDs `[B, T]` |
 | BlockMask batch size | Errors when batch size changes between calls | BlockMask created with fixed batch size | Recreate BlockMask when batch size changes, or resize content_starts buffer |
 | MoMH prefill graph break | `TORCH_LOGS=graph_breaks` shows `_build_momh_block_mask_prefill` | Block-mask creation inside compiled decoder (`torch.compiler.disable`) | Build block mask in VLM wrapper and pass `prefill_block_mask` into decoder |
+| Blackwell CUDA kernel image | `CUDA error: no kernel image is available for execution on the device` | PyTorch build lacks sm_120 support | Install a CUDA 12.8+ PyTorch build (e.g., torch 2.10.0+cu128) |
+| Checkpoint load missing state | `No trainer state found` or missing trainer fields on resume | PyTorch 2.6+ defaults `torch.load` to `weights_only=True` | Load trainer/checkpoint state with `weights_only=False` |
 
 ## flex_attention Debugging
 
