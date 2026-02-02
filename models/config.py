@@ -128,6 +128,7 @@ class TrainConfig:
     max_val_batches: int = 5000
     wandb_entity: str = ""
     wandb_project: str = "dualtower"
+    wandb_group: str | None = None
     log_wandb: bool = True
     wandb_xaxis_tokens: bool = False
     prefix_run_name: str | None = None
@@ -141,6 +142,7 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_format: str = "dcp"  # "dcp" or "torch"
     resume_from_checkpoint: str | None = None
+    resume_run_name: str | None = None
     strict_resume: bool = True
     effective_token_lr_scale: bool = False
     effective_token_lr_exponent: float = 0.5
