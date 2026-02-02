@@ -1,5 +1,10 @@
 #!/bin/bash
 
+export WANDB_API_KEY=
+export HF_TOKEN=
+export HF_HOME=
+export CUDA_VISIBLE_DEVICES=
+
 srun torchrun --nproc_per_node=$SLURM_GPUS_PER_NODE \
     --nnodes=$SLURM_NNODES \
     --rdzv_id=$SLURM_JOB_ID \

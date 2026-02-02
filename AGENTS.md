@@ -1,7 +1,7 @@
 # AGENTS.md — Project Operating Contract
 
 > **Domain:** research
-> **Created:** 2026-01-30
+> **Created:** 2026-01-13
 
 This document defines the operational contract for AI agents working in this project.
 

@@ -2,43 +2,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
-
-from models.activation_checkpointing import get_default_sac_policy, get_sac_context_fn
-
-from models.momh_attention import (
-    flex_attention_compiled,
-    flex_attention_compiled_dynamic,
-    create_momh_block_mask,
-    create_momh_block_mask_from_modality,
-    generate_momh_score_mod_with_offset,
-)
-
-
-@torch.compiler.disable
-def _build_momh_block_mask_prefill(
-    *,
-    n_q_heads: int,
-    seq_len: int,
-    is_vision: torch.Tensor,
-    attention_mask: torch.Tensor,
-    pct_v: float,
-    pct_t: float,
-    device: str,
-):
-    # Building the BlockMask is expensive and produces a non-Tensor object; keep it out of
-    # the torch.compile graph and reuse it across all LM blocks in a forward pass.
-    seq_len = int(seq_len)
-    return create_momh_block_mask_from_modality(
-        n_q_heads=n_q_heads,
-        q_len=seq_len,
-        kv_len=seq_len,
-        is_vision=is_vision,
-        attention_mask=attention_mask,
-        pct_v=pct_v,
-        pct_t=pct_t,
-        device=device,
-    )
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
 class RMSNorm(nn.Module):
@@ -106,12 +69,13 @@ class RotaryEmbedding(nn.Module):
         self.attention_scaling = cfg.lm_attn_scaling
 
     @torch.no_grad()
-    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, position_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute rotary positional embeddings (cosine and sine components).
 
         Args:
             position_ids (torch.Tensor): Tensor of shape (batch_size, seq_len) containing position indices.
+            attention_mask (torch.Tensor, optional): Tensor of shape (batch_size, seq_len) with 1 for valid tokens, 0 for padding.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Tuple of two tensors (cos, sin), each of shape
@@ -119,11 +83,20 @@ class RotaryEmbedding(nn.Module):
         """
 
         batch_size, seq_len = position_ids.shape
-        # Dynamic scaling for longer sequences without data-dependent branching (torch.compile friendly).
-        # If max position exceeds original max, scale down frequencies; otherwise scale=1.
-        max_seq = position_ids.max() + 1  # tensor scalar
-        scale = torch.clamp(max_seq / float(self.original_max_seq_len), min=1.0)
-        inv_freq = self.inv_freq / scale
+        
+        # If attention mask is provided, adjust position_ids to not increment for padding tokens
+        if attention_mask is not None:
+           position_ids = attention_mask.cumsum(dim=1) - 1
+           position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+        
+        # Dynamic scaling for longer sequences
+        # Divide the angle frequency to fit more rotation into the embedding space.
+        max_seq = position_ids.max() + 1
+        if max_seq > self.original_max_seq_len:
+            scale = max_seq / self.original_max_seq_len
+            inv_freq = self.inv_freq / scale
+        else:
+            inv_freq = self.inv_freq
             
         # Compute theta = position * frequency
         # Flatten position_ids for batch processing
@@ -141,6 +114,11 @@ class RotaryEmbedding(nn.Module):
         # Compute cos and sin
         cos = torch.cos(emb) * self.attention_scaling
         sin = torch.sin(emb) * self.attention_scaling
+
+        if attention_mask is not None:
+            mask_expanded = attention_mask.unsqueeze(-1).expand_as(cos)
+            cos = cos * mask_expanded.float()
+            sin = sin * mask_expanded.float()
         
         return cos, sin
 
@@ -204,34 +182,20 @@ class LanguageModelGroupedQueryAttention(nn.Module):
     GQA reduces computation by using fewer key-value heads than query heads,
     grouping multiple query heads to share the same key-value heads.
 
-    Optionally supports Mixture of Modality Heads (MoMH) for vision-language models,
-    where different heads specialize in different modality attention patterns.
-
     Args:
         cfg: Configuration object containing:
             - lm_n_heads (int): Number of query heads.
             - lm_n_kv_heads (int): Number of key-value heads.
             - lm_hidden_dim (int): Hidden embedding dimension.
             - lm_dropout (float): Dropout rate.
-            - momh_enabled (bool): Enable Mixture of Modality Heads.
-            - momh_head_pct_vision (float): Percentage of heads for V->V.
-            - momh_head_pct_text (float): Percentage of heads for T->T.
-            - mp_image_token_length (int): Legacy (span-based) vision length; not used for masking.
     """
     def __init__(self, cfg):
         super().__init__()
 
-        self.cfg = cfg
         self.n_heads = cfg.lm_n_heads
         self.n_kv_heads = cfg.lm_n_kv_heads
         self.embd_dim = cfg.lm_hidden_dim
         self.dropout = cfg.lm_dropout
-
-        # MoMH configuration
-        self.momh_enabled = getattr(cfg, 'momh_enabled', False)
-        self.momh_pct_vision = getattr(cfg, 'momh_head_pct_vision', 0.4)
-        self.momh_pct_text = getattr(cfg, 'momh_head_pct_text', 0.4)
-        self.S_V = getattr(cfg, 'mp_image_token_length', 64)
 
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         assert self.embd_dim % self.n_heads == 0, "embd_dim must be divisible by num_heads"
@@ -252,38 +216,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
-        # MoMH decode support (span-based legacy mode): captured tensor buffers + score_mod.
-        # These are created lazily on first decode to ensure correct device placement.
-        self._momh_decode_score_mod = None
-        self._momh_content_starts_buffer = None
-        self._momh_position_offset_buffer = None
-
-    def _get_momh_decode_score_mod(self, device: torch.device):
-        if self._momh_decode_score_mod is None:
-            self._momh_content_starts_buffer = torch.zeros(1, dtype=torch.int64, device=device)
-            self._momh_position_offset_buffer = torch.tensor(0, dtype=torch.int64, device=device)
-            self._momh_decode_score_mod = generate_momh_score_mod_with_offset(
-                n_q_heads=self.n_heads,
-                S_V=self.S_V,
-                content_starts=self._momh_content_starts_buffer,
-                position_offset=self._momh_position_offset_buffer,
-                pct_v=self.momh_pct_vision,
-                pct_t=self.momh_pct_text,
-            )
-        return self._momh_decode_score_mod
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attention_mask=None,
-        block_kv_cache=None,
-        block_mask=None,
-        content_starts=None,
-        is_vision=None,
-        position_offset: int | torch.Tensor = 0,
-    ) -> tuple[torch.Tensor, dict]:
+    def forward_ori(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
 
@@ -297,8 +230,6 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             attention_mask (Tensor, optional): Attention mask tensor of shape (B, total_kv_length),
                                                with 1 for tokens to attend to and 0 for padding.
             block_kv_cache (dict, optional): Cache dict with 'key' and 'value' tensors for autoregressive decoding.
-            is_vision (Tensor, optional): Bool tensor of shape (B, total_kv_length) marking vision tokens
-                                          (typically `<|image|>` placeholder positions). Required for MoMH.
 
         Returns:
             tuple[Tensor, dict]:
@@ -338,125 +269,182 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         
         T_kv = k_exp.size(2) # Total sequence length of keys/values
 
-        # MoMH path (preferred): use an explicit per-token modality mask (is_vision) and attention_mask.
-        use_momh_modality = (
-            self.momh_enabled
-            and (is_vision is not None)
-            and (attention_mask is not None)
-            and x.device.type == "cuda"
-        )
+        # Prepare attention mask for SDPA or manual path
+        # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
+        additive_attn_mask = None
+        if attention_mask is not None:
+            # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
+            # Let's make it `[B, 1, 1, T_kv]` for SDPA.
+            mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
+            additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
+            # This additive_attn_mask shape is [B, 1, 1, T_kv]
 
-        # Legacy MoMH span-based mode: driven by left-padding content_starts and fixed S_V.
-        # Kept for older tests and workflows that predate `is_vision` masking.
-        use_momh_span = (
-            (not use_momh_modality)
-            and self.momh_enabled
-            and (content_starts is not None)
-            and x.device.type == "cuda"
-        )
-
-        if use_momh_modality:
-            if block_mask is None:
-                is_vision_kv = is_vision[:, :T_kv]
-                attn_mask_kv = attention_mask[:, :T_kv]
-                block_mask = create_momh_block_mask_from_modality(
-                    n_q_heads=self.n_heads,
-                    q_len=T_curr,
-                    kv_len=T_kv,
-                    is_vision=is_vision_kv,
-                    attention_mask=attn_mask_kv,
-                    pct_v=self.momh_pct_vision,
-                    pct_t=self.momh_pct_text,
-                    device=str(x.device),
-                )
-
-            target_dtype = q.dtype
-            k_exp = k_exp.to(target_dtype)
-            v_exp = v_exp.to(target_dtype)
-            if is_prefill:
-                y = flex_attention_compiled(q, k_exp, v_exp, block_mask=block_mask)
-            else:
-                y = flex_attention_compiled_dynamic(q, k_exp, v_exp, block_mask=block_mask)
-
-        elif use_momh_span and is_prefill:
-            block_mask = create_momh_block_mask(
-                n_q_heads=self.n_heads,
-                seq_len=T_kv,
-                S_V=self.S_V,
-                content_starts=content_starts,
-                pct_v=self.momh_pct_vision,
-                pct_t=self.momh_pct_text,
-                device=str(x.device),
+        if self.sdpa and x.device.type != 'mps':
+            # During decode, no additional masking needed as [1, T_kv] is naturally causal
+            is_causal = (T_curr == T_kv and T_curr > 1)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k_exp, v_exp,
+                attn_mask=additive_attn_mask, 
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=is_causal
             )
-            target_dtype = q.dtype
-            k_exp = k_exp.to(target_dtype)
-            v_exp = v_exp.to(target_dtype)
-            y = flex_attention_compiled(q, k_exp, v_exp, block_mask=block_mask)
-
-        elif use_momh_span and (not is_prefill):
-            score_mod = self._get_momh_decode_score_mod(x.device)
-
-            if self._momh_content_starts_buffer.shape[0] != content_starts.shape[0]:
-                self._momh_content_starts_buffer = content_starts.clone()
-                self._momh_decode_score_mod = generate_momh_score_mod_with_offset(
-                    n_q_heads=self.n_heads,
-                    S_V=self.S_V,
-                    content_starts=self._momh_content_starts_buffer,
-                    position_offset=self._momh_position_offset_buffer,
-                    pct_v=self.momh_pct_vision,
-                    pct_t=self.momh_pct_text,
-                )
-                score_mod = self._momh_decode_score_mod
-            else:
-                self._momh_content_starts_buffer.copy_(content_starts)
-
-            if isinstance(position_offset, torch.Tensor):
-                position_offset = int(position_offset.item())
-            self._momh_position_offset_buffer.fill_(int(position_offset))
-
-            target_dtype = q.dtype
-            k_exp = k_exp.to(target_dtype)
-            v_exp = v_exp.to(target_dtype)
-            y = flex_attention_compiled_dynamic(q, k_exp, v_exp, score_mod=score_mod)
         else:
-            # Standard attention path (decode phase, MoMH disabled, or non-CUDA)
-            # Prepare attention mask for SDPA or manual path
-            # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
-            additive_attn_mask = None
-            if attention_mask is not None:
-                # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
-                # Let's make it `[B, 1, 1, T_kv]` for SDPA.
-                mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
-                additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
-                # This additive_attn_mask shape is [B, 1, 1, T_kv]
+            # Manual attention implementation
+            attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
+            # During decode: no additional masking needed as [1, T_kv] is naturally causal
+            if T_curr == T_kv and T_curr > 1:
+                causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
+                attn = attn.masked_fill(~causal_mask_val, float('-inf'))
 
-            if self.sdpa and x.device.type != 'mps':
-                # During decode, no additional masking needed as [1, T_kv] is naturally causal
-                is_causal = (T_curr == T_kv and T_curr > 1)
-                y = torch.nn.functional.scaled_dot_product_attention(
-                    q, k_exp, v_exp,
-                    attn_mask=additive_attn_mask,
-                    dropout_p=self.dropout if self.training else 0.0,
-                    is_causal=is_causal
-                )
-            else:
-                # Manual attention implementation
-                attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
-                # During decode: no additional masking needed as [1, T_kv] is naturally causal
-                if T_curr == T_kv and T_curr > 1:
-                    causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
-                    attn = attn.masked_fill(~causal_mask_val, float('-inf'))
+            if additive_attn_mask is not None: # Additive padding mask
+                # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
+                attn = attn + additive_attn_mask 
 
-                if additive_attn_mask is not None: # Additive padding mask
-                    # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
-                    attn = attn + additive_attn_mask
-
-                attn = F.softmax(attn, dim=-1)
-                attn = self.attn_dropout(attn)
-                y = attn @ v_exp
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            y = attn @ v_exp
             
-        # Ensure output dtype matches input (flex_attention may return float32).
-        y = y.to(x.dtype)
+        y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
+        y = self.out_proj(y)
+        y = self.resid_dropout(y)
+
+        return y, block_kv_cache
+
+
+    def forward(self, x, cos, sin, attention_mask=None, block_kv_cache=None):
+        # Handle case when block_kv_cache is None (e.g., LeftTower first pass)
+        if block_kv_cache is None:
+            return self.forward_ori(x, cos, sin, attention_mask, block_kv_cache)
+        
+        # block_kv_cache exists, there will always be T_img_kv length from the image side
+        B, T_curr, C = x.size()
+        T_img_kv = block_kv_cache['key'].size(2)
+        is_dual_prefill = (T_curr > T_img_kv)
+
+        # let's construct full q,k,v first, we will replace the kv from image later
+        # we must do this to preserve the pos embedding assignment validity
+        q_curr = self.q_proj(x).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
+        k_curr = self.k_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+        v_curr = self.v_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+
+        q, k_rotated = apply_rotary_pos_embd(q_curr, k_curr, cos, sin)
+
+        # now since we already got the full RoPE-ed input, lets develop the logic to detect whether this is special case or no
+        if is_dual_prefill:
+            k_img = block_kv_cache['key']
+            v_img = block_kv_cache['value']
+            # then, up to [:T_img_kv], replace with k_img and v_img
+            k = torch.cat([k_img, k_rotated[:,:,T_img_kv:,:]], dim=2)  # (B, n_kv_heads, T_curr (with replacement), head_dim)
+            v = torch.cat([v_img, v_curr[:,:,T_img_kv:,:]], dim=2)  # (B, n_kv_heads, T_curr (with replacement), head_dim)
+            # then assign it back to the original `block_kv_cache`
+            block_kv_cache['key'] = k
+            block_kv_cache['value'] = v
+        else:
+            # Concatenate with cached K, V
+            # k_rotated and v_curr are for the new token(s)
+            k = block_kv_cache['key']
+            v = block_kv_cache['value']
+            k = torch.cat([k, k_rotated], dim=2)
+            v = torch.cat([v, v_curr], dim=2)
+            block_kv_cache['key'] = k
+            block_kv_cache['value'] = v
+        
+        # Repeat K, V for Grouped Query Attention
+        k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
+        v_exp = v.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
+        
+        T_kv = k_exp.size(2) # Total sequence length of keys/values
+
+        # Prepare attention mask for SDPA or manual path
+        # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
+        additive_attn_mask = None
+        if attention_mask is not None:
+            # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
+            # Let's make it `[B, 1, 1, T_kv]` for SDPA.
+            mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
+            # Convert to additive mask: 1 (attend) -> 0.0, 0 (pad) -> -inf
+            additive_attn_mask = torch.where(mask_for_keys.unsqueeze(1).unsqueeze(2).bool(), 0.0, float('-inf'))
+            # This additive_attn_mask shape is [B, 1, 1, T_kv]
+        
+        # Create modified causal mask once (shared between SDPA and manual paths)
+        # in the case of autoregressive decoding, NO NEED TO MAKE THIS, since one query token will naturally look at all others (pure self-attention)
+        # that's why the condition is if T_curr > 1, where autoregressive generation T_curr == 1 always
+        causal_mask_bool = None
+        if T_curr == T_kv and T_curr > 1:
+            # Create modified causal mask: image tokens attend bidirectionally, text tokens attend causally
+            # -img- -txt-
+            # 11111 10000
+            # 11111 11000
+            # 11111 11100
+            # 11111 11110
+            # 11111 11111
+
+
+            # 1. Image Bidirectional Masking
+            causal_mask_bool = torch.zeros(T_curr, T_curr, device=x.device, dtype=torch.bool)
+            # first T_img_kv rows can attend to first T_img_kv columns only
+            causal_mask_bool[:T_img_kv, :T_img_kv] = True
+            # all text rows can attend to the image columns (before causal)
+            causal_mask_bool[T_img_kv:, :T_img_kv] = True
+            
+
+
+            # 2. Causal Applying
+            # get the length of text and prepare the causal lower triangle matrix
+            text_len = T_curr - T_img_kv
+            text_causal = torch.tril(torch.ones(text_len, text_len, device=x.device, dtype=torch.bool))
+            # patch such triangle to the text area only
+            causal_mask_bool[T_img_kv:, T_img_kv:] = text_causal
+            # for broadcasting compatibility, add (B, n_heads) dimensions
+            causal_mask_bool = causal_mask_bool.view(1, 1, T_curr, T_curr)
+
+
+            # 3. Expectation result:
+            # assuming T_curr = 10 and T_kv  = 2, then the produced mask is ->
+            # tensor([[[[ True,  True,  True,  True,  True,  True,  True,  True,  True,  True], <- bidirectional for first img token (will be masked anyway)
+            #           [ True,  True,  True,  True,  True,  True,  True,  True,  True,  True], <- bidirectional ~ (masked anyway)
+            #           [ True,  True,  True, False, False, False, False, False, False, False], <- start of modified causal for text token #0
+            #           [ True,  True,  True,  True, False, False, False, False, False, False], <- text token #1
+            #           [ True,  True,  True,  True,  True, False, False, False, False, False], <- ...
+            #           [ True,  True,  True,  True,  True,  True, False, False, False, False],
+            #           [ True,  True,  True,  True,  True,  True,  True, False, False, False],
+            #           [ True,  True,  True,  True,  True,  True,  True,  True, False, False],
+            #           [ True,  True,  True,  True,  True,  True,  True,  True,  True, False],
+            #           [ True,  True,  True,  True,  True,  True,  True,  True,  True,  True]]]]) <- last text token
+        
+        
+        if self.sdpa and x.device.type != 'mps':
+            combined_mask = additive_attn_mask
+            if causal_mask_bool is not None:
+                # convert boolean mask to additive mask: True -> 0.0, False -> -inf
+                modified_causal_mask = torch.where(causal_mask_bool, 0.0, float('-inf'))
+                # if there is additive, add it to block <pad> / unattended token, else just use the pure causal
+                combined_mask = modified_causal_mask + additive_attn_mask if additive_attn_mask is not None else modified_causal_mask
+                # TODO: Remove after proofing
+                causal_attn = combined_mask
+            
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k_exp, v_exp,
+                attn_mask=combined_mask, # in the case of None, it will become standard bidirectional self attention mechanism
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False  # False, since we handle causal masking explicitly above
+            )
+        else:
+            # Manual attention implementation
+            attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
+
+            # Apply modified causal masking during dual prefill
+            if causal_mask_bool is not None:
+                attn = attn.masked_fill(~causal_mask_bool, float('-inf'))
+
+            if additive_attn_mask is not None: # Additive padding mask
+                # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
+                attn = attn + additive_attn_mask
+            
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            y = attn @ v_exp
+            
         y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
         y = self.out_proj(y)
         y = self.resid_dropout(y)
@@ -521,18 +509,7 @@ class LanguageModelBlock(nn.Module):
         self.norm1 = RMSNorm(cfg) # Input Norm
         self.norm2 = RMSNorm(cfg) # Post Attention Norm
     
-    def forward(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        block_kv_cache: dict | None = None,
-        block_mask = None,
-        content_starts: torch.Tensor | None = None,
-        is_vision: torch.Tensor | None = None,
-        position_offset: int | torch.Tensor = 0,
-    ):
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None):
         """
         Forward pass of the Transformer block.
 
@@ -545,8 +522,6 @@ class LanguageModelBlock(nn.Module):
                 with 1 indicating tokens to attend to and 0 for padding tokens.
             block_kv_cache (dict, optional): Key-value cache dict for cached keys and values
                 during decoding. If None, no cache is used.
-            content_starts (Tensor, optional): Legacy MoMH parameter (span-based). Kept for compatibility.
-            is_vision (Tensor, optional): Bool tensor of shape (B, total_kv_length) marking vision tokens.
 
         Returns:
             Tuple[Tensor, dict]: Output tensor after the block (same shape as input),
@@ -554,17 +529,7 @@ class LanguageModelBlock(nn.Module):
         """
         res = x
         x = self.norm1(x)
-        x, block_kv_cache = self.attn(
-            x,
-            cos,
-            sin,
-            attention_mask=attention_mask,
-            block_kv_cache=block_kv_cache,
-            block_mask=block_mask,
-            content_starts=content_starts,
-            is_vision=is_vision,
-            position_offset=position_offset,
-        )
+        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache)
         x = res + x
 
         res = x
@@ -593,21 +558,6 @@ class LanguageModel(nn.Module):
             self.head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
-        self.use_selective_activation_checkpointing = False
-        self.allow_activation_checkpointing_mutation = False
-        self.activation_checkpointing_policy = get_default_sac_policy()
-
-    def set_activation_checkpointing_mode(
-        self,
-        *,
-        use_selective: bool,
-        allow_cache_entry_mutation: bool = False,
-        policy: str | None = None,
-    ) -> None:
-        self.use_selective_activation_checkpointing = bool(use_selective)
-        self.allow_activation_checkpointing_mutation = bool(allow_cache_entry_mutation)
-        if policy is not None:
-            self.activation_checkpointing_policy = policy
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -619,17 +569,7 @@ class LanguageModel(nn.Module):
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        kv_cache: list[dict] | None = None,
-        start_pos: int = 0,
-        content_starts: torch.Tensor | None = None,
-        is_vision: torch.Tensor | None = None,
-        prefill_block_mask=None,
-        position_offset: int | torch.Tensor | None = None,
-    ):
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0):
         """
         Performs a forward pass through the language model.
 
@@ -646,8 +586,6 @@ class LanguageModel(nn.Module):
             start_pos (int, optional): The starting position index for the current input
                 sequence. Used to compute rotary positional embeddings correctly,
                 especially for cached sequences during generation. Default is 0.
-            content_starts (Tensor, optional): Legacy MoMH parameter (span-based). Kept for compatibility.
-            is_vision (Tensor, optional): Bool tensor of shape (B, total_sequence_length) marking vision tokens.
 
         Returns:
             Tuple:
@@ -674,90 +612,21 @@ class LanguageModel(nn.Module):
 
         # T_curr is the length of the current input sequence
         B, T_curr, _ = x.size()
-
+        
         # Create position_ids for the current sequence based on start_pos
         current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).expand(B, -1)
-        cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
+        
+        # During decoding (T_curr=1), we don't need the full attention mask for RoPE
+        # and passing it would cause shape mismatch in RotaryEmbedding if we disabled position collapsing
+        rope_mask = attention_mask if (attention_mask is not None and attention_mask.shape == current_position_ids.shape) else None
+        cos, sin = self.rotary_embd(current_position_ids, rope_mask) # Get rotary position embeddings for current tokens
 
         # Initialize new KV cache if none provided
-        is_prefill = kv_cache is None
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
-        if position_offset is None:
-            position_offset = start_pos
-
-        use_activation_checkpointing = (
-            getattr(self.cfg, "activation_checkpointing", False)
-            and self.training
-            and is_prefill
-        )
-        checkpoint_context_fn = None
-        if use_activation_checkpointing and self.use_selective_activation_checkpointing:
-            checkpoint_context_fn = get_sac_context_fn(
-                self.activation_checkpointing_policy,
-                allow_cache_entry_mutation=self.allow_activation_checkpointing_mutation,
-            )
-
-        prefill_block_mask = None
-        if (
-            prefill_block_mask is None
-            and attention_mask is not None
-            and is_vision is not None
-            and x.device.type == "cuda"
-            and len(self.blocks) > 0
-            and self.blocks[0].attn.momh_enabled
-            and start_pos == 0
-            and T_curr > 1
-        ):
-            prefill_block_mask = _build_momh_block_mask_prefill(
-                n_q_heads=int(self.blocks[0].attn.n_heads),
-                seq_len=T_curr,
-                is_vision=is_vision[:, :T_curr],
-                attention_mask=attention_mask[:, :T_curr],
-                pct_v=float(self.blocks[0].attn.momh_pct_vision),
-                pct_t=float(self.blocks[0].attn.momh_pct_text),
-                device=str(x.device),
-            )
-
         for i, block in enumerate(self.blocks):
-            if use_activation_checkpointing:
-                def _run_block(x_in: torch.Tensor) -> torch.Tensor:
-                    x_out, _ = block(
-                        x_in,
-                        cos,
-                        sin,
-                        attention_mask=attention_mask,
-                        block_kv_cache=None,
-                        block_mask=prefill_block_mask,
-                        content_starts=content_starts,
-                        is_vision=is_vision,
-                        position_offset=position_offset,
-                    )
-                    return x_out
-
-                if checkpoint_context_fn is None:
-                    x = activation_checkpoint(_run_block, x, use_reentrant=False)
-                else:
-                    x = activation_checkpoint(
-                        _run_block,
-                        x,
-                        use_reentrant=False,
-                        context_fn=checkpoint_context_fn,
-                    )
-                kv_cache[i] = None
-            else:
-                x, kv_cache[i] = block(
-                    x,
-                    cos,
-                    sin,
-                    attention_mask=attention_mask,
-                    block_kv_cache=kv_cache[i],
-                    block_mask=prefill_block_mask,
-                    content_starts=content_starts,
-                    is_vision=is_vision,
-                    position_offset=position_offset,
-                )
+            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
 
         x = self.norm(x)
 

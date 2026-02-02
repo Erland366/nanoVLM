@@ -19,6 +19,7 @@ class ConstantLengthDataset(IterableDataset):
         queue_size: int = 2,
         max_images_per_example: int = 4,
         max_images_per_knapsack: int = 18,
+        pack_sequences: bool = True,
     ):
         self.dataset = dataset
         self.max_sample_length = max_sample_length
@@ -29,15 +30,17 @@ class ConstantLengthDataset(IterableDataset):
         self.queue_size = max(queue_size, 1)
         self.max_images_per_example = max_images_per_example
         self.max_images_per_knapsack = max_images_per_knapsack
+        self.pack_sequences = pack_sequences
         self._sentinel = object()
         self._average_length_per_sample = (
             self.dataset.mp_image_token_length + 198
         )  # 198 is the average tokens for the cauldron dataset
 
     def __len__(self):
-        return int(
-            len(self.dataset) * self._average_length_per_sample / self.seq_length
-        )
+        base_len = len(self.dataset)
+        if not self.pack_sequences:
+            return base_len
+        return int(base_len * self._average_length_per_sample / self.seq_length)
 
     def __iter__(self) -> Iterator[dict]:
         """
@@ -82,6 +85,25 @@ class ConstantLengthDataset(IterableDataset):
 
             return sharded_item_iterator()
 
+        if not self.pack_sequences:
+            iterator = make_base_iterator()
+            more_examples = True
+            while more_examples:
+                try:
+                    sample = next(iterator)
+                except StopIteration:
+                    if self.infinite:
+                        iterator = make_base_iterator()
+                        self.epoch += 1
+                        print(f"Epoch {self.epoch} finished, restarting iterator")
+                        continue
+                    break
+
+                if self._should_skip_sample(sample):
+                    continue
+                yield sample
+            return
+
         queue: Queue = Queue(maxsize=self.queue_size)
 
         producer = threading.Thread(
@@ -124,10 +146,8 @@ class ConstantLengthDataset(IterableDataset):
                 if sample is None:  # Ratings filtered out the sample
                     continue
 
-                if len(sample["input_ids"]) >= self.max_sample_length:
-                    continue  # skip overly long samples
-                if len(sample["images"]) > self.max_images_per_example:
-                    continue  # skip samples that exceed the image constraint
+                if self._should_skip_sample(sample):
+                    continue
 
                 sample["input_ids"] = torch.cat(
                     [
@@ -169,6 +189,15 @@ class ConstantLengthDataset(IterableDataset):
 
         # finished → unblock consumer
         queue.put(self._sentinel)
+
+    def _should_skip_sample(self, sample):
+        if sample is None:
+            return True
+        if len(sample["input_ids"]) >= self.max_sample_length:
+            return True  # skip overly long samples
+        if len(sample["images"]) > self.max_images_per_example:
+            return True  # skip samples that exceed the image constraint
+        return False
 
     def _balanced_greedy_knapsack(
         self, buffer, L, delta=0, max_images_per_knapsack=None
