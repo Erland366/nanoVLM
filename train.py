@@ -47,6 +47,16 @@ warnings.filterwarnings("ignore", message=".*Length of IterableDataset.*")
 import PIL.PngImagePlugin
 PIL.PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value_lower = value.lower()
+    if value_lower in {"true", "1", "yes", "y", "t"}:
+        return True
+    if value_lower in {"false", "0", "no", "n", "f"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     numpy.random.seed(worker_seed)
@@ -478,11 +488,13 @@ def train(train_cfg, vlm_cfg):
         model.train()
         total_train_loss = 0
         total_tokens_processed = 0
+        num_batches = 0
         optimizer.zero_grad()
         data_load_start = time.time()
 
         print("Starting training loop")
         for i, batch in enumerate(synchronized_dataloader_step(iter_train_loader, is_dist())):
+            num_batches += 1
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0
             step_effective_tokens = None
             step_effective_token_ratio = None
@@ -777,9 +789,9 @@ def train(train_cfg, vlm_cfg):
             data_load_start = time.time()
 
         iter_train_loader = iter(train_loader)
-        if stop_training:
+        if num_batches == 0:
             break
-        avg_train_loss = total_train_loss / i
+        avg_train_loss = total_train_loss / num_batches
         # gather average batch loss from all ranks if DDP
         avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
 
@@ -806,9 +818,14 @@ def train(train_cfg, vlm_cfg):
                 run.log(log_payload, step=global_step)
 
             print(f"Epoch: {epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
+        if stop_training:
+            break
 
     # Summary Statistics
     if is_master():
+        if not epoch_times:
+            print("No completed epochs; skipping summary statistics.")
+            return
         avg_epoch_time = sum(epoch_times) / len(epoch_times)
         total_training_time = sum(epoch_times)
         batch_size = int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)
@@ -835,18 +852,18 @@ def main():
     parser.add_argument('--lr_vision_backbone', type=float, help='Learning rate for the vision backbone')
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
-    parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
-    parser.add_argument('--activation_checkpointing', type=bool, help='Enable activation checkpointing for LM/VIT blocks')
+    parser.add_argument('--compile', type=str2bool, help='Use torch.compile to optimize the model')
+    parser.add_argument('--activation_checkpointing', type=str2bool, help='Enable activation checkpointing for LM/VIT blocks')
     parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
-    parser.add_argument('--momh_enabled', type=bool, help='Enable MoMH attention')
-    parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
-    parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
+    parser.add_argument('--momh_enabled', type=str2bool, help='Enable MoMH attention')
+    parser.add_argument('--log_wandb', type=str2bool, help='Log to wandb')
+    parser.add_argument('--resume_from_vlm_checkpoint', type=str2bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
     parser.add_argument('--max_training_tokens', type=int, help='Stop after this many effective tokens (non-padding)')
-    parser.add_argument('--pack_sequences', type=bool, help='Enable packing multiple samples per sequence')
-    parser.add_argument('--effective_token_lr_scale', type=bool, help='Scale LR by effective token ratio each step')
+    parser.add_argument('--pack_sequences', type=str2bool, help='Enable packing multiple samples per sequence')
+    parser.add_argument('--effective_token_lr_scale', type=str2bool, help='Scale LR by effective token ratio each step')
     parser.add_argument('--effective_token_lr_exponent', type=float, help='Exponent for effective token LR scaling')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
     parser.add_argument('--image_correspondence_min_rating', type=int, help='Minimum image correspondence rating of images per sample')

@@ -605,7 +605,7 @@ class LanguageModel(nn.Module):
             kv_cache = [None] * len(self.blocks)
 
         use_activation_checkpointing = (
-            self.cfg.activation_checkpointing
+            getattr(self.cfg, "activation_checkpointing", False)
             and self.training
             and is_prefill
         )
