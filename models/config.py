@@ -20,7 +20,7 @@ class VLMConfig:
     lm_re_base: int = 100000
     lm_max_position_embeddings: int = 1024
     lm_base_vocab_size: int = 49152
-    extra_token_amount: int = 66
+    extra_token_amount: int = 66  # Number of extra tokens for the VLM (image start, image end, image token)
     lm_vocab_size: int = 49218
     lm_n_heads: int = 6
     lm_n_kv_heads: int = 2
@@ -42,6 +42,7 @@ class VLMConfig:
     momh_head_pct_vision: float = 0.2  # 20% of heads for V->V only
     momh_head_pct_text: float = 0.3    # 30% of heads for T->T only
     # Remaining 50% (1 - vision - text) for VT->VT cross-modal
+    activation_checkpointing: bool = False  # Enable LM/ViT activation checkpointing during training.
 
     max_img_size: int = 256
     resize_to_max_side_len: bool = True
@@ -69,6 +70,7 @@ class TrainConfig:
     # When using torch.compile, allow varying batch size / seq length without recompilation.
     # This uses torch._dynamo.maybe_mark_dynamic on (B, T) dims for input_ids/labels/attention_mask.
     compile_dynamic_shapes: bool = False
+    activation_memory_budget: float | None = None
     resume_from_vlm_checkpoint: bool = False
 
     batch_size: int = 1
@@ -112,6 +114,7 @@ class TrainConfig:
     max_sample_length: int = 1024
 
     max_training_steps: int = 30000
+    max_training_tokens: int | None = None
     max_grad_norm: float = 1.0
     enable_validation: bool = True
     val_size: int = 5000
@@ -123,6 +126,7 @@ class TrainConfig:
     log_wandb: bool = True
     wandb_entity: str = ""
     wandb_project: str = "dualtower"
+    wandb_xaxis_tokens: bool = False
     prefix_run_name: str | None = None
     save_code_cfg: bool = True
     save_model_every_n_steps: int = 500
@@ -131,9 +135,11 @@ class TrainConfig:
     save_hf: bool = False
     hf_model_cp_path: str = "patrickamadeus/vanilla-cauldron"
 
+    effective_token_lr_scale: bool = False
+    effective_token_lr_exponent: float = 0.5
     use_lmms_eval: bool = False
     lmms_eval_tasks: str = "mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa"
-    lmms_eval_limit: float = None
+    lmms_eval_limit: float | None = None
     lmms_eval_batch_size: int = 64
 
     # Distributed backend choice when launched under torchrun.

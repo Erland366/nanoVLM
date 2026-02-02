@@ -12,9 +12,17 @@
       "type": "core",
       "description": "Document findings as reusable skills"
     },
+    "activation-checkpointing-compile-tradeoffs-nanovlm": {
+      "type": "result",
+      "description": "Activation checkpointing tradeoffs under compile/no-compile"
+    },
     "torch-compile-dynamic-shapes-nanovlm": {
       "type": "result",
       "description": "Mark (B,T) dynamic to reduce torch.compile recompiles in training"
+    },
+    "padding-aware-lr-scaling": {
+      "type": "result",
+      "description": "Scale LR by effective-token ratio for non-pack training with heavy padding"
     }
   },
   "paths": {

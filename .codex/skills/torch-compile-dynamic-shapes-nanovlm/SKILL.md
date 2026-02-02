@@ -87,6 +87,8 @@ directly, you can still trigger a graph break unless you supply `prefill_block_m
 | `mark_dynamic` errors | Dim specialized to a constant | Prefer `maybe_mark_dynamic` |
 | Graph break in MoMH prefill | Block-mask creation inside compiled decoder | Build mask in VLM wrapper and pass in |
 | Long compile times | Full-model compile or dynamic=True everywhere | Use regional compile and limit dynamic dims |
+| flex_attention block mask recompiles | Guard on batch size in create_block_mask | Keep B fixed per compile run or cache/precompute mask |
+| Flex decoding guard recompiles | guard on seq length in flex decoding path | Avoid crossing guard thresholds within one compile session |
 
 ## References
 

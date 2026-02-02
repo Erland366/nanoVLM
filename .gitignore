@@ -15,6 +15,7 @@ wandb/
 logs/
 *.csv
 .vscode
+.env
 
 resources
 
@@ -28,4 +29,3 @@ eval_results*/
 /shards/*
 *.png
 plots*/
-.env
