@@ -86,7 +86,29 @@ python train.py
 which will use the default `models/config.py`.
 
 Optional: add a `.env` file with `WANDB_API_KEY` and `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`).
-`train.py` will load `.env` and log into W&B/Hugging Face automatically for the master process.
+`train.py` loads `.env` automatically (via `python-dotenv`) so `WANDB_API_KEY`/`HF_TOKEN` can be picked up without interactive login.
+
+### Muon optimizer (microsoft/dion)
+
+This repo can optionally use the Muon optimizer implementation from `microsoft/dion`.
+
+Install:
+```bash
+source .venv/bin/activate
+uv pip install git+https://github.com/microsoft/dion.git
+```
+
+Quick smoke test (synthetic, logs to W&B):
+```bash
+source .venv/bin/activate
+python scripts/muon_smoketest.py --steps 5
+```
+
+Run training with Muon:
+```bash
+source .venv/bin/activate
+python train.py --optimizer muon
+```
 
 Note: the default config in this worktree is a **small debug-scale** setup for fast iteration:
 256-d ViT (patch16, img 128, 4 blocks, `mp_image_token_length=4`), SmolLM2-135M-Instruct (384 hidden, 8 blocks,
