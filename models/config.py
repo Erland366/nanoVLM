@@ -120,6 +120,11 @@ class TrainConfig:
     local_model_cp_path: str = "checkpoints/vanilla-cauldron"
     save_hf: bool = False
     hf_model_cp_path: str = "patrickamadeus/vanilla-cauldron"
+    checkpoint_every_n_steps: int = 500
+    checkpoint_dir: str = "checkpoints"
+    checkpoint_format: str = "dcp"  # "dcp" or "torch"
+    resume_from_checkpoint: str | None = None
+    strict_resume: bool = True
     use_lmms_eval: bool = False # Use lmms-eval for evaluation
     lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
     lmms_eval_limit: float = None

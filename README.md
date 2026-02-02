@@ -87,6 +87,28 @@ which will use the default `models/config.py`.
 
 Note: the default config is now a **small debug-scale** setup (128px ViT, 1024‑token LM, `mp_image_token_length=4`) for fast iteration. Update `models/config.py` or pass CLI overrides for larger runs.
 
+### Checkpointing and resume
+
+Training checkpoints now include **model weights, optimizer state, RNG state, and data-loader progress** so you can resume deterministically (map-style datasets).
+
+Key config fields (`models/config.py`):
+- `checkpoint_every_n_steps`: save frequency (optimizer steps)
+- `checkpoint_dir`: base directory for checkpoints
+- `checkpoint_format`: `dcp` (default) or `torch`
+- `resume_from_checkpoint`: path to a checkpoint directory (e.g., `checkpoints/<run_name>/step_500`)
+- `strict_resume`: fail fast if required checkpoint data is missing
+
+Example (save every 50 steps, resume):
+```bash
+python train.py --checkpoint_every_n_steps 50 --checkpoint_dir checkpoints
+python train.py --resume_from_checkpoint checkpoints/<run_name>/step_50
+```
+
+Notes:
+- For **bitwise-identical** resumes, use map-style datasets (`stream_dataset=False`). Streaming datasets may resume but won’t be identical.
+- `checkpoint_format=dcp` uses PyTorch Distributed Checkpointing in single-writer mode (rank 0). Sharded checkpoints require FSDP/DTensor.
+- If `dcp` is unavailable in your PyTorch build, set `--checkpoint_format torch`.
+
 ### torch.compile (regional) + dynamic batch/seq
 
 When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
