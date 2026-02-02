@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from data.data_utils import synchronized_dataloader_step
 
-from configs.config import VLMConfig, TrainConfig, GlobalConfig
+from models.config import VLMConfig, TrainConfig, GlobalConfig
 from models.vision_language_model import VisionLanguageModel
 from train_utils import (
     create_cpu_group, destroy_dist, dist_gather, dist_mean_scalar,
@@ -34,6 +34,43 @@ warnings.filterwarnings("ignore", message=".*Length of IterableDataset.*")
 # Fix for "Decompressed data too large" error with certain PNGs
 import PIL.PngImagePlugin
 PIL.PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value_lower = value.lower()
+    if value_lower in {"true", "1", "yes", "y", "t"}:
+        return True
+    if value_lower in {"false", "0", "no", "n", "f"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def _compile_module_list(modules, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"):
+    for idx, block in enumerate(modules):
+        modules[idx] = torch.compile(block, dynamic=dynamic, mode=mode)
+
+
+def compile_regions(model, *, dynamic: bool | None = None, mode: str | None = "reduce-overhead"):
+    if not hasattr(model, "vision_encoder") or not hasattr(model, "decoder") or not hasattr(model, "MP"):
+        raise AttributeError("Model must expose vision_encoder, decoder, and MP for regional compile.")
+    if hasattr(model.vision_encoder, "blocks"):
+        _compile_module_list(model.vision_encoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.vision_encoder = torch.compile(model.vision_encoder, dynamic=dynamic, mode=mode)
+    if hasattr(model.decoder, "blocks"):
+        _compile_module_list(model.decoder.blocks, dynamic=dynamic, mode=mode)
+    else:
+        model.decoder = torch.compile(model.decoder, dynamic=dynamic, mode=mode)
+    model.MP = torch.compile(model.MP, dynamic=dynamic, mode=mode)
+
+
+def compute_effective_token_scale(
+    effective_tokens: int, denom_tokens: int, exponent: float
+) -> tuple[float, float]:
+    ratio = effective_tokens / max(denom_tokens, 1)
+    ratio = min(max(ratio, 1e-6), 1.0)
+    return ratio, ratio**exponent
 
 # Cosine learning rate schedule with warmup (from Karpathy)
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py#L353
@@ -54,7 +91,9 @@ def get_lr(it, max_lr, max_steps):
 
 
 def train(train_cfg, vlm_cfg, global_cfg):
-    train_loader, val_loader, iter_train_loader, _ = get_dataloaders(train_cfg, vlm_cfg, global_cfg)
+    train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(
+        train_cfg, vlm_cfg, global_cfg
+    )
 
     if is_dist():
         print("Rank", get_rank(), "Waiting for all workers to get dataloaders...")
@@ -65,6 +104,9 @@ def train(train_cfg, vlm_cfg, global_cfg):
             print("All workers have gotten dataloaders.")
 
     run_name = get_run_name(train_cfg, vlm_cfg)
+    tokens_step_metric = "tokens/consumed"
+    lmms_eval_step = "<lmms-eval-step>"
+    run = None
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
             entity=train_cfg.wandb_entity,
@@ -76,8 +118,15 @@ def train(train_cfg, vlm_cfg, global_cfg):
             },
             name=run_name,
         )
-        # Define a custom x-axis for lmms-eval metrics
-        lmms_eval_step = "<lmms-eval-step>"
+        if getattr(train_cfg, "wandb_xaxis_tokens", False):
+            run.define_metric(tokens_step_metric)
+            run.define_metric("batch_loss", step_metric=tokens_step_metric)
+            run.define_metric("val_loss", step_metric=tokens_step_metric)
+            run.define_metric("grad_norm", step_metric=tokens_step_metric)
+            run.define_metric("training_stats/*", step_metric=tokens_step_metric)
+            run.define_metric("epoch_*", step_metric=tokens_step_metric)
+            lmms_eval_step = tokens_step_metric
+
         run.define_metric(name="lmms_eval/*", step_metric=lmms_eval_step)
 
     # Initialize model
@@ -86,6 +135,18 @@ def train(train_cfg, vlm_cfg, global_cfg):
         model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
     else:
         model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+
+    use_selective_ac = bool(train_cfg.compile and getattr(vlm_cfg, "activation_checkpointing", False))
+    if hasattr(model, "set_activation_checkpointing_mode"):
+        model.set_activation_checkpointing_mode(
+            use_selective=use_selective_ac,
+            allow_cache_entry_mutation=use_selective_ac,
+        )
+        if is_master() and use_selective_ac:
+            print(
+                "Using selective activation checkpointing under torch.compile "
+                "(allow_cache_entry_mutation=True)."
+            )
     
     if is_master():
         print(f"nanoVLM initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
@@ -130,9 +191,22 @@ def train(train_cfg, vlm_cfg, global_cfg):
     
     print(f"Using device: {device}")
     model.to(device)
-    
+
+    if getattr(train_cfg, "activation_memory_budget", None) is not None:
+        if not 0.0 <= train_cfg.activation_memory_budget <= 1.0:
+            raise ValueError("activation_memory_budget must be between 0 and 1.")
+        if not hasattr(torch._dynamo.config, "activation_memory_budget"):
+            raise RuntimeError("activation_memory_budget is not supported in this PyTorch build.")
+        if train_cfg.compile:
+            torch._dynamo.config.activation_memory_budget = train_cfg.activation_memory_budget
+            if is_master():
+                print(f"Using activation_memory_budget={train_cfg.activation_memory_budget}")
+        else:
+            if is_master():
+                print("activation_memory_budget set but compile is disabled; ignoring.")
+
     if train_cfg.compile:
-        model = torch.compile(model)
+        compile_regions(model)
     if is_dist():
         print("Wrapping model for DDP")
         model = wrap_model(model)
@@ -146,6 +220,8 @@ def train(train_cfg, vlm_cfg, global_cfg):
     epoch = 0
     train_pbar = None
     current_lrs = {}
+    tokens_processed_global = 0
+    effective_tokens_accum = 0
     if train_cfg.stream_dataset:
         train_pbar = tqdm(
             total=train_cfg.max_training_steps,
@@ -171,6 +247,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
         model.train()
         total_train_loss = 0
         total_tokens_processed = 0
+        num_batches = 0
         optimizer.zero_grad()
         data_load_start = time.time()
 
@@ -184,13 +261,30 @@ def train(train_cfg, vlm_cfg, global_cfg):
 
         print("Starting training loop")
         for i, batch in enumerate(synchronized_dataloader_step(iter_train_loader, is_dist())):
+            num_batches += 1
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0
+            step_effective_tokens = None
+            step_effective_token_ratio = None
+            step_effective_token_lr_scale = 1.0
             batch_start_time = time.time()
             images = batch["images"]
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             data_load_time = time.time() - data_load_start
+
+            num_tokens = int(torch.sum(attention_mask).item())
+            tokens_processed_global += num_tokens
+            effective_tokens_accum += num_tokens
+
+            if train_cfg.compile:
+                # Always mark (B,T) dynamic when compiling to reduce recompiles from variable batch/seq.
+                torch._dynamo.maybe_mark_dynamic(input_ids, 0)
+                torch._dynamo.maybe_mark_dynamic(input_ids, 1)
+                torch._dynamo.maybe_mark_dynamic(labels, 0)
+                torch._dynamo.maybe_mark_dynamic(labels, 1)
+                torch._dynamo.maybe_mark_dynamic(attention_mask, 0)
+                torch._dynamo.maybe_mark_dynamic(attention_mask, 1)
 
             # When using DDP with gradient accumulation,
             # skip gradient synchronization on intermediate steps to save time.
@@ -223,33 +317,61 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 if train_cfg.max_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
 
+                denom_tokens = (
+                    train_cfg.batch_size
+                    * train_cfg.gradient_accumulation_steps
+                    * get_world_size()
+                    * vlm_cfg.lm_max_length
+                )
+                if getattr(train_cfg, "effective_token_lr_scale", False) or train_cfg.log_wandb:
+                    step_effective_tokens = effective_tokens_accum
+                    if is_dist():
+                        step_effective_tokens = sum(dist_gather(step_effective_tokens))
+                    step_effective_token_ratio, step_effective_token_lr_scale = compute_effective_token_scale(
+                        step_effective_tokens,
+                        denom_tokens,
+                        getattr(train_cfg, "effective_token_lr_exponent", 0.5),
+                    )
+                    if not getattr(train_cfg, "effective_token_lr_scale", False):
+                        step_effective_token_lr_scale = 1.0
+
                 param_group_idx = 0
                 if train_cfg.lr_mp > 0:
-                    adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps)
+                    adj_lr_mp = (
+                        get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps)
+                        * step_effective_token_lr_scale
+                    )
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
                     current_lrs["train/lr_mp"] = adj_lr_mp
                     param_group_idx += 1
 
                 if train_cfg.lr_vision_backbone > 0:
-                    adj_lr_vision_backbone = get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
+                    adj_lr_vision_backbone = (
+                        get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
+                        * step_effective_token_lr_scale
+                    )
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
                     current_lrs["train/lr_vision_backbone"] = adj_lr_vision_backbone
                     param_group_idx += 1
 
                 if train_cfg.lr_language_backbone > 0:
-                    adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
+                    adj_lr_language_backbone = (
+                        get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
+                        * step_effective_token_lr_scale
+                    )
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
                     current_lrs["train/lr_language_backbone"] = adj_lr_language_backbone
               
                 optimizer.step()
                 optimizer.zero_grad()
+                effective_tokens_accum = 0
 
             batch_loss = loss.item()
             if train_cfg.gradient_accumulation_steps > 1:
                 batch_loss = batch_loss * train_cfg.gradient_accumulation_steps
             total_train_loss += batch_loss
 
-            num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens (effective tokens)
+            num_tokens = int(num_tokens) # Sum of attention mask gives number of tokens (effective tokens)
             total_batch_tokens = attention_mask.numel()   # Total tokens including padding
             total_tokens_processed += num_tokens
             post_process_time = time.time() - post_process_start
@@ -266,6 +388,8 @@ def train(train_cfg, vlm_cfg, global_cfg):
             accumulated_stats['fw_bw_time'].append(fw_bw_time)
             accumulated_stats['post_process_time'].append(post_process_time)
             accumulated_stats['images_per_sample'].extend(images_per_sample)
+            accumulated_stats['effective_tokens'].append(num_tokens)
+            accumulated_stats['total_tokens'].append(int(total_batch_tokens))
 
             if train_pbar is not None and is_master():
                 if train_cfg.stream_dataset:
@@ -307,11 +431,15 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 if is_master():
                     print(f"Step: {global_step}, Val Loss: {avg_val_loss:.4f}, Tokens/s: {tokens_per_second:.2f}")
                     if train_cfg.log_wandb:
-                        run.log({
+                        log_payload = {
                             "val_loss": avg_val_loss,
                             "val/min_val_loss": min_val_loss,
                             "val/max_val_loss": max_val_loss,
-                        }, step=global_step)
+                        }
+                        if getattr(train_cfg, "wandb_xaxis_tokens", False):
+                            tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+                            log_payload[tokens_step_metric] = tokens_step_value
+                        run.log(log_payload, step=global_step)
 
                 model.train()
 
@@ -361,12 +489,21 @@ def train(train_cfg, vlm_cfg, global_cfg):
 
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
-                    run.log({
+                    log_payload = {
                         **{f"training_stats/{key}": value for key, value in stats.items()},
                         "training_stats/effective_tokens": global_effective,
                         "training_stats/total_tokens": global_total,
                         "training_stats/token_efficiency": token_efficiency,
-                    }, step=global_step)
+                    }
+                    if getattr(train_cfg, "wandb_xaxis_tokens", False):
+                        tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+                        log_payload[tokens_step_metric] = tokens_step_value
+                    if step_effective_tokens is not None:
+                        log_payload["effective_tokens"] = step_effective_tokens
+                    if step_effective_token_ratio is not None:
+                        log_payload["effective_token_ratio"] = step_effective_token_ratio
+                        log_payload["effective_token_lr_scale"] = step_effective_token_lr_scale
+                    run.log(log_payload, step=global_step)
 
                     # Check for and log new lmms-eval results
                     eval_results_dir = os.path.join('eval_results', run_name)
@@ -413,16 +550,29 @@ def train(train_cfg, vlm_cfg, global_cfg):
                     
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
-                    run.log({
+                    log_payload = {
                         "batch_loss": batch_loss_gathered,
                         **({"grad_norm": grad_norm} if train_cfg.max_grad_norm is not None else {}),
                         **current_lrs,
-                    }, step=global_step)
+                    }
+                    if getattr(train_cfg, "wandb_xaxis_tokens", False):
+                        tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+                        log_payload[tokens_step_metric] = tokens_step_value
+                    run.log(log_payload, step=global_step)
                 
             if is_update_step:
                 global_step += 1
                 if train_cfg.save_model_every_n_steps and global_step % train_cfg.save_model_every_n_steps == 0:
                     save_model_checkpoint(model, train_cfg, global_step=global_step)
+                if getattr(train_cfg, "max_training_tokens", None) is not None:
+                    tokens_processed = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+                    if tokens_processed >= train_cfg.max_training_tokens:
+                        if is_master():
+                            print(
+                                f"Stopping: tokens_processed={tokens_processed} "
+                                f">= max_training_tokens={train_cfg.max_training_tokens}"
+                            )
+                        return
                 if global_step >= train_cfg.max_training_steps:
                     break
             data_load_start = time.time()
@@ -430,7 +580,9 @@ def train(train_cfg, vlm_cfg, global_cfg):
         iter_train_loader = iter(train_loader)
         if not train_cfg.stream_dataset and train_pbar is not None and is_master():
             train_pbar.close()
-        avg_train_loss = total_train_loss / i
+        if num_batches == 0:
+            break
+        avg_train_loss = total_train_loss / num_batches
         # gather average batch loss from all ranks if DDP
         avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
 
@@ -444,9 +596,15 @@ def train(train_cfg, vlm_cfg, global_cfg):
 
         if is_master():
             if train_cfg.log_wandb:
-                run.log({"epoch_loss": avg_train_loss,
-                         "epoch_duration": epoch_duration,
-                         "epoch_tokens_per_second": epoch_tokens_per_second})
+                log_payload = {
+                    "epoch_loss": avg_train_loss,
+                    "epoch_duration": epoch_duration,
+                    "epoch_tokens_per_second": epoch_tokens_per_second,
+                }
+                if getattr(train_cfg, "wandb_xaxis_tokens", False):
+                    tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
+                    log_payload[tokens_step_metric] = tokens_step_value
+                run.log(log_payload)
 
             print(f"Epoch: {epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
 
@@ -483,9 +641,18 @@ def main():
     parser.add_argument('--lr_vision_backbone', type=float, help='Learning rate for the vision backbone')
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
-    parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
-    parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
-    parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
+    parser.add_argument('--compile', type=str2bool, help='Use torch.compile to optimize the model')
+    parser.add_argument('--activation_checkpointing', type=str2bool, help='Enable activation checkpointing for LM/VIT blocks')
+    parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
+    parser.add_argument('--momh_enabled', type=str2bool, help='Enable MoMH attention')
+    parser.add_argument('--max_training_steps', type=int, help='Maximum number of training steps')
+    parser.add_argument('--max_training_tokens', type=int, help='Stop after this many effective tokens (non-padding)')
+    parser.add_argument('--pack_sequences', type=str2bool, help='Enable packing multiple samples per sequence')
+    parser.add_argument('--effective_token_lr_scale', type=str2bool, help='Scale LR by effective token ratio each step')
+    parser.add_argument('--effective_token_lr_exponent', type=float, help='Exponent for effective token LR scaling')
+    parser.add_argument('--wandb_xaxis_tokens', type=str2bool, help='Use tokens as wandb x-axis')
+    parser.add_argument('--log_wandb', type=str2bool, help='Log to wandb')
+    parser.add_argument('--resume_from_vlm_checkpoint', type=str2bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
@@ -509,6 +676,26 @@ def main():
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:
         train_cfg.compile = args.compile
+    if args.activation_checkpointing is not None:
+        vlm_cfg.activation_checkpointing = args.activation_checkpointing
+    if args.activation_memory_budget is not None:
+        train_cfg.activation_memory_budget = args.activation_memory_budget
+    if args.momh_enabled is not None:
+        vlm_cfg.momh_enabled = args.momh_enabled
+    if args.max_training_steps is not None:
+        train_cfg.max_training_steps = args.max_training_steps
+    if args.max_training_tokens is not None:
+        train_cfg.max_training_tokens = args.max_training_tokens
+    if args.pack_sequences is not None:
+        train_cfg.pack_sequences = args.pack_sequences
+    if args.effective_token_lr_scale is not None:
+        train_cfg.effective_token_lr_scale = args.effective_token_lr_scale
+    if args.effective_token_lr_exponent is not None:
+        train_cfg.effective_token_lr_exponent = args.effective_token_lr_exponent
+    if args.wandb_xaxis_tokens is not None:
+        train_cfg.wandb_xaxis_tokens = args.wandb_xaxis_tokens
+    if args.log_wandb is not None:
+        train_cfg.log_wandb = args.log_wandb
     if args.no_log_wandb is True:
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:

@@ -21,6 +21,7 @@ This file documents error patterns encountered and their solutions.
 | MoMH garbage output | Model produces nonsense during generation | MoMH attention not applied during decode phase | Pass `content_starts` and `position_offset` to decode, use `score_mod` |
 | Input shape mismatch | `ValueError: not enough values to unpack` | Passing 2D token IDs when model expects 3D embeddings (`lm_use_tokens=False`) | Use embeddings `[B, T, D]` not token IDs `[B, T]` |
 | BlockMask batch size | Errors when batch size changes between calls | BlockMask created with fixed batch size | Recreate BlockMask when batch size changes, or resize content_starts buffer |
+| MoMH prefill graph break | `TORCH_LOGS=graph_breaks` shows `_build_momh_block_mask_prefill` | Block-mask creation inside compiled decoder (`torch.compiler.disable`) | Build block mask in VLM wrapper and pass `prefill_block_mask` into decoder |
 
 ## flex_attention Debugging
 

@@ -1,8 +1,8 @@
 {
   "domain": "research",
   "version": "1.0.0",
-  "created": "2025-01-13",
-  "updated": "2025-01-15",
+  "created": "2026-01-13",
+  "updated": "2026-02-02",
   "skills": {
     "domain-advisor": {
       "type": "core",
@@ -16,9 +16,25 @@
       "type": "project",
       "description": "Patterns for flex_attention prefill vs decode"
     },
+    "mmstar-first-letter-scoring": {
+      "type": "project",
+      "description": "MMStar exact-match scoring uses only the first output character"
+    },
     "torch-compile-debug": {
       "type": "project",
       "description": "Debug torch.compile recompilations and graph breaks"
+    },
+    "activation-checkpointing-compile-tradeoffs-nanovlm": {
+      "type": "result",
+      "description": "Activation checkpointing tradeoffs under compile/no-compile"
+    },
+    "torch-compile-dynamic-shapes-nanovlm": {
+      "type": "result",
+      "description": "Mark (B,T) dynamic to reduce torch.compile recompiles in training"
+    },
+    "padding-aware-lr-scaling": {
+      "type": "result",
+      "description": "Scale LR by effective-token ratio for non-pack training with heavy padding"
     }
   },
   "paths": {

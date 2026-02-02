@@ -70,6 +70,7 @@ Dependencies:
 - `numpy` <3
 - `torchvision` for the image processors
 - `pillow` for image loading
+- `einops` for image patch splitting
 - `datasets` for the training datasets
 - `huggingface-hub` & `transformers` to load the pretrained backbones
 - `wandb` for logging
@@ -83,6 +84,121 @@ huggingface-cli login
 python train.py
 ```
 which will use the default `models/config.py`.
+
+Optional: add a `.env` file with `WANDB_API_KEY` and `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`).
+`train.py` will load `.env` and log into W&B/Hugging Face automatically for the master process.
+
+Note: the default config in this worktree is a **small debug-scale** setup for fast iteration:
+256-d ViT (patch16, img 128, 4 blocks, `mp_image_token_length=4`), SmolLM2-135M-Instruct (384 hidden, 8 blocks,
+1024 max length), and `patrickamadeus/the_cauldron` `sample_1pct` with batch size 1, grad accum 8,
+lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000. See `models/config.py` for full defaults.
+
+`train.py` always logs `tokens/consumed` to W&B (when enabled), so you can switch the chart x-axis to that metric.
+If you want tokens to be the default step metric, set `TrainConfig.wandb_xaxis_tokens=True`.
+
+To scale LR by effective (non-padding) tokens per update step, set `TrainConfig.effective_token_lr_scale=True`.
+We compute `ratio = effective_tokens / (B_global * lm_max_length)` and apply `ratio**effective_token_lr_exponent`
+**after** the LR scheduler (default exponent is 0.5). This logs `effective_tokens`, `effective_token_ratio`, and
+`effective_token_lr_scale` each update step. Override the exponent with
+`TrainConfig.effective_token_lr_exponent` or `--effective_token_lr_exponent`.
+
+To cap training for a short run, use `--max_training_steps N` or `--max_training_tokens N` (effective tokens).
+If both are set, training stops when either limit is reached.
+
+For vanilla attention, disable MoMH with `--momh_enabled False`. To toggle sequence packing, use
+`--pack_sequences True|False`.
+
+### torch.compile (regional) + dynamic batch/seq
+
+When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
+
+When compile is enabled, `train.py` always applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance. There is no separate flag for this.
+
+### Activation checkpointing (memory saving)
+
+To reduce training-time activation memory at the cost of extra compute, enable activation checkpointing:
+
+```bash
+python train.py --activation_checkpointing True
+```
+
+This applies checkpointing to the language-model blocks during training (not during decode/inference).
+
+#### Selective activation checkpointing (SAC)
+
+When **activation checkpointing** is enabled **and** `--compile True`, we automatically switch to
+**selective activation checkpointing** with the matmul/attention policy. If `--compile` is disabled,
+activation checkpointing uses the standard (manual) checkpointing behavior instead.
+
+#### Compile-time memory budget (SAC via torch.compile)
+
+When using `torch.compile`, you can enable the memory budget API:
+
+```bash
+python train.py --compile True --activation_memory_budget 0.5
+```
+
+This applies selective recomputation inside compiled regions. Budget 0 behaves like plain AC, 1 behaves like default compile.
+
+### Training-step benchmark (Unsloth-style)
+
+To measure step time, tokens/s, and VRAM for a short forward+backward+optimizer loop (useful for A/B comparisons like MoMH on vs off):
+
+```bash
+source .venv/bin/activate
+python eval/benchmark_train_step.py --mode synthetic --steps 10 --warmup-steps 3 --batch-size 1 --seq-len 2048
+```
+
+<u>Important: this benchmark defaults to the **current `train.py` setup**. You can still override compile via CLI flags, but all optimization changes should ultimately land in `train.py`.</u>
+
+The benchmark reports `compile_time_ms` when compile is enabled (first step that triggers compilation). Use `--compile` to force compile on, and `--compile-mode {default,reduce-overhead,max-autotune}` to select the compile mode.
+
+Selective activation checkpointing under `torch.compile` enables `allow_cache_entry_mutation=True` to avoid cached-tensor mutation
+errors. This disables a correctness guard; use with care.
+
+Write results to JSONL (default `benchmark_results/train_step.jsonl`) and compare runs by toggling MoMH:
+
+```bash
+source .venv/bin/activate
+python eval/benchmark_train_step.py --mode synthetic --momh --out-jsonl benchmark_results/train_step.jsonl
+python eval/benchmark_train_step.py --mode synthetic --no-momh --out-jsonl benchmark_results/train_step.jsonl
+```
+
+#### Shape-sweep (variable batch/seq)
+
+To surface `torch.compile` recompiles from varying batch size or sequence length, run a shape-sweep in a **single process** and enable `TORCH_LOGS`:
+
+```bash
+TORCH_LOGS="recompiles,guards" python eval/benchmark_train_step.py \
+  --mode synthetic \
+  --vary-batch-sizes 4,3,4 \
+  --vary-seq-lens 2048,1536,2048 \
+  --shape-steps 1
+```
+
+Notes:
+- Dynamic `(B,T)` marking is applied automatically when compile is enabled in `train.py`.
+- This benchmark uses list-of-tensors image inputs (matching training), so variable image counts or tile counts can still introduce guards.
+- MoMH block masks are now built in the VLM wrapper (outside compiled decoder) to avoid graph breaks from `torch.compiler.disable` inside the compiled region. Direct calls to `model.decoder(...)` can still graph-break if they need a block mask.
+
+### MoMH masking sanity check
+
+MoMH masking classifies tokens as “vision” based on the `<|image|>` placeholder positions (the same positions that get replaced by image embeddings). This is important for multi-image / multi-patch samples where the number of `<|image|>` placeholders is much larger than `mp_image_token_length`.
+
+For performance, the MoMH `BlockMask` is built once per forward pass and reused across all language-model blocks (instead of recomputing it per block).
+
+To verify whether `models/momh_attention.py` is masking the correct image-token placeholders for a real dataset sample:
+
+```bash
+source .venv/bin/activate
+python scripts/check_momh_image_token_mask.py \
+  --dataset patrickamadeus/the_cauldron \
+  --config sample_1pct \
+  --split train \
+  --streaming \
+  --fail-on-any-mismatch \
+  --dump-json ./momh_mask_report.json
+```
 
 ## Generate
 
