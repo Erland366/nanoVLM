@@ -12,6 +12,24 @@ Each entry should include:
 
 ---
 
+<!-- New entries go above this line -->
+
+## 2026-02-02 — MoMH uptraining plan (gradual mask ramp)
+
+**Type:** Plan  
+**General description:** Uptrain pretrained VLM with MoMH masks using a gradual head-split ramp to avoid optimization shock.
+
+### Details
+
+- **Precondition:** set `VLMConfig.vlm_load_backbone_weights=True` and point `VLMConfig.vlm_checkpoint_path` to the pretrained VLM (uptraining requires loading weights).
+- **Phase A (warm start, 10–20% budget):** `momh_enabled=False`, low LR (~0.3× baseline). Optional: freeze vision encoder.
+- **Phase B (ramp, 40–50% budget):** enable MoMH and ramp head splits to target in 2–3 stages:
+  - B1: `pct_v=0.0`, `pct_t=0.0` (all VT)
+  - B2: `pct_v=0.1`, `pct_t=0.15`
+  - B3: `pct_v=0.2`, `pct_t=0.3` (target)
+- **Phase C (hold, 30–40% budget):** keep target splits; use ~0.5× baseline LR (or 0.3× if unstable).
+- **Monitoring:** watch loss spikes at mask switches, grad norms, and (optional) head usage/entropy.
+
 ## 2026-02-02 — Retrospective: effective-token LR scaling vs packed baseline
 
 **Type:** Retrospective  
@@ -32,6 +50,23 @@ Each entry should include:
 **Links:**  
 - Report: `training_reports/momh-packing-document-masking-benchmark-2026-02-02.md`
 
+## 2026-02-01 — Effective-token LR scaling
+
+**Type:** Observation  
+**General description:** Added optional LR scaling based on effective (non-padding) tokens per update step.
+
+**Details:** Introduced `TrainConfig.effective_token_lr_scale` and `effective_token_lr_exponent`, applied the
+scale after the scheduler for all LR groups, and logged `effective_tokens`, `effective_token_ratio`, and
+`effective_token_lr_scale` each update step.
+
+## 2026-02-01 — Token-based stopping
+
+**Type:** Observation  
+**General description:** Added an optional stop condition based on effective token count.
+
+**Details:** Added `TrainConfig.max_training_tokens` and `--max_training_tokens` to stop training once the
+global effective-token count reaches the requested budget.
+
 ## 2026-02-02 — Retrospective: activation checkpointing + compile tradeoffs
 
 **Type:** Retrospective  
@@ -40,7 +75,7 @@ Each entry should include:
 ### Details
 
 - Benchmarked manual vs selective activation checkpointing (no compile) and selective activation checkpointing under `torch.compile` in synthetic mode at `batch_size=1`, `seq_len=1024`.
-- Selective AC under `torch.compile` requires `allow_cache_entry_mutation=True` to avoid cached-tensor mutation errors; activation checkpointing now auto-selects selective when compile is enabled.
+- Selective AC under `torch.compile` requires `allow_cache_entry_mutation=True` to avoid cached‑tensor mutation errors; activation checkpointing now auto-selects selective when compile is enabled.
 - Shape sweeps with `(B,T)=(1,512)->(2,1024)` and `(4,128)->(8,64)` still triggered recompiles in `flex_attention.create_block_mask` and block forwards due to batch-size guards; no graph breaks observed.
 
 ### Links
@@ -82,6 +117,17 @@ Each entry should include:
 
 - Report: `training_reports/activation-checkpointing-benchmark-2026-02-02.md`
 
+## 2026-02-01 — Benchmark reflects train.py (no optimization flags)
+
+**Type:** Observation  
+**General description:** Removed benchmark-specific optimization flags so results reflect the current training setup.
+
+### Details
+
+- `eval/benchmark_train_step.py` now reads `TrainConfig.compile` from `models/config.py` and no longer accepts compile/mark-dynamic flags.
+- Dynamic `(B,T)` marking is always applied when compile is enabled in `train.py` (no separate toggle).
+- Documentation and the dynamic-shapes skill updated to match the “no knobs in benchmark” workflow.
+
 ## 2026-02-02 — Regional compile (per-block) + reduce-overhead benchmark
 
 **Type:** Retrospective  
@@ -99,7 +145,7 @@ Each entry should include:
 
 ## 2026-02-01 — Regional torch.compile + MoMH block-mask graph break fix
 
-**Type:** Retrospective  
+**Type:** Retrospective
 **General description:** Reduced compile-scope to regional submodules and removed a torch.compile graph break caused by MoMH block-mask construction inside the decoder.
 
 ### Details
@@ -108,81 +154,34 @@ Each entry should include:
 - Added `compile_time_ms` to the training-step benchmark output (first step that triggers compilation).
 - Fixed a graph break in `models/language_model.py` by moving MoMH prefill block-mask construction into the VLM wrapper (`models/vision_language_model.py`) and passing it into the decoder.
 
+### Key Points
+
+- Regional compile cuts compile scope and makes it easier to control graph breaks.
+- MoMH block-mask creation inside a compiled decoder causes graph breaks because it was wrapped in `torch.compiler.disable`; constructing it outside the compiled region removes that break.
+- Benchmark now reports `compile_time_ms` for faster comparison of compile latency changes.
+
 ### Links
 
 - Benchmark: `eval/benchmark_train_step.py`
 - VLM wrapper: `models/vision_language_model.py`
 - Decoder: `models/language_model.py`
 
-## 2026-02-01 — Benchmark reflects train.py (no optimization flags)
-
-**Type:** Observation  
-**General description:** Removed benchmark-specific optimization flags so results reflect the current training setup.
-
-### Details
-
-- `eval/benchmark_train_step.py` now reads `TrainConfig.compile` from `models/config.py` and no longer accepts compile/mark-dynamic flags.
-- Dynamic `(B,T)` marking is always applied when compile is enabled in `train.py` (no separate toggle).
-
-## 2026-02-01 — Token-based stopping
-
-**Type:** Observation  
-**General description:** Added an optional stop condition based on effective token count.
-
-**Details:** Added `TrainConfig.max_training_tokens` and `--max_training_tokens` to stop training once the global effective-token count reaches the requested budget.
-
-## 2026-02-01 — Effective-token LR scaling
-
-**Type:** Observation  
-**General description:** Added optional LR scaling based on effective (non-padding) tokens per update step.
-
-**Details:** Introduced `TrainConfig.effective_token_lr_scale` and `effective_token_lr_exponent`, applied the scale after the scheduler for all LR groups, and logged `effective_tokens`, `effective_token_ratio`, and `effective_token_lr_scale` each update step.
-
 ## 2026-01-30 — Torch.compile dynamic shapes + train-step benchmark
 
-**Type:** Retrospective  
+**Type:** Retrospective
 **General description:** Reduce `torch.compile` recompiles from variable batch/sequence shapes while tracking throughput via a stable benchmark.
 
 ### Details
 
 Added an opt-in `TrainConfig.compile_dynamic_shapes` switch that uses `torch._dynamo.maybe_mark_dynamic` on `(B,T)` dims for `input_ids`, `labels`, and `attention_mask` in the training and validation loops (removed 2026-02-01; dynamic marking is now always on when compile is enabled). This targets the common training failure mode where the collator drops too-long samples and produces variable batch sizes / sequence lengths, leading to recompilations.
 
+Also recorded a set of “contended GPU” benchmark numbers at `seq_len=2048` to keep a reference point for shared-GPU throughput comparisons.
+
+### Key Points
+
+- Prefer `maybe_mark_dynamic` over `mark_dynamic` to avoid `ConstraintViolationError` when dims sometimes specialize to constants.
+- Dynamic `(B,T)` reduces recompiles, but tile-count variance (vision input length) can still trigger recompiles.
+
 ### Links
 
 - Report: `training_reports/2026-01-30_torch-compile_dynamic-shapes_and_benchmark.md`
-
-## 2025-01-14 | Retrospective | MoMH Flex Attention Inference Fix
-
-**General description**: Fixed MoMH attention to work during inference decode phase, achieving 4000x+ speedup.
-
-**Problem**: Model produced garbage output during generation because MoMH attention was only applied during prefill, not decode. The model was trained with specialized head attention patterns (V-heads, T-heads, VT-heads) but fell back to vanilla SDPA during decode.
-
-**Solution**:
-1. Implemented `score_mod` with position offset for decode phase (vs `BlockMask` for prefill)
-2. Used captured tensors to avoid recompilation when updating position values
-3. Added `flex_attention_compiled_dynamic` with `dynamic=True` for decode to handle variable KV lengths
-
-**Key Results**:
-| Metric | Before | After |
-|--------|--------|-------|
-| Decode time/iter | 1036ms | 0.25ms |
-| Recompilations | Every step | None |
-| Test coverage | 0 | 21 tests |
-
-**Files**: See `training_reports/momh_flex_attention_retrospective.md` for full details.
-
-<!-- New entries go above this line -->
-
-## 2026-02-02 — Checkpointing + deterministic resume validation
-
-**Type:** Retrospective  
-**General description:** Added full-state checkpointing and validated deterministic resume from step 50 to 100.
-
-### Details
-
-- Checkpoints now include model weights, optimizer state, RNG state, and dataloader progress (global_step, epoch, micro_step_in_epoch, warmup_batches, tokens_processed_global).
-- Resume restores RNG, fast-forwards dataloader for in-epoch resumption, disables warmup on resume, and reloads optimizer state.
-- Determinism verified on GPU: a baseline 100-step run matched the resumed run (from step_50) for batch_loss and grad_norm on steps 50–99.
-  - Baseline run: `ckpt-100full-gpu_...` (W&B run id `l0lrs914`)
-  - Resume run: `ckpt-100resume-gpu-...` (W&B run id `9zf5afcy`)
-- Updated PyTorch to 2.10.0+cu128 to support Blackwell (sm_120) GPUs after `no kernel image` failures on older builds.

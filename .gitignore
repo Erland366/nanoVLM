@@ -15,7 +15,6 @@ wandb/
 logs/
 *.csv
 .vscode
-.env
 
 resources
 
@@ -27,9 +26,7 @@ results/
 eval_results*/
 *.arrow
 /shards/*
-plots*/
-.ipynb_checkpoints/
-setup.sh
-train.sh
 *.png
-*.sh
+plots*/
+.env
+compiled_resources/
