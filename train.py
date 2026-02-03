@@ -8,11 +8,11 @@ import wandb
 import argparse
 import contextlib
 import subprocess
-import torch.optim as optim
 from statistics import mean
 from dataclasses import asdict
 import torch.distributed as dist
 from tqdm import tqdm
+from dotenv import load_dotenv
 
 from data.data_utils import synchronized_dataloader_step
 
@@ -32,6 +32,7 @@ from utils.checkpointing import (
     save_model_optimizer_state,
     save_trainer_state,
 )
+from utils.optimizers import build_optimizer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -233,27 +234,18 @@ def train(train_cfg, vlm_cfg, global_cfg):
         if is_dist():
             print(f"Validation summary per GPU: batch size {val_loader.batch_size}")
 
-    # Define optimizer groups
-    # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
-    # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
-    param_groups = []
-    if train_cfg.lr_mp > 0:
-        param_groups.append({'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp})
-    else:
+    # Freeze modules with LR <= 0.
+    if train_cfg.lr_mp <= 0:
         for p in list(model.MP.parameters()):
             p.requires_grad = False
-    if train_cfg.lr_vision_backbone > 0:
-        param_groups.append({'params': list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_vision_backbone})
-    else:
+    if train_cfg.lr_vision_backbone <= 0:
         for p in list(model.vision_encoder.parameters()):
             p.requires_grad = False
-    if train_cfg.lr_language_backbone > 0:
-        param_groups.append({'params': list(model.decoder.parameters()), 'lr': train_cfg.lr_language_backbone})
-    else:
+    if train_cfg.lr_language_backbone <= 0:
         for p in list(model.decoder.parameters()):
             p.requires_grad = False
 
-    optimizer = optim.AdamW(param_groups)
+    optimizer = build_optimizer(model, train_cfg)
     all_params = [p for group in optimizer.param_groups for p in group['params']]
 
     device = (
@@ -438,32 +430,35 @@ def train(train_cfg, vlm_cfg, global_cfg):
                     if not getattr(train_cfg, "effective_token_lr_scale", False):
                         step_effective_token_lr_scale = 1.0
 
-                param_group_idx = 0
+                lrs_by_key = {}
                 if train_cfg.lr_mp > 0:
                     adj_lr_mp = (
                         get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps)
                         * step_effective_token_lr_scale
                     )
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
+                    lrs_by_key["mp"] = adj_lr_mp
                     current_lrs["train/lr_mp"] = adj_lr_mp
-                    param_group_idx += 1
 
                 if train_cfg.lr_vision_backbone > 0:
                     adj_lr_vision_backbone = (
                         get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
                         * step_effective_token_lr_scale
                     )
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
+                    lrs_by_key["vision"] = adj_lr_vision_backbone
                     current_lrs["train/lr_vision_backbone"] = adj_lr_vision_backbone
-                    param_group_idx += 1
 
                 if train_cfg.lr_language_backbone > 0:
                     adj_lr_language_backbone = (
                         get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
                         * step_effective_token_lr_scale
                     )
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
+                    lrs_by_key["language"] = adj_lr_language_backbone
                     current_lrs["train/lr_language_backbone"] = adj_lr_language_backbone
+
+                for group in optimizer.param_groups:
+                    lr_key = group.get("lr_key")
+                    if lr_key in lrs_by_key:
+                        group["lr"] = lrs_by_key[lr_key]
               
                 optimizer.step()
                 optimizer.zero_grad()
@@ -788,10 +783,21 @@ def train(train_cfg, vlm_cfg, global_cfg):
             run.finish()
 
 def main():
+    load_dotenv()
     parser = argparse.ArgumentParser()
     parser.add_argument('--lr_mp', type=float, help='Learning rate for the mapping network')
     parser.add_argument('--lr_vision_backbone', type=float, help='Learning rate for the vision backbone')
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
+    parser.add_argument('--optimizer', type=str, choices=("adamw", "muon"), help='Optimizer: adamw or muon')
+    parser.add_argument('--weight_decay', type=float, help='Weight decay (applies to AdamW or scalar updates under Muon)')
+    parser.add_argument('--adamw_beta1', type=float, help='AdamW beta1 (also used for scalar updates under Muon)')
+    parser.add_argument('--adamw_beta2', type=float, help='AdamW beta2 (also used for scalar updates under Muon)')
+    parser.add_argument('--muon_mu', type=float, help='Muon momentum (mu)')
+    parser.add_argument('--muon_adjust_lr', type=str, choices=("spectral_norm", "rms_norm", "none"), help='Muon adjust_lr mode')
+    parser.add_argument('--muon_nesterov', type=str2bool, help='Muon Nesterov momentum')
+    parser.add_argument('--muon_cautious_wd', type=str2bool, help='Muon cautious weight decay')
+    parser.add_argument('--muon_epsilon', type=float, help='Muon epsilon for numerical stability')
+    parser.add_argument('--muon_use_triton', type=str2bool, help='Use Triton Newton-Schulz kernel in Muon')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=str2bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--activation_checkpointing', type=str2bool, help='Enable activation checkpointing for LM/VIT blocks')
@@ -828,6 +834,26 @@ def main():
         train_cfg.lr_vision_backbone = args.lr_vision_backbone
     if args.lr_language_backbone is not None:
         train_cfg.lr_language_backbone = args.lr_language_backbone
+    if args.optimizer is not None:
+        train_cfg.optimizer = args.optimizer
+    if args.weight_decay is not None:
+        train_cfg.weight_decay = args.weight_decay
+    if args.adamw_beta1 is not None or args.adamw_beta2 is not None:
+        beta1 = float(args.adamw_beta1) if args.adamw_beta1 is not None else float(train_cfg.adamw_betas[0])
+        beta2 = float(args.adamw_beta2) if args.adamw_beta2 is not None else float(train_cfg.adamw_betas[1])
+        train_cfg.adamw_betas = (beta1, beta2)
+    if args.muon_mu is not None:
+        train_cfg.muon_mu = args.muon_mu
+    if args.muon_adjust_lr is not None:
+        train_cfg.muon_adjust_lr = None if args.muon_adjust_lr == "none" else args.muon_adjust_lr
+    if args.muon_nesterov is not None:
+        train_cfg.muon_nesterov = args.muon_nesterov
+    if args.muon_cautious_wd is not None:
+        train_cfg.muon_cautious_wd = args.muon_cautious_wd
+    if args.muon_epsilon is not None:
+        train_cfg.muon_epsilon = args.muon_epsilon
+    if args.muon_use_triton is not None:
+        train_cfg.muon_use_triton = args.muon_use_triton
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:

@@ -126,6 +126,20 @@ class VLMConfig:
 
 @dataclass
 class TrainConfig:
+    # Optimizer selection
+    optimizer: str = "adamw"  # "adamw" or "muon"
+    weight_decay: float = 0.01
+    adamw_betas: tuple[float, float] = (0.9, 0.999)
+
+    # Muon optimizer (microsoft/dion)
+    muon_mu: float = 0.95
+    muon_adjust_lr: str | None = "spectral_norm"  # "spectral_norm", "rms_norm", or None
+    muon_nesterov: bool = False
+    muon_cautious_wd: bool = False
+    muon_epsilon: float = 1e-8
+    muon_use_triton: bool = False
+    muon_scalar_algorithm: str = "adamw"  # "adamw" or "lion"
+
     lr_mp: float = 5e-5
     lr_vision_backbone: float = 1e-5
     lr_language_backbone: float = 1e-5

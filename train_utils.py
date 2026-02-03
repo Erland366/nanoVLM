@@ -105,6 +105,7 @@ def set_seed(global_cfg):
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
     max_training_steps = f"{train_cfg.max_training_steps}"
+    optimizer = getattr(train_cfg, "optimizer", "adamw")
     learning_rate = f"lr_vision_{train_cfg.lr_vision_backbone}-language_{train_cfg.lr_language_backbone}-{train_cfg.lr_mp}"
     num_gpus = f"{get_world_size()}xGPU"
     date = time.strftime("%m%d-%H%M%S")
@@ -112,7 +113,7 @@ def get_run_name(train_cfg, vlm_cfg):
     mp = f"mp{vlm_cfg.mp_pixel_shuffle_factor}"
     llm = f"{vlm_cfg.lm_model_type.split('/')[-1]}"
 
-    base_name = f"nanoVLM_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
+    base_name = f"nanoVLM_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_opt{optimizer}_{max_training_steps}_{learning_rate}_{date}"
     if train_cfg.prefix_run_name:
         return f"{train_cfg.prefix_run_name}_{base_name}"
     return base_name
