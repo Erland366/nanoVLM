@@ -424,6 +424,7 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg, *, do_warmup: bool = True):
         queue_size=2,
         max_images_per_example=train_cfg.max_images_per_example,
         max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+        pack_sequences=train_cfg.pack_sequences,
     )
 
     val_dataset = ConstantLengthDataset(
@@ -435,6 +436,7 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg, *, do_warmup: bool = True):
         queue_size=2,
         max_images_per_example=train_cfg.max_images_per_example,
         max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+        pack_sequences=train_cfg.pack_sequences,
     )
 
     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)

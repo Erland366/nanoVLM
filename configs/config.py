@@ -65,6 +65,9 @@ class VLMConfig:
     momh_head_pct_text: float = 0.2    # 40% of heads for T->T only
     # Remaining 20% (1 - vision - text) for VT->VT cross-modal
 
+    # Activation checkpointing for LM/ViT blocks during training.
+    activation_checkpointing: bool = False
+
     vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
     hf_repo_name: str = 'nanoVLM'
 
@@ -77,6 +80,7 @@ class TrainConfig:
     lr_vision_backbone: float = 0                 # Learning rate for vision backbone
     lr_language_backbone: float = 5e-5              # Learning rate for language backbone
     compile: bool = False                            # Use torch.compile for model/training
+    activation_memory_budget: float = None         # torch.compile activation memory budget (0-1); requires compile=True
     resume_from_vlm_checkpoint: bool = False       # Resume full VLM training from checkpoint
 
     # =========================
@@ -139,6 +143,9 @@ class TrainConfig:
     max_training_steps: int = 20_000                   # Total optimizer steps for training
     max_grad_norm: float = 1.0                      # Gradient clipping
 
+    effective_token_lr_scale: bool = False
+    effective_token_lr_exponent: float = 0.5
+
     # =========================
     # Evaluation Related
     # =========================
@@ -172,4 +179,3 @@ class TrainConfig:
     lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa'
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
-
