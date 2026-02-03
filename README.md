@@ -206,6 +206,17 @@ Notes:
 - This benchmark uses list-of-tensors image inputs (matching training), so variable image counts or tile counts can still introduce guards.
 - MoMH block masks are now built in the VLM wrapper (outside compiled decoder) to avoid graph breaks from `torch.compiler.disable` inside the compiled region. Direct calls to `model.decoder(...)` can still graph-break if they need a block mask.
 
+### MoMH document-masking microbench (packing)
+
+To benchmark the runtime impact of MoMH document masking (`document_ids`) and the potential speedup from increased sparsity under packing:
+
+```bash
+source .venv/bin/activate
+python eval/benchmark_momh_doc_mask.py --seq-len 2048 --iters 200 --repeats 15
+```
+
+This writes JSONL output to `benchmark_results/momh_doc_mask.jsonl` by default.
+
 ### MoMH masking sanity check
 
 MoMH masking classifies tokens as “vision” based on the `<|image|>` placeholder positions (the same positions that get replaced by image embeddings). This is important for multi-image / multi-patch samples where the number of `<|image|>` placeholders is much larger than `mp_image_token_length`.
