@@ -131,7 +131,7 @@ Notes:
 
 ### torch.compile (regional) + dynamic batch/seq
 
-When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
+When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode=TrainConfig.compile_mode` (default: `reduce-overhead`) to cut compile latency. You can override via `train.py --compile_mode {default,reduce-overhead,max-autotune}`. Variable batch sizes can still trigger recompiles.
 
 When compile is enabled, `train.py` always applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance. There is no separate flag for this.
 
@@ -167,7 +167,7 @@ To measure step time, tokens/s, and VRAM for a short forward+backward+optimizer 
 
 ```bash
 source .venv/bin/activate
-python eval/benchmark_train_step.py --mode synthetic --steps 10 --warmup-steps 3 --batch-size 1 --seq-len 2048
+python eval/benchmark_train_step.py --mode synthetic --batch-size 1 --seq-len 2048
 ```
 
 <u>Important: this benchmark defaults to the **current `train.py` setup**. You can still override compile via CLI flags, but all optimization changes should ultimately land in `train.py`.</u>
@@ -177,12 +177,39 @@ The benchmark reports `compile_time_ms` when compile is enabled (first step that
 Selective activation checkpointing under `torch.compile` enables `allow_cache_entry_mutation=True` to avoid cached-tensor mutation
 errors. This disables a correctness guard; use with care.
 
-Write results to JSONL (default `benchmark_results/train_step.jsonl`) and compare runs by toggling MoMH:
+Write results to JSONL (default `benchmark_results/train_step.jsonl`) as a log, and optionally emit a stable JSON run artifact for comparisons:
 
 ```bash
 source .venv/bin/activate
 python eval/benchmark_train_step.py --mode synthetic --momh --out-jsonl benchmark_results/train_step.jsonl
 python eval/benchmark_train_step.py --mode synthetic --no-momh --out-jsonl benchmark_results/train_step.jsonl
+```
+
+#### Baselines + compare (stable JSON)
+
+Save a committed baseline under `benchmarks/baselines/train_step_e2e/` (refuses if git is dirty unless `--allow-dirty`):
+
+```bash
+source .venv/bin/activate
+python eval/benchmark_train_step.py --mode synthetic --compile --compile-mode reduce-overhead \
+  --save-baseline nanovlm-<gpu>-bf16-YYYY-MM-DD
+```
+
+Run again and write a JSON artifact:
+
+```bash
+source .venv/bin/activate
+python eval/benchmark_train_step.py --mode synthetic --compile --compile-mode reduce-overhead \
+  --out-json /tmp/train_step_current.json
+```
+
+Compare (exits non-zero on regression):
+
+```bash
+source .venv/bin/activate
+python eval/benchmark_train_step.py --compare \
+  --baseline nanovlm-<gpu>-bf16-YYYY-MM-DD \
+  --current /tmp/train_step_current.json
 ```
 
 #### Shape-sweep (variable batch/seq)

@@ -292,7 +292,12 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 print("activation_memory_budget set but compile is disabled; ignoring.")
 
     if train_cfg.compile:
-        compile_regions(model)
+        compile_mode = getattr(train_cfg, "compile_mode", "reduce-overhead")
+        if compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
+            raise ValueError(
+                f"Unsupported compile_mode={compile_mode!r}; expected default|reduce-overhead|max-autotune."
+            )
+        compile_regions(model, dynamic=None, mode=compile_mode)
     if is_dist():
         print("Wrapping model for DDP")
         model = wrap_model(model)
@@ -332,7 +337,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
         current_epoch = epoch + 1
         epoch_start_time = time.time()
         model.train()
-        total_train_loss = 0
+        total_train_loss_t = torch.zeros((), device=device, dtype=torch.float32)
         total_tokens_processed = 0
         num_batches = 0
         optimizer.zero_grad()
@@ -359,12 +364,17 @@ def train(train_cfg, vlm_cfg, global_cfg):
             step_effective_token_lr_scale = 1.0
             batch_start_time = time.time()
             images = batch["images"]
+            attention_mask_host = batch["attention_mask"]
+            if not isinstance(attention_mask_host, torch.Tensor):
+                raise TypeError(
+                    f"Expected batch['attention_mask'] to be a torch.Tensor, got {type(attention_mask_host)}"
+                )
+            num_tokens = int(attention_mask_host.sum().item())
+
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            attention_mask = attention_mask_host.to(device)
             data_load_time = time.time() - data_load_start
-
-            num_tokens = int(torch.sum(attention_mask).item())
             tokens_processed_global += num_tokens
             effective_tokens_accum += num_tokens
 
@@ -394,6 +404,8 @@ def train(train_cfg, vlm_cfg, global_cfg):
             )
             with autocast_context:
                 with context:
+                    if train_cfg.compile and hasattr(torch, "compiler"):
+                        torch.compiler.cudagraph_mark_step_begin()
                     _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
 
             if train_cfg.gradient_accumulation_steps > 1:
@@ -457,12 +469,14 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 optimizer.zero_grad()
                 effective_tokens_accum = 0
 
-            batch_loss = loss.item()
-            if train_cfg.gradient_accumulation_steps > 1:
-                batch_loss = batch_loss * train_cfg.gradient_accumulation_steps
-            total_train_loss += batch_loss
+            loss_detached = loss.detach()
+            loss_unscaled = (
+                loss_detached * train_cfg.gradient_accumulation_steps
+                if train_cfg.gradient_accumulation_steps > 1
+                else loss_detached
+            )
+            total_train_loss_t = total_train_loss_t + loss_unscaled.float()
 
-            num_tokens = int(num_tokens) # Sum of attention mask gives number of tokens (effective tokens)
             total_batch_tokens = attention_mask.numel()   # Total tokens including padding
             total_tokens_processed += num_tokens
             post_process_time = time.time() - post_process_start
@@ -488,8 +502,10 @@ def train(train_cfg, vlm_cfg, global_cfg):
                         train_pbar.update(1)
                 else:
                     train_pbar.update(1)
+                if is_update_step:
+                    batch_loss_value = float(loss_unscaled.float().item())
                 train_pbar.set_postfix({
-                    "Loss": f"{batch_loss:.4f}",
+                    "Loss": f"{batch_loss_value:.4f}" if is_update_step else "",
                     "Step": f"{global_step}",
                 })
 
@@ -634,6 +650,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
             # Log batch loss  
             if is_update_step:
                 # ALL RANKS: gather loss from all ranks if DDP
+                batch_loss = float(loss_unscaled.float().item())
                 if is_dist():
                     batch_loss_gathered = dist_mean_scalar(batch_loss)
                 else:
@@ -720,7 +737,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
             train_pbar.close()
         if num_batches == 0:
             break
-        avg_train_loss = total_train_loss / num_batches
+        avg_train_loss = float((total_train_loss_t / num_batches).item())
         # gather average batch loss from all ranks if DDP
         avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
 
@@ -782,6 +799,12 @@ def main():
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=str2bool, help='Use torch.compile to optimize the model')
+    parser.add_argument(
+        '--compile_mode',
+        type=str,
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help='torch.compile mode (default|reduce-overhead|max-autotune)',
+    )
     parser.add_argument('--activation_checkpointing', type=str2bool, help='Enable activation checkpointing for LM/VIT blocks')
     parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
     parser.add_argument('--momh_enabled', type=str2bool, help='Enable MoMH attention')
@@ -820,6 +843,8 @@ def main():
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:
         train_cfg.compile = args.compile
+    if args.compile_mode is not None:
+        train_cfg.compile_mode = args.compile_mode
     if args.activation_checkpointing is not None:
         vlm_cfg.activation_checkpointing = args.activation_checkpointing
     if args.activation_memory_budget is not None:
