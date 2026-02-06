@@ -113,3 +113,22 @@ Invoke after completing experiments to capture learnings.
 - **Skill naming:** `{topic}-{finding}` (e.g., `lora-rank-optimal`)
 - **Dates:** YYYY-MM-DD format
 - **Configs:** YAML or JSON, copy-paste ready
+
+## 8. Debugging
+For debugging that is not affecting the loss (eg. compile), we can reduce the model size to make our iterations faster. Suggested configs that we can change on `./models/config.py`:
+```
+vit_hidden_dim: 256,
+vit_inter_dim: 1024,
+vit_patch_size: 16,
+vit_img_size: 128,
+vit_n_heads: 4,
+vit_dropout: 0.0,
+vit_n_blocks: 4,
+lm_hidden_dim: 384,
+lm_inter_dim: 1024,
+lm_n_heads: 6,
+lm_n_kv_heads: 2,
+lm_n_blocks: 8,
+lm_max_length: 1024,
+lm_tie_weights: true,
+```

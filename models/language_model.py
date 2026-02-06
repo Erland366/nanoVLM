@@ -722,8 +722,8 @@ class LanguageModel(nn.Module):
 
         for i, block in enumerate(self.blocks):
             if use_activation_checkpointing:
-                def _run_block(x_in: torch.Tensor) -> torch.Tensor:
-                    x_out, _ = block(
+                def _run_block(x_in: torch.Tensor, _block=block) -> torch.Tensor:
+                    x_out, _ = _block(
                         x_in,
                         cos,
                         sin,

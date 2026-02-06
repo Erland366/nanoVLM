@@ -14,6 +14,42 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-06 — Observation: compile stability fix for cudagraph pool errors
+
+**Type:** Observation  
+**General description:** Stabilized `compile=True` training loop for CUDA by aligning compile mode controls and cudagraph boundaries.
+
+### Details
+
+- Added `TrainConfig.compile_mode` (`default|reduce-overhead|max-autotune`) and CLI `--compile_mode` to control regional `torch.compile` mode directly in `train.py`.
+- Added per-microstep `torch.compiler.cudagraph_mark_step_begin()` when `compile=True` on CUDA to avoid cudagraph pool lifetime/accounting failures during training loops with recompute/checkpointing.
+- Made `activation_memory_budget` wiring robust across PyTorch builds by checking `torch._dynamo.config` first and falling back to `torch._functorch.config`.
+
+## 2026-02-06 — Retrospective: NaN debug + token-normalized accumulation fix
+
+**Type:** Retrospective  
+**General description:** Traced unstable/poor pretraining loss to activation-checkpointing closure correctness and gradient-accumulation loss normalization mismatch.
+
+### Details
+
+- **NaN root cause identified:** activation-checkpointed block loops in ViT/LM used late-bound loop closures, which can recompute the wrong block in backward.
+- **Fix applied:** bind each checkpoint closure to the current loop block (`_block=block`) in:
+  - `models/vision_transformer.py`
+  - `models/language_model.py`
+- **Verification:** with `activation_checkpointing=False`, runs stayed finite; with the buggy AC path, first optimizer updates produced non-finite vision grads.
+- **Convergence discrepancy vs baseline:** compared `flex_attention` to `DualTowerVLM` and found a training-path mismatch:
+  - baseline uses token-count-normalized accumulation (`loss_reduction="sum"` + valid-token count + grad rescale by total valid tokens),
+  - current branch used per-microbatch mean CE accumulation.
+- **Fix applied:** switched `flex_attention` training to token-normalized accumulation in `train.py`, and extended `VisionLanguageModel.forward(...)` to support `loss_reduction` and `return_loss_count`.
+- **Runs executed:**
+  - `xw54sjrv` (long no-compile MoMH run) reached ~2927 steps before manual stop.
+  - `3yn8ei95` (patched token-normalized run, 500-step target) reached ~278 steps with finite loss before manual stop.
+
+### Links
+
+- W&B runs: `xw54sjrv`, `3yn8ei95`
+- Troubleshooting updates: `references/troubleshooting.md`
+
 ## 2026-02-02 — MoMH uptraining plan (gradual mask ramp)
 
 **Type:** Plan  

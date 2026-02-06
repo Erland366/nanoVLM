@@ -156,6 +156,7 @@ class TrainConfig:
     max_training_tokens: int | None = None
 
     compile: bool = False
+    compile_mode: str | None = "default"
     activation_memory_budget: float | None = 0.5
 
     # Training-time activation checkpointing behavior (controlled via VLMConfig.activation_checkpointing).

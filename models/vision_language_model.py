@@ -106,7 +106,15 @@ class VisionLanguageModel(nn.Module):
                 return torch.cat(images, dim=0).to(device)
         return images # Already a tensor
 
-    def forward(self, input_ids, images, attention_mask=None, targets=None):
+    def forward(
+        self,
+        input_ids,
+        images,
+        attention_mask=None,
+        targets=None,
+        loss_reduction: str = "mean",
+        return_loss_count: bool = False,
+    ):
         images_tensor = self._process_images(images, input_ids.device)
         is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
@@ -147,11 +155,24 @@ class VisionLanguageModel(nn.Module):
         )
 
         loss = None
+        loss_count = None
         if targets is not None:
             logits = self.decoder.head(logits) # Apply LM head
             # Loss is calculated over all tokens, but `targets` (labels) will have -100 for non-answer tokens.
             # No need to slice logits based on image embedding size here, as the target mask handles it.
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-100,
+                reduction=loss_reduction,
+            )
+            if return_loss_count:
+                loss_count = (targets != -100).sum()
+
+        if return_loss_count:
+            if loss_count is None:
+                raise ValueError("return_loss_count=True requires targets.")
+            return logits, loss, loss_count
 
         return logits, loss
 

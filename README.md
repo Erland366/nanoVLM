@@ -131,7 +131,9 @@ Notes:
 
 ### torch.compile (regional) + dynamic batch/seq
 
-When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP) using `mode="reduce-overhead"` to cut compile latency. This matches “regional compile” guidance and reduces cold-start compile time compared to compiling the entire VLM wrapper. Variable batch sizes can still trigger recompiles.
+When `TrainConfig.compile` is `True` (see `models/config.py`), we compile **each repeated block** in the vision encoder and decoder (plus the MP). The default mode is `default` for stability, and you can override it with `TrainConfig.compile_mode` or CLI `--compile_mode {default,reduce-overhead,max-autotune}`.
+
+In compile mode on CUDA, the training loop calls `torch.compiler.cudagraph_mark_step_begin()` on each micro-step to keep cudagraph boundaries explicit and avoid stale-pool lifetime issues.
 
 When compile is enabled, `train.py` always applies `torch._dynamo.maybe_mark_dynamic` on the `(B, T)` dims of `input_ids`, `labels`, and `attention_mask` to reduce recompiles from batch/seq variance. There is no separate flag for this.
 

@@ -93,6 +93,15 @@ def compile_regions(model, *, dynamic: bool | None = None, mode: str | None = "r
     model.MP = torch.compile(model.MP, dynamic=dynamic, mode=mode)
 
 
+def _resolve_compile_mode(mode: str | None) -> str | None:
+    allowed_modes = {"default", "reduce-overhead", "max-autotune"}
+    if mode is None:
+        return None
+    if mode not in allowed_modes:
+        raise ValueError(f"Unsupported compile_mode: {mode}. Allowed values: {sorted(allowed_modes)}")
+    return mode
+
+
 def compute_effective_token_scale(
     effective_tokens: int, denom_tokens: int, exponent: float
 ) -> tuple[float, float]:
@@ -281,13 +290,20 @@ def train(train_cfg, vlm_cfg, global_cfg):
             strict=True,
         )
 
+    compile_mode = _resolve_compile_mode(getattr(train_cfg, "compile_mode", "default"))
+
     if getattr(train_cfg, "activation_memory_budget", None) is not None:
         if not 0.0 <= train_cfg.activation_memory_budget <= 1.0:
             raise ValueError("activation_memory_budget must be between 0 and 1.")
-        if not hasattr(torch._functorch.config, "activation_memory_budget"):
+        budget_cfg = None
+        if hasattr(torch._dynamo.config, "activation_memory_budget"):
+            budget_cfg = torch._dynamo.config
+        elif hasattr(torch._functorch.config, "activation_memory_budget"):
+            budget_cfg = torch._functorch.config
+        if budget_cfg is None:
             raise RuntimeError("activation_memory_budget is not supported in this PyTorch build.")
         if train_cfg.compile:
-            torch._functorch.config.activation_memory_budget = train_cfg.activation_memory_budget
+            budget_cfg.activation_memory_budget = train_cfg.activation_memory_budget
             if is_master():
                 print(f"Using activation_memory_budget={train_cfg.activation_memory_budget}")
         else:
@@ -295,7 +311,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 print("activation_memory_budget set but compile is disabled; ignoring.")
 
     if train_cfg.compile:
-        compile_regions(model)
+        compile_regions(model, mode=compile_mode)
     if is_dist():
         print("Wrapping model for DDP")
         model = wrap_model(model)
@@ -340,6 +356,8 @@ def train(train_cfg, vlm_cfg, global_cfg):
         num_batches = 0
         optimizer.zero_grad()
         data_load_start = time.time()
+        accumulated_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        accumulated_loss_tokens = torch.zeros((), device=device, dtype=torch.float32)
 
         if not train_cfg.stream_dataset:
             train_pbar = tqdm(
@@ -354,6 +372,13 @@ def train(train_cfg, vlm_cfg, global_cfg):
             synchronized_dataloader_step(iter_train_loader, is_dist()),
             start=micro_step_in_epoch,
         ):
+            if (
+                train_cfg.compile
+                and device.type == "cuda"
+                and hasattr(torch, "compiler")
+                and hasattr(torch.compiler, "cudagraph_mark_step_begin")
+            ):
+                torch.compiler.cudagraph_mark_step_begin()
             num_batches += 1
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0
             micro_step_in_epoch = i + 1
@@ -397,17 +422,42 @@ def train(train_cfg, vlm_cfg, global_cfg):
             )
             with autocast_context:
                 with context:
-                    _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                    _, loss, loss_token_count = model(
+                        input_ids,
+                        images,
+                        attention_mask=attention_mask,
+                        targets=labels,
+                        loss_reduction="sum",
+                        return_loss_count=True,
+                    )
 
-            if train_cfg.gradient_accumulation_steps > 1:
-                loss = loss / train_cfg.gradient_accumulation_steps
+            loss_token_count_value = int(loss_token_count.item())
+            if loss_token_count_value == 0:
+                raise ValueError("Found a batch with no valid target tokens; check label masking.")
 
+            accumulated_loss_sum += loss.detach().to(dtype=torch.float32)
+            accumulated_loss_tokens += loss_token_count.to(dtype=torch.float32)
             loss.backward()
 
             fw_bw_time = time.time() - fw_bw_start
             post_process_start = time.time()
             if is_update_step:
                 current_lrs = {}
+                total_loss_tokens = accumulated_loss_tokens.clone()
+                total_loss_sum = accumulated_loss_sum.clone()
+                if is_dist():
+                    dist.all_reduce(total_loss_tokens, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
+
+                total_loss_tokens_value = total_loss_tokens.item()
+                if total_loss_tokens_value == 0:
+                    raise ValueError("Gradient accumulation produced zero total tokens; check label masking.")
+
+                grad_scale = get_world_size() / total_loss_tokens_value
+                for param in all_params:
+                    if param.grad is not None:
+                        param.grad.mul_(grad_scale)
+
                 if train_cfg.max_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
 
@@ -459,10 +509,10 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 optimizer.step()
                 optimizer.zero_grad()
                 effective_tokens_accum = 0
+                accumulated_loss_tokens.zero_()
+                accumulated_loss_sum.zero_()
 
-            batch_loss = loss.item()
-            if train_cfg.gradient_accumulation_steps > 1:
-                batch_loss = batch_loss * train_cfg.gradient_accumulation_steps
+            batch_loss = loss.item() / loss_token_count_value
             total_train_loss += batch_loss
 
             num_tokens = int(num_tokens) # Sum of attention mask gives number of tokens (effective tokens)
@@ -785,6 +835,12 @@ def main():
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--compile', type=str2bool, help='Use torch.compile to optimize the model')
+    parser.add_argument(
+        '--compile_mode',
+        type=str,
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help='torch.compile mode when compile=True',
+    )
     parser.add_argument('--activation_checkpointing', type=str2bool, help='Enable activation checkpointing for LM/VIT blocks')
     parser.add_argument('--activation_memory_budget', type=float, help='torch.compile activation memory budget (0-1)')
     parser.add_argument('--momh_enabled', type=str2bool, help='Enable MoMH attention')
@@ -823,6 +879,8 @@ def main():
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:
         train_cfg.compile = args.compile
+    if args.compile_mode is not None:
+        train_cfg.compile_mode = args.compile_mode
     if args.activation_checkpointing is not None:
         vlm_cfg.activation_checkpointing = args.activation_checkpointing
     if args.activation_memory_budget is not None:

@@ -184,8 +184,8 @@ class ViT(nn.Module):
 
         for block in self.blocks:
             if use_activation_checkpointing:
-                def _run_block(x_in: torch.Tensor) -> torch.Tensor:
-                    return block(x_in)
+                def _run_block(x_in: torch.Tensor, _block=block) -> torch.Tensor:
+                    return _block(x_in)
 
                 if checkpoint_context_fn is None:
                     x = activation_checkpoint(_run_block, x, use_reentrant=False)

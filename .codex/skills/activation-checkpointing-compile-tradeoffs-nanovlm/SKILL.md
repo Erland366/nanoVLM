@@ -48,6 +48,8 @@ Do NOT use when:
 - If `compile=False` and you need VRAM savings, manual AC outperformed selective AC at B=1, T=1024.
 - Prefer `compile-mode=default` when AC is enabled; `reduce-overhead` triggered cudagraph issues in practice.
 - Keep batch size fixed within a compile session to minimize recompiles in flex_attention block mask.
+- In checkpointed loops, bind the current block in the closure (e.g., `def _run_block(x_in, _block=block): ...`)
+  to avoid late-bound recomputation bugs in backward.
 
 ## Failure Modes
 
@@ -56,6 +58,7 @@ Do NOT use when:
 | Selective AC under compile without allow_mutation | Cached tensor mutation error | Must set allow_cache_entry_mutation=True |
 | AC + reduce-overhead | CUDAGraph-related errors | Use compile-mode default for AC runs |
 | Selective AC (no compile) slower than manual | Policy overhead outweighs benefits | Use manual AC when not compiling |
+| Checkpoint closure captures loop variable (`block`) late | Backward recompute can run the wrong block, causing non-finite grads/NaNs | Bind `block` via default arg in closure (`_block=block`) in LM/ViT loops |
 
 ## Configuration
 
@@ -72,4 +75,4 @@ VLMConfig:
 - Related reports: `training_reports/activation-checkpointing-benchmark-2026-02-02.md`,
   `training_reports/activation-checkpointing-compile-benchmark-2026-02-02.md`,
   `training_reports/compile-reduce-overhead-2026-02-02.md`
-- Code: `train.py`, `models/language_model.py`, `models/activation_checkpointing.py`
+- Code: `train.py`, `models/language_model.py`, `models/vision_transformer.py`, `models/activation_checkpointing.py`
