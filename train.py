@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+
+load_dotenv()
 import os
 import re
 import json
@@ -281,10 +284,10 @@ def train(train_cfg, vlm_cfg, global_cfg):
     if getattr(train_cfg, "activation_memory_budget", None) is not None:
         if not 0.0 <= train_cfg.activation_memory_budget <= 1.0:
             raise ValueError("activation_memory_budget must be between 0 and 1.")
-        if not hasattr(torch._dynamo.config, "activation_memory_budget"):
+        if not hasattr(torch._functorch.config, "activation_memory_budget"):
             raise RuntimeError("activation_memory_budget is not supported in this PyTorch build.")
         if train_cfg.compile:
-            torch._dynamo.config.activation_memory_budget = train_cfg.activation_memory_budget
+            torch._functorch.config.activation_memory_budget = train_cfg.activation_memory_budget
             if is_master():
                 print(f"Using activation_memory_budget={train_cfg.activation_memory_budget}")
         else:

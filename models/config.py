@@ -18,7 +18,7 @@ class VLMConfig:
     lm_inter_dim: int = 2560
     lm_rms_eps: float = 1e-5
     lm_re_base: int = 100000
-    lm_max_position_embeddings: int = 8192
+    lm_max_position_embeddings: int = 4096
     lm_base_vocab_size: int = 49152
     extra_token_amount: int = 66  # Number of extra tokens for the VLM (image start, image end, image token)
     lm_vocab_size: int = lm_base_vocab_size + extra_token_amount
@@ -38,16 +38,16 @@ class VLMConfig:
     mp_image_token_length: int = 64
 
     # Mixture of Modality Heads (MoMH) config
-    momh_enabled: bool = True
+    momh_enabled: bool = False
     momh_head_pct_vision: float = 0.2  # 20% of heads for V->V only
     momh_head_pct_text: float = 0.3  # 30% of heads for T->T only
     # Remaining 50% (1 - vision - text) for VT->VT cross-modal
 
     # Activation checkpointing for LM/ViT blocks during training.
-    activation_checkpointing: bool = False
+    activation_checkpointing: bool = True
 
     max_img_size: int = 2048
-    resize_to_max_side_len: bool = True
+    resize_to_max_side_len: bool = False
 
     vlm_extra_tokens: dict[str, str] = field(
         default_factory=lambda: {
@@ -126,6 +126,20 @@ class VLMConfig:
 
 @dataclass
 class TrainConfig:
+    # Optimizer selection
+    optimizer: str = "adamw"  # "adamw" or "muon"
+    weight_decay: float = 0.01
+    adamw_betas: tuple[float, float] = (0.9, 0.999)
+
+    # Muon optimizer (microsoft/dion)
+    muon_mu: float = 0.95
+    muon_adjust_lr: str | None = "spectral_norm"  # "spectral_norm", "rms_norm", or None
+    muon_nesterov: bool = False
+    muon_cautious_wd: bool = False
+    muon_epsilon: float = 1e-8
+    muon_use_triton: bool = False
+    muon_scalar_algorithm: str = "adamw"  # "adamw" or "lion"
+
     lr_mp: float = 5e-5
     lr_vision_backbone: float = 1e-5
     lr_language_backbone: float = 1e-5
@@ -142,7 +156,7 @@ class TrainConfig:
     max_training_tokens: int | None = None
 
     compile: bool = False
-    activation_memory_budget: float | None = None
+    activation_memory_budget: float | None = 0.5
 
     # Training-time activation checkpointing behavior (controlled via VLMConfig.activation_checkpointing).
     # This flag enables cross-rank sync when computing token-efficiency stats.
@@ -150,7 +164,7 @@ class TrainConfig:
 
     max_images_per_example: int = 10
     max_images_per_knapsack: int = 18
-    max_sample_length: int = 1024
+    max_sample_length: int = 4096
     pack_sequences: bool = False
 
     train_dataset_path: str = "patrickamadeus/the_cauldron"
@@ -171,12 +185,12 @@ class TrainConfig:
     visual_dependency_min_rating: int = 1
     formatting_min_rating: int = 1
 
-    enable_validation: bool = True
+    enable_validation: bool = False
     max_val_batches: int = 5000
 
     log_wandb: bool = True
-    wandb_entity: str = "erlandpg"
-    wandb_project: str = "nanoVLM"
+    wandb_entity: str | None = None
+    wandb_project: str = "momH"
     wandb_xaxis_tokens: bool = False
     prefix_run_name: str | None = None
 
@@ -190,9 +204,10 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_format: str = "dcp"  # "dcp" or "torch"
     resume_from_checkpoint: str | None = None
+    resume_from_vlm_checkpoint: str | None = None
 
     effective_token_lr_scale: bool = False
-    effective_token_lr_exponent: float = 0.5
+    effective_token_lr_exponent: float = 1
 
     use_lmms_eval: bool = False
     lmms_eval_tasks: str = (
@@ -200,6 +215,8 @@ class TrainConfig:
     )
     lmms_eval_limit: float | None = None
     lmms_eval_batch_size: int = 64
+
+    val_size: float = 0.1
 
 
 @dataclass

@@ -423,6 +423,7 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg, *, do_warmup: bool = True):
         queue_size=2,
         max_images_per_example=train_cfg.max_images_per_example,
         max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+        pack_sequences=train_cfg.pack_sequences,
     )
 
     val_dataset = ConstantLengthDataset(
@@ -434,6 +435,7 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg, *, do_warmup: bool = True):
         queue_size=2,
         max_images_per_example=train_cfg.max_images_per_example,
         max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+        pack_sequences=train_cfg.pack_sequences,
     )
 
     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
@@ -471,7 +473,8 @@ def get_dataloaders(train_cfg, vlm_cfg, global_cfg, *, do_warmup: bool = True):
     if do_warmup:
         print("Warming up dataloaders...")
         next(iter_train_loader)
-        next(iter_val_loader)
+        if train_cfg.enable_validation:
+            next(iter_val_loader)
         print("Warmup complete.")
 
     return train_loader, val_loader, iter_train_loader, iter_val_loader
