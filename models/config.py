@@ -144,8 +144,8 @@ class TrainConfig:
     lr_vision_backbone: float = 1e-5
     lr_language_backbone: float = 1e-5
 
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
 
     eval_in_epochs: bool = False
@@ -163,10 +163,10 @@ class TrainConfig:
     # This flag enables cross-rank sync when computing token-efficiency stats.
     sync_token_efficiency: bool = False
 
-    max_images_per_example: int = 10
+    max_images_per_example: int = 1
     max_images_per_knapsack: int = 18
     max_sample_length: int = 4096
-    pack_sequences: bool = False
+    pack_sequences: bool = True
 
     train_dataset_path: str = "patrickamadeus/the_cauldron"
     train_dataset_name: tuple[str, ...] = ("sample_1pct",)
@@ -207,7 +207,7 @@ class TrainConfig:
     resume_from_checkpoint: str | None = None
     resume_from_vlm_checkpoint: str | None = None
 
-    effective_token_lr_scale: bool = False
+    effective_token_lr_scale: bool = True
     effective_token_lr_exponent: float = 1
 
     use_lmms_eval: bool = False

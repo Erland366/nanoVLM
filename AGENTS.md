@@ -9,7 +9,15 @@ This document defines the operational contract for AI agents working in this pro
 
 ## 1. Project Context
 
-**Purpose:** Research project
+**Purpose:** I want to make sure that our training is correct before doing a full training + lr sweep tomorrow. The current wandb result shows that it is very noisy. I want to investigate what is the cause of the noise and if there are any optimizations that we can do to reduce it.
+
+Example run that is noisy is : 
+- https://wandb.ai/patrickirawan-mbzuai/momh/runs/5611r2nt
+- https://wandb.ai/patrickirawan-mbzuai/momh/runs/d4huzeui
+
+Please test everything using 2000 steps, compile True, momH true. For now we are doing this by using lr_effective_scale = False for sanity test. But I think lr_effective_scale True should actually help. We might need to reduce the exponent to be 0.5 tho. Use CUDA_VISIBLE_DEVICES=1 to make sure that we are not affected by GPU contention.
+
+Another possible source of noise is the fact we did not use packing properly. The run above shows that our effective token is less than 50%. Which means we are full of padding token. We might need to force the packing to be full.
 
 **Domain:** ML research and experimentation
 

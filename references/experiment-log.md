@@ -14,6 +14,80 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-06 — Observation: batch_loss now logs optimizer-step loss
+
+**Type:** Observation  
+**General description:** Re-mapped default loss logging so `batch_loss` uses the optimizer-step token-normalized loss and moved last-microbatch loss to `micro_loss`.
+
+### Details
+
+- `batch_loss` now logs `step_update_loss` (token-normalized loss across the full accumulation window).
+- Added `micro_loss` metric that logs the previous behavior (last micro-batch loss at update step).
+- Kept `update_loss` as a compatibility alias of the same optimizer-step loss value.
+- Updated README metric descriptions accordingly.
+
+## 2026-02-06 — Observation: removed EMA loss logging from W&B
+
+**Type:** Observation  
+**General description:** Removed EMA-smoothed loss logging to keep charts fully raw and unbiased.
+
+### Details
+
+- Removed `update_loss_ema` metric definition and logging from `train.py`.
+- Removed EMA-related config fields from `TrainConfig`:
+  - `log_update_loss_ema`
+  - `update_loss_ema_beta`
+- Removed matching CLI flags from `train.py`.
+- Kept `update_loss` logging (token-normalized optimizer-step loss) and existing `batch_loss` logging.
+
+## 2026-02-06 — Observation: log optimizer-step loss and EMA in W&B
+
+**Type:** Observation  
+**General description:** Added less noisy loss metrics that match optimizer-step behavior under gradient accumulation.
+
+### Details
+
+- Added `update_loss` logging in `train.py` as token-normalized optimizer-step loss (`total_loss_sum / total_loss_tokens`) computed at each update step.
+- Added optional `update_loss_ema` logging (default enabled) with new config fields:
+  - `TrainConfig.log_update_loss_ema` (default `True`)
+  - `TrainConfig.update_loss_ema_beta` (default `0.98`, validated in `[0,1)`).
+- Kept existing `batch_loss` logging unchanged for backward compatibility.
+- Updated W&B metric definitions so `update_loss` and `update_loss_ema` follow the same configured x-axis step metric.
+
+## 2026-02-06 — Observation: set default GA to 2 for bs4 parity test
+
+**Type:** Observation  
+**General description:** Adjusted default accumulation so `batch_size=4` matches prior effective batch size 8 for fair loss-convergence comparison.
+
+### Details
+
+- Changed `TrainConfig.gradient_accumulation_steps` default from `8` to `2` while keeping `batch_size=4`.
+- This restores effective global batch to `4 x 2 x 1 = 8`, matching prior single-GPU runs with `bs=1, ga=8`.
+- Updated README default-config note to reflect `batch_size=4`, `grad accum=2`.
+
+## 2026-02-06 — Observation: default train batch config switched to bs4/ga8
+
+**Type:** Observation  
+**General description:** Updated repo defaults to test loss behavior with larger per-step microbatch while keeping gradient accumulation at 8.
+
+### Details
+
+- Changed `TrainConfig.batch_size` default from `1` to `4`.
+- Kept `TrainConfig.gradient_accumulation_steps` at `8`.
+- Updated README default-config note to match current defaults.
+
+## 2026-02-06 — Observation: W&B effective-token x-axis restored
+
+**Type:** Observation  
+**General description:** Restored stable token-based charting by logging cumulative `effective_tokens` on every main training log event.
+
+### Details
+
+- `train.py` now uses cumulative `effective_tokens` as the default W&B step metric.
+- `tokens/consumed` remains available as the default step metric when `TrainConfig.wandb_xaxis_tokens=True`.
+- Per-update effective tokens were renamed to `effective_tokens_step` so the cumulative axis metric remains monotonic and usable as x-axis.
+- Applied to validation, training stats, batch loss, and epoch logs.
+
 ## 2026-02-06 — Observation: compile stability fix for cudagraph pool errors
 
 **Type:** Observation  

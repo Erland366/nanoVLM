@@ -187,6 +187,12 @@ def train(train_cfg, vlm_cfg, global_cfg):
             f"(global_step={resume_global_step}, epoch={resume_epoch}, micro_step_in_epoch={resume_micro_step})"
         )
     tokens_step_metric = "tokens/consumed"
+    effective_tokens_step_metric = "effective_tokens"
+    wandb_step_metric = (
+        tokens_step_metric
+        if getattr(train_cfg, "wandb_xaxis_tokens", False)
+        else effective_tokens_step_metric
+    )
     lmms_eval_step = "<lmms-eval-step>"
     run = None
     if train_cfg.log_wandb and is_master():
@@ -200,13 +206,15 @@ def train(train_cfg, vlm_cfg, global_cfg):
             },
             name=run_name,
         )
+        run.define_metric(wandb_step_metric)
+        run.define_metric("batch_loss", step_metric=wandb_step_metric)
+        run.define_metric("micro_loss", step_metric=wandb_step_metric)
+        run.define_metric("update_loss", step_metric=wandb_step_metric)
+        run.define_metric("val_loss", step_metric=wandb_step_metric)
+        run.define_metric("grad_norm", step_metric=wandb_step_metric)
+        run.define_metric("training_stats/*", step_metric=wandb_step_metric)
+        run.define_metric("epoch_*", step_metric=wandb_step_metric)
         if getattr(train_cfg, "wandb_xaxis_tokens", False):
-            run.define_metric(tokens_step_metric)
-            run.define_metric("batch_loss", step_metric=tokens_step_metric)
-            run.define_metric("val_loss", step_metric=tokens_step_metric)
-            run.define_metric("grad_norm", step_metric=tokens_step_metric)
-            run.define_metric("training_stats/*", step_metric=tokens_step_metric)
-            run.define_metric("epoch_*", step_metric=tokens_step_metric)
             lmms_eval_step = tokens_step_metric
 
         run.define_metric(name="lmms_eval/*", step_metric=lmms_eval_step)
@@ -291,7 +299,6 @@ def train(train_cfg, vlm_cfg, global_cfg):
         )
 
     compile_mode = _resolve_compile_mode(getattr(train_cfg, "compile_mode", "default"))
-
     if getattr(train_cfg, "activation_memory_budget", None) is not None:
         if not 0.0 <= train_cfg.activation_memory_budget <= 1.0:
             raise ValueError("activation_memory_budget must be between 0 and 1.")
@@ -328,6 +335,12 @@ def train(train_cfg, vlm_cfg, global_cfg):
     current_lrs = {}
     tokens_processed_global = resume_tokens_processed_global
     effective_tokens_accum = 0
+
+    def get_wandb_tokens_step_value() -> int:
+        if is_dist():
+            return int(sum(dist_gather(tokens_processed_global)))
+        return int(tokens_processed_global)
+
     if train_cfg.stream_dataset:
         train_pbar = tqdm(
             total=train_cfg.max_training_steps,
@@ -385,6 +398,7 @@ def train(train_cfg, vlm_cfg, global_cfg):
             step_effective_tokens = None
             step_effective_token_ratio = None
             step_effective_token_lr_scale = 1.0
+            step_update_loss = None
             batch_start_time = time.time()
             images = batch["images"]
             input_ids = batch["input_ids"].to(device)
@@ -452,6 +466,8 @@ def train(train_cfg, vlm_cfg, global_cfg):
                 total_loss_tokens_value = total_loss_tokens.item()
                 if total_loss_tokens_value == 0:
                     raise ValueError("Gradient accumulation produced zero total tokens; check label masking.")
+
+                step_update_loss = (total_loss_sum / total_loss_tokens).item()
 
                 grad_scale = get_world_size() / total_loss_tokens_value
                 for param in all_params:
@@ -580,9 +596,10 @@ def train(train_cfg, vlm_cfg, global_cfg):
                             "val/min_val_loss": min_val_loss,
                             "val/max_val_loss": max_val_loss,
                         }
-                        if getattr(train_cfg, "wandb_xaxis_tokens", False):
-                            tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
-                            log_payload[tokens_step_metric] = tokens_step_value
+                        tokens_step_value = get_wandb_tokens_step_value()
+                        log_payload[effective_tokens_step_metric] = tokens_step_value
+                        if wandb_step_metric != effective_tokens_step_metric:
+                            log_payload[wandb_step_metric] = tokens_step_value
                         run.log(log_payload, step=global_step)
 
                 model.train()
@@ -639,11 +656,12 @@ def train(train_cfg, vlm_cfg, global_cfg):
                         "training_stats/total_tokens": global_total,
                         "training_stats/token_efficiency": token_efficiency,
                     }
-                    if getattr(train_cfg, "wandb_xaxis_tokens", False):
-                        tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
-                        log_payload[tokens_step_metric] = tokens_step_value
+                    tokens_step_value = get_wandb_tokens_step_value()
+                    log_payload[effective_tokens_step_metric] = tokens_step_value
+                    if wandb_step_metric != effective_tokens_step_metric:
+                        log_payload[wandb_step_metric] = tokens_step_value
                     if step_effective_tokens is not None:
-                        log_payload["effective_tokens"] = step_effective_tokens
+                        log_payload["effective_tokens_step"] = step_effective_tokens
                     if step_effective_token_ratio is not None:
                         log_payload["effective_token_ratio"] = step_effective_token_ratio
                         log_payload["effective_token_lr_scale"] = step_effective_token_lr_scale
@@ -694,14 +712,19 @@ def train(train_cfg, vlm_cfg, global_cfg):
                     
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
+                    if step_update_loss is None:
+                        raise RuntimeError("Missing update_loss on optimizer step.")
                     log_payload = {
-                        "batch_loss": batch_loss_gathered,
+                        "batch_loss": step_update_loss,
+                        "micro_loss": batch_loss_gathered,
+                        "update_loss": step_update_loss,
                         **({"grad_norm": grad_norm} if train_cfg.max_grad_norm is not None else {}),
                         **current_lrs,
                     }
-                    if getattr(train_cfg, "wandb_xaxis_tokens", False):
-                        tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
-                        log_payload[tokens_step_metric] = tokens_step_value
+                    tokens_step_value = get_wandb_tokens_step_value()
+                    log_payload[effective_tokens_step_metric] = tokens_step_value
+                    if wandb_step_metric != effective_tokens_step_metric:
+                        log_payload[wandb_step_metric] = tokens_step_value
                     run.log(log_payload, step=global_step)
                 
             if is_update_step:
@@ -792,9 +815,10 @@ def train(train_cfg, vlm_cfg, global_cfg):
                     "epoch_duration": epoch_duration,
                     "epoch_tokens_per_second": epoch_tokens_per_second,
                 }
-                if getattr(train_cfg, "wandb_xaxis_tokens", False):
-                    tokens_step_value = sum(dist_gather(tokens_processed_global)) if is_dist() else tokens_processed_global
-                    log_payload[tokens_step_metric] = tokens_step_value
+                tokens_step_value = get_wandb_tokens_step_value()
+                log_payload[effective_tokens_step_metric] = tokens_step_value
+                if wandb_step_metric != effective_tokens_step_metric:
+                    log_payload[wandb_step_metric] = tokens_step_value
                 run.log(log_payload)
 
             print(f"Epoch: {current_epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")

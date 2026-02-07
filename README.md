@@ -90,16 +90,21 @@ Optional: add a `.env` file with `WANDB_API_KEY` and `HF_TOKEN` (or `HUGGINGFACE
 
 Note: the default config in this worktree is a **small debug-scale** setup for fast iteration:
 256-d ViT (patch16, img 128, 4 blocks, `mp_image_token_length=4`), SmolLM2-135M-Instruct (384 hidden, 8 blocks,
-1024 max length), and `patrickamadeus/the_cauldron` `sample_1pct` with batch size 1, grad accum 8,
+1024 max length), and `patrickamadeus/the_cauldron` `sample_1pct` with batch size 4, grad accum 2,
 lr 5e-5/1e-5/1e-5, eval interval 500, stats log interval 10, and val size 5000. See `models/config.py` for full defaults.
 
-`train.py` always logs `tokens/consumed` to W&B (when enabled), so you can switch the chart x-axis to that metric.
-If you want tokens to be the default step metric, set `TrainConfig.wandb_xaxis_tokens=True`.
+`train.py` always logs cumulative `effective_tokens` to W&B, and by default uses it as the step metric for
+`batch_loss`, `micro_loss`, `update_loss`, `val_loss`, `grad_norm`, `training_stats/*`, and `epoch_*`.
+If you want `tokens/consumed` to be the default step metric instead, set `TrainConfig.wandb_xaxis_tokens=True`.
+
+`batch_loss` is the token-normalized optimizer-step loss (`sum_loss / sum_valid_tokens` across the full
+accumulation window). `update_loss` logs the same value for compatibility.
+`micro_loss` is the last micro-batch loss on each optimizer update, which is expected to look noisy.
 
 To scale LR by effective (non-padding) tokens per update step, set `TrainConfig.effective_token_lr_scale=True`.
 We compute `ratio = effective_tokens / (B_global * lm_max_length)` and apply `ratio**effective_token_lr_exponent`
-**after** the LR scheduler (default exponent is 0.5). This logs `effective_tokens`, `effective_token_ratio`, and
-`effective_token_lr_scale` each update step. Override the exponent with
+**after** the LR scheduler (default exponent is 0.5). This logs `effective_tokens_step`,
+`effective_token_ratio`, and `effective_token_lr_scale` each update step. Override the exponent with
 `TrainConfig.effective_token_lr_exponent` or `--effective_token_lr_exponent`.
 
 To cap training for a short run, use `--max_training_steps N` or `--max_training_tokens N` (effective tokens).
