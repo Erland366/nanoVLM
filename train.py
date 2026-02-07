@@ -35,6 +35,7 @@ from utils.checkpointing import (
     save_model_optimizer_state,
     save_trainer_state,
 )
+from utils.cuda_compat import ensure_cuda_device_compatibility
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -102,6 +103,16 @@ def _resolve_compile_mode(mode: str | None) -> str | None:
     return mode
 
 
+def _resolve_runtime_device() -> torch.device:
+    device = (
+        torch.device("cuda") if torch.cuda.is_available()
+        else torch.device("mps") if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        else torch.device("cpu")
+    )
+    ensure_cuda_device_compatibility(device)
+    return device
+
+
 def compute_effective_token_scale(
     effective_tokens: int, denom_tokens: int, exponent: float
 ) -> tuple[float, float]:
@@ -151,6 +162,10 @@ def train(train_cfg, vlm_cfg, global_cfg):
 
     do_warmup = not train_cfg.resume_from_checkpoint
     warmup_batches = 1 if do_warmup else 0
+    device = _resolve_runtime_device()
+    if device.type == "mps":
+        torch.backends.mps.enable_fallback_to_cpu = True
+        torch.mps.empty_cache()
 
     train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(
         train_cfg, vlm_cfg, global_cfg, do_warmup=do_warmup
@@ -268,15 +283,6 @@ def train(train_cfg, vlm_cfg, global_cfg):
     optimizer = optim.AdamW(param_groups)
     all_params = [p for group in optimizer.param_groups for p in group['params']]
 
-    device = (
-        torch.device("cuda") if torch.cuda.is_available()
-        else torch.device("mps") if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        else torch.device("cpu")
-    )
-    if device.type == "mps":
-        torch.backends.mps.enable_fallback_to_cpu = True
-        torch.mps.empty_cache()
-    
     print(f"Using device: {device}")
     model.to(device)
 

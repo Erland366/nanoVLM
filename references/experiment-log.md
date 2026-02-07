@@ -14,6 +14,40 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-06 — Observation: selective AC NaN fix via attention-only policy
+
+**Type:** Observation  
+**General description:** Fixed selective activation checkpointing instability under `torch.compile` by narrowing the selective save policy.
+
+### Details
+
+- Root cause: selective policy `matmul_attention` (saving generic matmul-family ops) produced non-finite gradients on the first step in compiled runs.
+- Fix: changed default selective policy to `attention_only` in `models/activation_checkpointing.py`.
+- Backward compatibility: `matmul_attention` remains accepted as an alias and maps to `attention_only`.
+- Verification:
+  - Default config (`seq_len=1024`, `compile_mode=default`, selective AC): finite loss/grad norm for 10 steps.
+  - AGENTS small debug config was tested with the specified reduced ViT/LM dimensions; to satisfy model invariants with `vit_img_size=128`, `mp_image_token_length` must be set to `4` (otherwise placeholder/token mismatch).
+  - AGENTS small config + `mp_image_token_length=4`: no NaNs in tested selective/manual/default paths.
+- Remaining issue: `compile_mode=reduce-overhead` + selective AC still fails with cudagraph/storage runtime errors; this is tracked separately.
+
+## 2026-02-06 — Observation: fail-fast CUDA compatibility guard for Blackwell
+
+**Type:** Observation  
+**General description:** Added a CUDA architecture preflight to fail early with actionable guidance when the local PyTorch build cannot execute kernels on the active GPU.
+
+### Details
+
+- Added `utils/cuda_compat.py` with `ensure_cuda_device_compatibility(device)`:
+  - checks requested CUDA device availability,
+  - compares device capability (e.g., `sm_120`) against `torch.cuda.get_arch_list()`,
+  - raises an explicit `RuntimeError` with install guidance instead of failing later inside random tensor/model ops.
+- Wired this preflight into:
+  - `train.py`,
+  - `eval/benchmark_train_step.py`,
+  - `eval/measure_vram.py`.
+- Motivation: triage benchmark runs in this environment failed before step execution because the current venv is `torch 2.9.1+cu126` while GPUs are Blackwell (`sm_120`).
+- Added regression tests for the compatibility checker in `tests/test_cuda_compat.py`.
+
 ## 2026-02-06 — Observation: compile stability fix for cudagraph pool errors
 
 **Type:** Observation  

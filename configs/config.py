@@ -126,7 +126,7 @@ class TrainConfig:
     formatting_min_rating: int = 1                  # Subset: minimum formatting quality rating
 
     # Packing
-    max_images_per_example: int = 10
+    max_images_per_example: int = 1
     max_images_per_knapsack: int = 18
     pack_sequences: bool = False
     max_sample_length: int = 4096

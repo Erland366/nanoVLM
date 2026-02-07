@@ -9,7 +9,14 @@ This document defines the operational contract for AI agents working in this pro
 
 ## 1. Project Context
 
-**Purpose:** Research project
+**Purpose:** We have a problem on the activation checkpointing/selective activation checkpointing front where the current implementation causes NaN gradient issues. This project is to investigate the root cause of the NaN gradients and fix the issue, while maintaining the memory savings from activation checkpointing.
+
+For this project, please use `CUDA_VISIBLE_DEVICES=0` and do not use other GPUs since it's being used on other experiments.
+
+Iterate quickly using the reduced model config in the "Debugging" section below. and test it only 10 steps. Make sure the loss is not NaN and that the gradients are not NaN. 
+Test the comparison of with and without activation checkpointing to confirm that the NaN issue is fixed and make sure the results are consistent.
+
+Make sure that we gain the performance benefits of activation checkpointing without the NaN gradient issue.
 
 **Domain:** ML research and experimentation
 

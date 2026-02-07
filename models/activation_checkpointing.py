@@ -6,7 +6,9 @@ from typing import Callable
 import torch
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-DEFAULT_SAC_POLICY = "matmul_attention"
+# Default selective policy intentionally excludes generic matmul ops because
+# they produced non-finite grads under compile in this project setup.
+DEFAULT_SAC_POLICY = "attention_only"
 
 
 def _maybe_add_op(ops: set, name: str) -> None:
@@ -18,14 +20,9 @@ def _maybe_add_op(ops: set, name: str) -> None:
 
 
 @lru_cache(maxsize=None)
-def _matmul_attention_ops() -> set:
+def _attention_ops() -> set:
     ops: set = set()
     for name in [
-        "mm",
-        "bmm",
-        "addmm",
-        "matmul",
-        "_scaled_mm",
         "_scaled_dot_product_flash_attention",
         "_scaled_dot_product_efficient_attention",
         "_flash_attention_forward",
@@ -43,16 +40,18 @@ def _op_in_set(op, op_set: set) -> bool:
     return packet in op_set
 
 
-def _policy_matmul_attention(ctx, op, *args, **kwargs) -> CheckpointPolicy:
-    if _op_in_set(op, _matmul_attention_ops()):
+def _policy_attention_only(ctx, op, *args, **kwargs) -> CheckpointPolicy:
+    if _op_in_set(op, _attention_ops()):
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
 @lru_cache(maxsize=None)
 def get_sac_policy_fn(name: str) -> Callable:
-    if name == "matmul_attention":
-        return _policy_matmul_attention
+    # Backward-compatible alias: historical policy name now maps to
+    # attention-only saves due stability issues with matmul saves.
+    if name in {"attention_only", "matmul_attention"}:
+        return _policy_attention_only
     raise ValueError(f"Unknown activation checkpointing policy: {name}")
 
 

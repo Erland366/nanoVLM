@@ -13,6 +13,7 @@ from data.datasets import VQADataset
 from data.processors import get_image_processor, get_tokenizer
 from models.vision_language_model import VisionLanguageModel
 import models.config as config
+from utils.cuda_compat import ensure_cuda_device_compatibility
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -37,6 +38,7 @@ def compile_regions(model, *, dynamic: bool | None = None, mode: str | None = "r
 
 def measure_vram(args, vlm_cfg, train_cfg_defaults):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ensure_cuda_device_compatibility(device)
     if not torch.cuda.is_available():
         print("CUDA not available. VRAM measurement requires a CUDA-enabled GPU.")
         return

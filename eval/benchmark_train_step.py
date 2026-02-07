@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in os.sys.path:
 from models.activation_checkpointing import get_default_sac_policy
 from models.config import TrainConfig, VLMConfig
 from models.vision_language_model import VisionLanguageModel
+from utils.cuda_compat import ensure_cuda_device_compatibility
 
 
 @dataclass(frozen=True)
@@ -449,8 +450,7 @@ def _ensure_parent(path_str: str) -> Path:
 def main(argv: list[str]) -> int:
     args = _parse_args(argv)
     device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("Requested --device=cuda but CUDA is not available.")
+    ensure_cuda_device_compatibility(device)
 
     train_cfg = TrainConfig()
     random.seed(args.seed)

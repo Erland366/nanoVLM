@@ -28,6 +28,10 @@
       "type": "result",
       "description": "Activation checkpointing tradeoffs under compile/no-compile"
     },
+    "selective-ac-policy-stability-nanovlm": {
+      "type": "result",
+      "description": "Stabilize selective activation checkpointing policy under torch.compile"
+    },
     "torch-compile-dynamic-shapes-nanovlm": {
       "type": "result",
       "description": "Mark (B,T) dynamic to reduce torch.compile recompiles in training"
